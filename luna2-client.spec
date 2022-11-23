@@ -3,7 +3,7 @@ Name:          luna2-client
 Version:       2.0 
 Release:       1.noarch
 Group:         Unspecified
-Summary:       Kernel module Luna for deployed nodes.
+Summary:       Kernel module for Luna2-client to deploy nodes
 
 Packager:      ClusterVision
 
@@ -13,7 +13,7 @@ URL:           https://github.com/clustervision/luna
 
 Provides:      libluna-fakeuname.so()(64bit)  
 Provides:      luna2-client = %{version}.%{release}
-Provides:      luna2-client(x86-64) = %{version}.%{release}
+# Provides:      luna2-client(x86-64) = %{version}.%{release}
 Requires:      curl  
 Requires:      dracut-config-generic  
 Requires:      dracut-network  
@@ -36,7 +36,14 @@ Requires:      rsync
 Requires:      sed  
 Requires:      tar  
 Requires:      vim-minimal  
-Requires:      wget  
+Requires:      wget
+Requires:      coreutils
+Requires:      util-linux
+Requires:      bind-utils
+Requires:      mdadm
+Requires:      procps-ng
+Requires:      pcituils
+Requires:      dosfstoolp
 
 %clean
 echo "No need to remove the source"
