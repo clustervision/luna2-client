@@ -33,6 +33,6 @@ install() {
     inst "$moddir/ltorrent-client" "/luna/ltorrent-client"
 
     inst_hook cmdline 99 "$moddir/luna-parse-cmdline.sh"
-    inst_hook initqueue/finished 99 "$moddir/luna-start.sh"
+    inst_hook initqueue/finished 99 "$moddir/luna2-start.sh"
 
 }

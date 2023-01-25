@@ -74,30 +74,30 @@ function luna_start () {
     local luna_bootproto
     local luna_mac
     echo "$(getargs luna.hostname=)" > /proc/sys/kernel/hostname
-    echo "Luna: Starting ssh"
+    echo "Luna2: Starting ssh"
     echo "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin" >> /etc/passwd
     echo sshd:x:74: >> /etc/group
     mkdir -p /var/empty/sshd
     /usr/sbin/sshd > /dev/null 2>&1
-    echo "Luna: Start shell on tty2"
+    echo "Luna2: Start shell on tty2"
     luna_ctty2=/dev/tty2
     setsid -c /bin/sh -i -l 0<>$luna_ctty2 1<>$luna_ctty2 2<>$luna_ctty2 &
     udevadm settle
     # settle is not really reliable
     sleep 5
-    echo "Luna: Set-up network"
+    echo "Luna2: Set-up network"
     luna_bootproto=$(getargs luna.bootproto=)
     if [ "x$luna_bootproto" = "xdhcp" ]; then
-        echo "Luna: Configuring dhcp for all interfaces"
+        echo "Luna2: Configuring dhcp for all interfaces"
         /usr/sbin/dhclient -lf /luna/dhclient.leases
     else
         luna_ip=$(getargs luna.ip=)
         luna_mac=$(getargs luna.mac=)
-        echo "Luna: ${luna_ip} for interface with mac ${luna_mac} was specified"
-        echo "Luna: Trying to find interface for ${luna_mac}"
+        echo "Luna2: ${luna_ip} for interface with mac ${luna_mac} was specified"
+        echo "Luna2: Trying to find interface for ${luna_mac}"
         luna_nic=$(find_nic ${luna_mac})
         if [ "x${luna_nic}" = "x" ]; then
-            echo "Luna: unable to find NIC for mac ${luna_mac}. Starting dhcp"
+            echo "Luna2: unable to find NIC for mac ${luna_mac}. Starting dhcp"
             /usr/sbin/dhclient -lf /luna/dhclient.leases
         else
             echo "${luna_nic}" > /luna/luna_nic
@@ -147,21 +147,21 @@ if [ "x$root" = "xluna" ]; then
     luna_node=$(getargs luna.node=)
     luna_service=$(getargs luna.service=)
     if [ "x$luna_service" = "x1" ]; then
-        echo "Luna: Entering Service mode."
+        echo "Luna2: Entering Service mode."
         setsid -c /bin/sh -i -l 0<>$luna_ctty 1<>$luna_ctty 2<>$luna_ctty
     else
         RES="failure"
         while [ "x$RES" = "xfailure" ]; do
-            echo "Luna: Trying to get install script."
-            while ! curl -f -s -m 60 --connect-timeout 10 "$luna_url?step=install&node=$luna_node" > /luna/install.sh; do
-                echo "Luna: Could not get install script. Sleeping 10 sec."
+            echo "Luna2: Trying to get install script."
+            while ! curl -f -s -m 60 --connect-timeout 10 "${luna_url}/boot/install/${luna_node}" > /luna/install.sh; do
+                echo "Luna2: Could not get install script. Sleeping 10 sec."
                 sleep 10
             done
             /bin/sh /luna/install.sh && RES="success"
-            echo "Luna: install.sh exit status: $RES"
+            echo "Luna2: install.sh exit status: $RES"
             sleep 10
         done
     fi
     luna_finish
-    echo 'Exit from Luna Installer'
+    echo 'Exit from Luna2 Installer'
 fi
