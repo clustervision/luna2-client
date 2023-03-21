@@ -176,7 +176,6 @@ if [ "x$root" = "xluna" ]; then
         RES="failure"
         while [ "x$RES" = "xfailure" ]; do
             echo "Luna2: Trying to get install script."
-            #while ! curl -f -s -m 60 --connect-timeout 10 "${luna_url}/boot/install/${luna_node}" > /luna/install.sh; do
             while [ 0 ]; do
                 token=$(fetch_token)
                 curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /luna/install.sh -w "%{http_code}" > /luna/http_code.out
@@ -187,10 +186,6 @@ if [ "x$root" = "xluna" ]; then
                     echo "Luna2: Could not get install script [$http_code]. Sleeping 10 sec."
                     sleep 10
                 fi
-#            while ! curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" > /luna/install.sh; do
-#                echo "Luna2: Could not get install script. Sleeping 10 sec."
-#                sleep 10
-#                token=$(fetch_token)
             done
             /bin/sh /luna/install.sh && RES="success"
             echo "Luna2: install.sh exit status: $RES"
