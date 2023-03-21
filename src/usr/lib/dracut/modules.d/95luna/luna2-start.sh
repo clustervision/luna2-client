@@ -158,6 +158,7 @@ function fetch_token {
         echo $token
     else
         >&2 cat /luna/token.json
+        >&2 echo
         echo "None"
     fi
 }
