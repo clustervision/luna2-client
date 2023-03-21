@@ -133,6 +133,7 @@ function luna_finish () {
     ps h t tty2 o pid | while read pid; do kill -9 $pid; done
 
 }
+
 function _get_luna_ctty () {
     local luna_ctty
     luna_ctty=$(getargs luna.ctty=)
@@ -140,6 +141,27 @@ function _get_luna_ctty () {
     [ "x${luna_ctty}" = "x" ] && luna_ctty="/dev/tty1"
     echo -n $luna_ctty
 }
+
+function fetch_token {
+    # TPM - Antoine
+    # for now a unique string BUT IT SHOULD FETCH THE REAL DEAL HERE. TESTING ONLY. pending
+    TPM=$(ip a| grep -oE '[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+'|grep -v '00:00:00'|tr '\n' ':')
+    json='{"tpm_sha256":"'$TPM'"}'
+    luna_url=$(getargs luna.url=)
+    luna_node=$(getargs luna.node=)
+    curl -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /luna/token.json
+    valid=$(grep token /luna/token.json)
+    if [ "$valid" ]; then
+        token=$(cat /luna/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
+        token=$(echo "${token:1:-1}")
+        echo $token > /luna/token.dat
+        echo $token
+    else
+        >&2 cat /luna/token.json
+        echo "None"
+    fi
+}
+
 if [ "x$root" = "xluna" ]; then
     luna_start
     luna_ctty=$(_get_luna_ctty)
@@ -153,9 +175,12 @@ if [ "x$root" = "xluna" ]; then
         RES="failure"
         while [ "x$RES" = "xfailure" ]; do
             echo "Luna2: Trying to get install script."
-            while ! curl -f -s -m 60 --connect-timeout 10 "${luna_url}/boot/install/${luna_node}" > /luna/install.sh; do
+            token=$(fetch_token)
+            #while ! curl -f -s -m 60 --connect-timeout 10 "${luna_url}/boot/install/${luna_node}" > /luna/install.sh; do
+            while ! curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" > /luna/install.sh; do
                 echo "Luna2: Could not get install script. Sleeping 10 sec."
                 sleep 10
+                token=$(fetch_token)
             done
             /bin/sh /luna/install.sh && RES="success"
             echo "Luna2: install.sh exit status: $RES"
