@@ -65,6 +65,11 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/etc/dracut.conf.d/luna2.conf"
 
 %changelog
+* Fri Aug 18 2023 Antoine Schonewille
+- Adding real TPM support; using sha256 for now
+- adding tpm2-tools / tpm2_pcrread
+- improvements on install script fetch handling
+
 * Wed Nov 23 2022 Matthew Steggink
 - Rewrite of luna2 client
 
@@ -74,7 +79,3 @@ Dracut module for Luna deployment tool
 * Wed Feb 17 2021 Bart Lamboo
 - Redirected both stdin / stderr to console and logfile
 
-* Fri Aug 18 2023 Antoine Schonewille
-- Adding real TPM support; using sha256 for now
-- adding tpm2-tools / tpm2_pcrread
-- improvements on install script fetch handling
