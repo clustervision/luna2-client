@@ -143,9 +143,10 @@ function _get_luna_ctty () {
 }
 
 function fetch_token {
-    # TPM - Antoine
-    # for now a unique string BUT IT SHOULD FETCH THE REAL DEAL HERE. TESTING ONLY. pending
-    TPM=$(ip a| grep -oE '[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+'|grep -v '00:00:00'|tr '\n' ':')
+    TPM=$(tpm2_pcrread sha256:0 | grep '0x' | awk -F' : ' '{ print $2 }')
+    if [ "$TPM" == "" ]; then
+        TPM=$(ip a| grep -oE '[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+'|grep -v '00:00:00'|tr '\n' ':')
+    fi
     json='{"tpm_sha256":"'$TPM'"}'
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
