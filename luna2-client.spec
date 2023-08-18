@@ -14,6 +14,7 @@ URL:           https://github.com/clustervision/luna
 Provides:      libluna-fakeuname.so()(64bit)  
 Provides:      luna2-client = %{version}.%{release}
 # Provides:      luna2-client(x86-64) = %{version}.%{release}
+Requires:      tpm2-tools
 Requires:      aria2c
 Requires:      curl  
 Requires:      dracut-config-generic  
