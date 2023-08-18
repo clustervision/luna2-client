@@ -15,7 +15,7 @@ Provides:      libluna-fakeuname.so()(64bit)
 Provides:      luna2-client = %{version}.%{release}
 # Provides:      luna2-client(x86-64) = %{version}.%{release}
 Requires:      tpm2-tools
-Requires:      aria2c
+Requires:      aria2
 Requires:      curl  
 Requires:      dracut-config-generic  
 Requires:      dracut-network  
@@ -45,7 +45,7 @@ Requires:      bind-utils
 Requires:      mdadm
 Requires:      procps-ng
 Requires:      pcituils
-Requires:      dosfstoolp
+Requires:      dosfstools
 
 %clean
 echo "No need to remove the source"
