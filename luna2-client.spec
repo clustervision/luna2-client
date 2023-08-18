@@ -44,7 +44,7 @@ Requires:      util-linux
 Requires:      bind-utils
 Requires:      mdadm
 Requires:      procps-ng
-Requires:      pcituils
+Requires:      pciutils
 Requires:      dosfstools
 
 %clean
