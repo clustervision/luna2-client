@@ -56,7 +56,6 @@ Dracut module for Luna deployment tool
 %files
 %dir %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/bashrc"
-%attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/ltorrent-client"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-parse-cmdline.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-start.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/module-setup.sh"
@@ -74,3 +73,8 @@ Dracut module for Luna deployment tool
 
 * Wed Feb 17 2021 Bart Lamboo
 - Redirected both stdin / stderr to console and logfile
+
+* Fri Aug 18 2023 Antoine Schonewille
+- Adding real TPM support; using sha256 for now
+- adding tpm2-tools / tpm2_pcrread
+- improvements on install script fetch handling
