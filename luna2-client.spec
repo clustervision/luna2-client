@@ -57,7 +57,7 @@ Dracut module for Luna deployment tool
 %dir %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/bashrc"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-parse-cmdline.sh"
-%attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-start.sh"
+%attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna2-start.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/module-setup.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/profile"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/sshd_config"
