@@ -46,7 +46,6 @@ Requires:      mdadm
 Requires:      procps-ng
 Requires:      pciutils
 Requires:      dosfstools
-Requires:      base64
 
 %clean
 echo "No need to remove the source"
