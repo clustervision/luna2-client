@@ -1,10 +1,7 @@
 #!/bin/bash
 
-# Written by Dmitry Chirikov <dmitry@chirikov.ru>
+# Written by ClusterVision Development team
 # This file is part of Luna, cluster provisioning tool
-# https://github.com/dchirikov/luna
-
-# This file is part of Luna.
 
 # Luna is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -69,6 +66,12 @@ function find_nic () {
     done
 }
 
+function luna_init () {
+    if [ ! -d /lunatmp ]; then
+        mkdir /lunatmp
+    fi
+}
+
 function luna_start () {
     local luna_ip
     local luna_bootproto
@@ -89,7 +92,7 @@ function luna_start () {
     luna_bootproto=$(getargs luna.bootproto=)
     if [ "x$luna_bootproto" = "xdhcp" ]; then
         echo "Luna2: Configuring dhcp for all interfaces"
-        /usr/sbin/dhclient -lf /luna/dhclient.leases
+        /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
     else
         luna_ip=$(getargs luna.ip=)
         luna_mac=$(getargs luna.mac=)
@@ -98,9 +101,9 @@ function luna_start () {
         luna_nic=$(find_nic ${luna_mac})
         if [ "x${luna_nic}" = "x" ]; then
             echo "Luna2: unable to find NIC for mac ${luna_mac}. Starting dhcp"
-            /usr/sbin/dhclient -lf /luna/dhclient.leases
+            /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
         else
-            echo "${luna_nic}" > /luna/luna_nic
+            echo "${luna_nic}" > /lunatmp/luna_nic
             export LUNA_BOOTIF="${luna_nic}"
             ip a add ${luna_ip} dev ${luna_nic}
             sleep 1
@@ -114,14 +117,14 @@ function luna_finish () {
     /usr/bin/ps h --ppid `cat /var/run/sshd.pid` -o 'pid' | while read pid; do kill $pid; done
     kill `cat /var/run/sshd.pid`
     # shutdown dhclient
-    /usr/sbin/dhclient -lf /luna/dhclient.leases -x
+    /usr/sbin/dhclient -lf /lunatmp/dhclient.leases -x
     # bring interfaces down
-    if [ -f /luna/luna_nic ]; then
-        luna_nic=$(cat /luna/luna_nic)
+    if [ -f /lunatmp/luna_nic ]; then
+        luna_nic=$(cat /lunatmp/luna_nic)
         ip addr flush ${luna_nic}
         ip link set dev ${luna_nic} down
     else
-        cat /luna/dhclient.leases  | \
+        cat /lunatmp/dhclient.leases  | \
             sed -n '/interface /s/\W*interface "\(.*\)";/\1/p' | \
             while read iface; do
                 ip addr flush $iface
@@ -150,21 +153,22 @@ function fetch_token {
     json='{"tpm_sha256":"'$TPM'"}'
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
-    curl -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /luna/token.json
-    valid=$(grep token /luna/token.json)
+    curl -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
+    valid=$(grep token /lunatmp/token.json)
     if [ "$valid" ]; then
-        token=$(cat /luna/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
+        token=$(cat /lunatmp/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
         token=$(echo "${token:1:-1}")
-        echo $token > /luna/token.dat
+        echo $token > /lunatmp/token.dat
         echo $token
     else
-        >&2 cat /luna/token.json
+        >&2 cat /lunatmp/token.json
         >&2 echo
         echo "None"
     fi
 }
 
 if [ "x$root" = "xluna" ]; then
+    luna_init
     luna_start
     luna_ctty=$(_get_luna_ctty)
     luna_url=$(getargs luna.url=)
@@ -179,8 +183,8 @@ if [ "x$root" = "xluna" ]; then
             echo "Luna2: Trying to get install script."
             while [ 0 ]; do
                 token=$(fetch_token)
-                curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /luna/install.sh -w "%{http_code}" > /luna/http_code.out
-                http_code=$(cat /luna/http_code.out)
+                curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
+                http_code=$(cat /lunatmp/http_code.out)
                 if [ "$http_code" == "200" ]; then
                     break
                 else
@@ -188,7 +192,7 @@ if [ "x$root" = "xluna" ]; then
                     sleep 10
                 fi
             done
-            /bin/sh /luna/install.sh && RES="success"
+            /bin/sh /lunatmp/install.sh && RES="success"
             echo "Luna2: install.sh exit status: $RES"
             sleep 10
         done
