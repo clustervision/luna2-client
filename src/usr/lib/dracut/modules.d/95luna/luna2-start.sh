@@ -146,10 +146,10 @@ function _get_luna_ctty () {
 }
 
 function fetch_token {
-    TPM=$(tpm2_pcrread sha256:0 | grep '0x' | awk -F' : ' '{ print $2 }')
-    if [ "$TPM" == "" ]; then
-        TPM=$(ip a| grep -oE '[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+'|grep -v '00:00:00'|tr '\n' ':')
-    fi
+    TPM=$(tpm2_pcrread sha256:0 2> /dev/null | grep '0x' | awk -F' : ' '{ print $2 }')
+#    if [ "$TPM" == "" ]; then
+#        TPM=$(ip a| grep -oE '[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+'|grep -v '00:00:00'|tr '\n' ':')
+#    fi
     json='{"tpm_sha256":"'$TPM'"}'
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
