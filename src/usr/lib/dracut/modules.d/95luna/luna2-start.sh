@@ -153,7 +153,11 @@ function fetch_token {
     json='{"tpm_sha256":"'$TPM'"}'
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
-    curl -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
+    luna_verifycert=$(getargs luna.verifycert= | tr 'A-Z' 'a-z')
+    if [ "$luna_verifycert" == "no" ] || [ "$luna_verifycert" == "false" ]; then
+        INSECURE='--insecure'
+    fi
+    curl $INSECURE -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
     valid=$(grep token /lunatmp/token.json)
     if [ "$valid" ]; then
         token=$(cat /lunatmp/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
@@ -174,6 +178,10 @@ if [ "x$root" = "xluna" ]; then
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
     luna_service=$(getargs luna.service=)
+    luna_verifycert=$(getargs luna.verifycert= | tr 'A-Z' 'a-z')
+    if [ "$luna_verifycert" == "no" ] || [ "$luna_verifycert" == "false" ]; then
+        INSECURE='--insecure'
+    fi
     if [ "x$luna_service" = "x1" ]; then
         echo "Luna2: Entering Service mode."
         setsid -c /bin/sh -i -l 0<>$luna_ctty 1<>$luna_ctty 2<>$luna_ctty
@@ -183,7 +191,7 @@ if [ "x$root" = "xluna" ]; then
             echo "Luna2: Trying to get install script."
             while [ 0 ]; do
                 token=$(fetch_token)
-                curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
+                curl $INSECURE -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
                 http_code=$(cat /lunatmp/http_code.out)
                 if [ "$http_code" == "200" ]; then
                     break
