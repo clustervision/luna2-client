@@ -153,7 +153,7 @@ function fetch_token {
     json='{"tpm_sha256":"'$TPM'"}'
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
-    curl -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
+    curl --insecure -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
     valid=$(grep token /lunatmp/token.json)
     if [ "$valid" ]; then
         token=$(cat /lunatmp/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
@@ -183,7 +183,7 @@ if [ "x$root" = "xluna" ]; then
             echo "Luna2: Trying to get install script."
             while [ 0 ]; do
                 token=$(fetch_token)
-                curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
+                curl --insecure -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
                 http_code=$(cat /lunatmp/http_code.out)
                 if [ "$http_code" == "200" ]; then
                     break
