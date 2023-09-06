@@ -12,10 +12,10 @@ depends() {
 
 install() {
     dracut_install ssh sshd scp tar wget curl awk sed gzip basename dd partx \
-                   parted mkfs.ext2 mkfs.ext3 mkfs.ext4 mkfs.xfs ipmitool \
+                   parted mkfs.ext2 mkfs.ext3 mkfs.ext4 mkfs.xfs ipmitool ldconfig \
                    blkdiscard fstrim nslookup dig base64 tpm2_pcrread chroot
     inst_libdir_file libnssdbm3.so libnsspem.so libsoftokn3.chk \
-                     libsoftokn3.so libsqlite3.so
+                     libsoftokn3.so libsqlite3.so libtss2-tcti-device.so.0
 
     inst "$moddir/sshd_config" "/etc/ssh/sshd_config"
     inst "$moddir/bashrc" "/root/.bashrc"
