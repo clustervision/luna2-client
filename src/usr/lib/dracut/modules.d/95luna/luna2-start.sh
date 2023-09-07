@@ -145,14 +145,38 @@ function _get_luna_ctty () {
     echo -n $luna_ctty
 }
 
+function get_credentials {
+    LUNA_INI='/trinity/local/luna/node/config/luna.ini'
+    if [ -f $LUNA_INI ]; then
+        while IFS='=' read -ra line; do
+            if [ ! "$(echo $line | grep -E '^(#|;)')" ] && [ "$line" ]; then
+                if [ "$(echo $line | grep '^\[')" ]; then
+                    section=$(echo $line | grep -oE "[A-Z]+")
+                else
+                    key=$(echo ${line[0]})
+                    value=$(echo ${line[1]})
+                    declare -x "${section}_${key}"="$value"
+                fi
+            fi
+        done < "$LUNA_INI"
+    else
+        >&2 echo "No config file: $LUNA_INI"
+        echo ":"
+    fi
+    echo "${API_USERNAME}:${API_PASSWORD}"
+}
+
 function fetch_token {
+    CREDENTIALS=$(get_credentials)
+    USERNAME=$(echo $CREDENTIALS | awk -F':' '{ print $1 }')
+    PASSWORD=$(echo $CREDENTIALS | awk -F':' '{ print $2 }')
     export TPM2TOOLS_TCTI="device:/dev/tpm0"
     ldconfig
     TPM=$(tpm2_pcrread sha256:0 2> /dev/null | grep '0x' | awk -F' : ' '{ print $2 }')
 #    if [ "$TPM" == "" ]; then
 #        TPM=$(ip a| grep -oE '[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+'|grep -v '00:00:00'|tr '\n' ':')
 #    fi
-    json='{"tpm_sha256":"'$TPM'"}'
+    json='{"tpm_sha256":"'$TPM'","username":"'$USERNAME'","password":"'$PASSWORD'"}'
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
     luna_verifycert=$(getargs luna.verifycert= | tr 'A-Z' 'a-z')

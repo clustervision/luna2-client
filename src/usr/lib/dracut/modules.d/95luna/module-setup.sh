@@ -26,6 +26,7 @@ install() {
     inst_simple /etc/pki/tls/certs/ca-bundle.crt
     mkdir -m 0700 -p "$initdir/root/.ssh"
     inst_simple /root/.ssh/authorized_keys
+    inst_simple /trinity/local/luna/node/config/luna.ini
 
     inst_simple /etc/resolv.conf
 

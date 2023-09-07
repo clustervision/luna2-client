@@ -1,7 +1,7 @@
 BuildArch:     %{_arch} 
 Name:          luna2-client
 Version:       2.0 
-Release:       8.noarch
+Release:       10.noarch
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes
 
