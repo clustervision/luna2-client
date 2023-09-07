@@ -146,7 +146,7 @@ function _get_luna_ctty () {
 }
 
 function get_credentials {
-    LUNA_INI='/trinity/local/luna/utils/config/luna.ini'
+    LUNA_INI='/trinity/local/luna/node/config/luna.ini'
     if [ -f $LUNA_INI ]; then
         while IFS='=' read -ra line; do
             if [ ! "$(echo $line | grep -E '^(#|;)')" ] && [ "$line" ]; then
