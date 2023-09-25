@@ -92,7 +92,11 @@ function luna_start () {
     luna_bootproto=$(getargs luna.bootproto=)
     if [ "x$luna_bootproto" = "xdhcp" ]; then
         echo "Luna2: Configuring dhcp for all interfaces"
-        /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+        if [ -x /usr/sbin/dhclient ]; then
+            /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+        else
+            echo "Luna2: I have dhcp set as bootproto, but dhclient was not found"
+        fi
     else
         luna_ip=$(getargs luna.ip=)
         luna_mac=$(getargs luna.mac=)
@@ -101,7 +105,11 @@ function luna_start () {
         luna_nic=$(find_nic ${luna_mac})
         if [ "x${luna_nic}" = "x" ]; then
             echo "Luna2: unable to find NIC for mac ${luna_mac}. Starting dhcp"
-            /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+            if [ -x /usr/sbin/dhclient ]; then
+                /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+            else
+                echo "Luna2: I need to start dhcp, but dhclient was not found"
+            fi
         else
             echo "${luna_nic}" > /lunatmp/luna_nic
             export LUNA_BOOTIF="${luna_nic}"

@@ -32,7 +32,6 @@ Requires:      openssh
 Requires:      openssh-clients  
 Requires:      openssh-server  
 Requires:      parted  
-Requires:      rb_libtorrent  
 Requires:      rootfiles  
 Requires:      rsync  
 Requires:      sed  
@@ -46,6 +45,7 @@ Requires:      mdadm
 Requires:      procps-ng
 Requires:      pciutils
 Requires:      dosfstools
+Requires:      dhcp-client
 
 %clean
 echo "No need to remove the source"
