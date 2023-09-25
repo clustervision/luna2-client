@@ -1,7 +1,7 @@
 BuildArch:     %{_arch} 
 Name:          luna2-client
 Version:       2.0 
-Release:       10.noarch
+Release:       11.noarch
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes
 
@@ -32,7 +32,6 @@ Requires:      openssh
 Requires:      openssh-clients  
 Requires:      openssh-server  
 Requires:      parted  
-Requires:      rb_libtorrent  
 Requires:      rootfiles  
 Requires:      rsync  
 Requires:      sed  
@@ -46,6 +45,7 @@ Requires:      mdadm
 Requires:      procps-ng
 Requires:      pciutils
 Requires:      dosfstools
+Requires:      dhcp-client
 
 %clean
 echo "No need to remove the source"

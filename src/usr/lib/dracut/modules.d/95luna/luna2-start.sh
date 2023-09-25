@@ -92,7 +92,11 @@ function luna_start () {
     luna_bootproto=$(getargs luna.bootproto=)
     if [ "x$luna_bootproto" = "xdhcp" ]; then
         echo "Luna2: Configuring dhcp for all interfaces"
-        /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+        if [ -x /usr/sbin/dhclient ]; then
+            /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+        else
+            echo "Luna2: I have dhcp set as bootproto, but dhclient was not found"
+        fi
     else
         luna_ip=$(getargs luna.ip=)
         luna_mac=$(getargs luna.mac=)
@@ -101,7 +105,11 @@ function luna_start () {
         luna_nic=$(find_nic ${luna_mac})
         if [ "x${luna_nic}" = "x" ]; then
             echo "Luna2: unable to find NIC for mac ${luna_mac}. Starting dhcp"
-            /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+            if [ -x /usr/sbin/dhclient ]; then
+                /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+            else
+                echo "Luna2: I need to start dhcp, but dhclient was not found"
+            fi
         else
             echo "${luna_nic}" > /lunatmp/luna_nic
             export LUNA_BOOTIF="${luna_nic}"
@@ -114,8 +122,10 @@ function luna_start () {
 
 function luna_finish () {
     # shutdown sshd
-    /usr/bin/ps h --ppid `cat /var/run/sshd.pid` -o 'pid' | while read pid; do kill $pid; done
-    kill `cat /var/run/sshd.pid`
+    sshdpids=$(ps ax|grep sshd|grep -v grep|awk '{ print $1 }')
+    if [ "$sshdpids" ]; then
+        kill $sshdpids
+    fi
     # shutdown dhclient
     /usr/sbin/dhclient -lf /lunatmp/dhclient.leases -x
     # bring interfaces down
@@ -124,12 +134,14 @@ function luna_finish () {
         ip addr flush ${luna_nic}
         ip link set dev ${luna_nic} down
     else
-        cat /lunatmp/dhclient.leases  | \
-            sed -n '/interface /s/\W*interface "\(.*\)";/\1/p' | \
-            while read iface; do
-                ip addr flush $iface
-                ip link set dev $iface down
-            done
+        if [ -f /lunatmp/dhclient.leases ]; then
+            cat /lunatmp/dhclient.leases  | \
+                sed -n '/interface /s/\W*interface "\(.*\)";/\1/p' | \
+                while read iface; do
+                    ip addr flush $iface
+                    ip link set dev $iface down
+                done
+        fi
     fi
     mv /tmp/luna_install.log /sysroot/var/log/
     # kill shell on tty2

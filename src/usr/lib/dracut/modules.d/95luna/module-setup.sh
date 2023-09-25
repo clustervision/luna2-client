@@ -13,7 +13,7 @@ depends() {
 install() {
     dracut_install ssh sshd scp tar wget curl awk sed gzip basename dd partx \
                    parted mkfs.ext2 mkfs.ext3 mkfs.ext4 mkfs.xfs ipmitool ldconfig \
-                   blkdiscard fstrim nslookup dig base64 tpm2_pcrread chroot
+                   blkdiscard fstrim nslookup dig base64 tpm2_pcrread chroot dhclient
     inst_libdir_file libnssdbm3.so libnsspem.so libsoftokn3.chk \
                      libsoftokn3.so libsqlite3.so libtss2-tcti-device.so.0
 
@@ -31,7 +31,6 @@ install() {
     inst_simple /etc/resolv.conf
 
     mkdir -m 0755 -p "$initdir/luna"
-    inst "$moddir/ltorrent-client" "/luna/ltorrent-client"
 
     inst_hook cmdline 99 "$moddir/luna-parse-cmdline.sh"
     inst_hook initqueue/finished 99 "$moddir/luna2-start.sh"
