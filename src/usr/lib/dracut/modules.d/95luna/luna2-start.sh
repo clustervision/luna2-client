@@ -122,8 +122,10 @@ function luna_start () {
 
 function luna_finish () {
     # shutdown sshd
-    /usr/bin/ps h --ppid `cat /var/run/sshd.pid` -o 'pid' | while read pid; do kill $pid; done
-    kill `cat /var/run/sshd.pid`
+    sshdpids=$(ps ax|grep sshd|grep -v grep|awk '{ print $1 }')
+    if [ "$sshdpids" ]; then
+        kill $sshdpids
+    fi
     # shutdown dhclient
     /usr/sbin/dhclient -lf /lunatmp/dhclient.leases -x
     # bring interfaces down
@@ -132,12 +134,14 @@ function luna_finish () {
         ip addr flush ${luna_nic}
         ip link set dev ${luna_nic} down
     else
-        cat /lunatmp/dhclient.leases  | \
-            sed -n '/interface /s/\W*interface "\(.*\)";/\1/p' | \
-            while read iface; do
-                ip addr flush $iface
-                ip link set dev $iface down
-            done
+        if [ -f /lunatmp/dhclient.leases ]; then
+            cat /lunatmp/dhclient.leases  | \
+                sed -n '/interface /s/\W*interface "\(.*\)";/\1/p' | \
+                while read iface; do
+                    ip addr flush $iface
+                    ip link set dev $iface down
+                done
+        fi
     fi
     mv /tmp/luna_install.log /sysroot/var/log/
     # kill shell on tty2
