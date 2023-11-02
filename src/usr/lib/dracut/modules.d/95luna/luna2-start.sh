@@ -74,6 +74,7 @@ function luna_init () {
 
 function luna_start () {
     local luna_ip
+    local luna_gw
     local luna_bootproto
     local luna_mac
     echo "$(getargs luna.hostname=)" > /proc/sys/kernel/hostname
