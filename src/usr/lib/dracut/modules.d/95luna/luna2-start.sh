@@ -74,6 +74,7 @@ function luna_init () {
 
 function luna_start () {
     local luna_ip
+    local luna_gw
     local luna_bootproto
     local luna_mac
     echo "$(getargs luna.hostname=)" > /proc/sys/kernel/hostname
@@ -99,6 +100,7 @@ function luna_start () {
         fi
     else
         luna_ip=$(getargs luna.ip=)
+        luna_gw=$(getargs luna.gw=)
         luna_mac=$(getargs luna.mac=)
         echo "Luna2: ${luna_ip} for interface with mac ${luna_mac} was specified"
         echo "Luna2: Trying to find interface for ${luna_mac}"
@@ -116,6 +118,11 @@ function luna_start () {
             ip a add ${luna_ip} dev ${luna_nic}
             sleep 1
             ip l set dev ${luna_nic} up
+            if [ "$luna_gw" ]; then
+                sleep 1
+                echo "Luna2: setting default gateway ${luna_gw}"
+                ip route add default via ${luna_gw} dev ${luna_nic}
+            fi 
         fi
     fi
 }
