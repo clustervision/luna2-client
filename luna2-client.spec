@@ -1,7 +1,7 @@
 BuildArch:     %{_arch} 
 Name:          luna2-client
 Version:       2.0 
-Release:       12.noarch
+Release:       13.noarch
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes
 
@@ -46,6 +46,7 @@ Requires:      procps-ng
 Requires:      pciutils
 Requires:      dosfstools
 Requires:      dhcp-client
+Requires:      dmidecode
 
 %clean
 echo "No need to remove the source"
@@ -65,6 +66,9 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/etc/dracut.conf.d/luna2.conf"
 
 %changelog
+* Thu Feb 01 2024 Antoine Schonewille
+- added aria2c and dmidecode into ramdisk
+
 * Fri Aug 18 2023 Antoine Schonewille
 - Adding real TPM support; using sha256 for now
 - adding tpm2-tools / tpm2_pcrread
