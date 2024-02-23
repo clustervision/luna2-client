@@ -1,7 +1,7 @@
 BuildArch:     %{_arch} 
 Name:          luna2-client
 Version:       2.0 
-Release:       13.noarch
+Release:       14.noarch
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes
 
@@ -66,6 +66,9 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/etc/dracut.conf.d/luna2.conf"
 
 %changelog
+* Fri Feb 23 2024 Antoine Schonewille
+- added ipv6 compliancy
+
 * Thu Feb 01 2024 Antoine Schonewille
 - added aria2c and dmidecode into ramdisk
 
