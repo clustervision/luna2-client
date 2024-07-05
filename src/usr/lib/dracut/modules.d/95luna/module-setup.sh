@@ -14,7 +14,7 @@ install() {
     dracut_install ssh sshd scp tar wget curl awk sed gzip basename dd partx \
                    parted mkfs.ext2 mkfs.ext3 mkfs.ext4 mkfs.xfs ipmitool ldconfig \
                    blkdiscard fstrim nslookup dig base64 tpm2_pcrread chroot dhclient \
-                   dmidecode aria2c
+                   dhclient-script-luna dmidecode aria2c ping
     inst_libdir_file libnssdbm3.so libnsspem.so libsoftokn3.chk \
                      libsoftokn3.so libsqlite3.so libtss2-tcti-device.so.0
 
@@ -28,7 +28,6 @@ install() {
     mkdir -m 0700 -p "$initdir/root/.ssh"
     inst_simple /root/.ssh/authorized_keys
     inst_simple /trinity/local/luna/node/config/luna.ini
-
     inst_simple /etc/resolv.conf
 
     mkdir -m 0755 -p "$initdir/luna"

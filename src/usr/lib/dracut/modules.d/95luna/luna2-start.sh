@@ -91,24 +91,37 @@ function luna_start () {
     sleep 5
     echo "Luna2: Set-up network"
     luna_bootproto=$(getargs luna.bootproto=)
+    luna_ip=$(getargs luna.ip=)
+    luna_gw=$(getargs luna.gw=)
+    luna_mac=$(getargs luna.mac=)
+    echo "Luna2: Trying to find interface for ${luna_mac}"
+    luna_nic=$(find_nic ${luna_mac})
     if [ "x$luna_bootproto" = "xdhcp" ]; then
-        echo "Luna2: Configuring dhcp for all interfaces"
+        export LUNA_BOOTPROTO="${luna_bootproto}"
         if [ -x /usr/sbin/dhclient ]; then
-            /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+            if [ "x${luna_nic}" = "x" ]; then
+                echo "Luna2: unable to find NIC for mac ${luna_mac}. Starting dhcp for all interfaces"
+                /usr/sbin/dhclient -lf /lunatmp/dhclient.leases -sf /usr/sbin/dhclient-script-luna
+            else
+                echo "${luna_nic}" > /lunatmp/luna_nic
+                export LUNA_BOOTIF="${luna_nic}"
+                echo "Luna2: Starting dhcp for ${luna_nic}"
+                /usr/sbin/dhclient -lf /lunatmp/dhclient.leases ${luna_nic} -sf /usr/sbin/dhclient-script-luna
+                if [ "$luna_gw" ]; then
+                    sleep 1
+                    echo "Luna2: setting default gateway ${luna_gw}"
+                    ip route add default via ${luna_gw} dev ${luna_nic}
+                fi 
+            fi
         else
-            echo "Luna2: I have dhcp set as bootproto, but dhclient was not found"
+            echo "Luna2: I need to start dhcp, but dhclient was not found"
         fi
     else
-        luna_ip=$(getargs luna.ip=)
-        luna_gw=$(getargs luna.gw=)
-        luna_mac=$(getargs luna.mac=)
         echo "Luna2: ${luna_ip} for interface with mac ${luna_mac} was specified"
-        echo "Luna2: Trying to find interface for ${luna_mac}"
-        luna_nic=$(find_nic ${luna_mac})
         if [ "x${luna_nic}" = "x" ]; then
             echo "Luna2: unable to find NIC for mac ${luna_mac}. Starting dhcp"
             if [ -x /usr/sbin/dhclient ]; then
-                /usr/sbin/dhclient -lf /lunatmp/dhclient.leases
+                /usr/sbin/dhclient -lf /lunatmp/dhclient.leases -sf /usr/sbin/dhclient-script-luna
             else
                 echo "Luna2: I need to start dhcp, but dhclient was not found"
             fi

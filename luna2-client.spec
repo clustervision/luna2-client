@@ -1,7 +1,7 @@
 BuildArch:     %{_arch} 
 Name:          luna2-client
 Version:       2.0 
-Release:       14.noarch
+Release:       15.noarch
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes
 
@@ -64,8 +64,12 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/sshd_config"
 %attr(0755, root, root) "/usr/lib64/libluna-fakeuname.so"
 %attr(0755, root, root) "/etc/dracut.conf.d/luna2.conf"
+%attr(0755, root, root) "/usr/sbin/dhclient-script-luna"
 
 %changelog
+* Fri Jul 05 2024 Antoine Schonewille
+- added dhclient-script-luna
+
 * Fri Feb 23 2024 Antoine Schonewille
 - added ipv6 compliancy
 
