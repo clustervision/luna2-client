@@ -141,6 +141,7 @@ function luna_start () {
 }
 
 function luna_finish () {
+    luna_loghost=$(getargs luna.loghost=)
     # shutdown sshd
     sshdpids=$(ps ax|grep sshd|grep -v grep|awk '{ print $1 }')
     if [ "$sshdpids" ]; then
@@ -162,6 +163,11 @@ function luna_finish () {
                     ip link set dev $iface down
                 done
         fi
+    fi
+    if [ "$luna_loghost" ]; then
+        cat /tmp/luna_install.log | logger -d -n $luna_loghost
+    else
+        echo "Luna2: loghost not defined, cannot forward logs."
     fi
     mv /tmp/luna_install.log /sysroot/var/log/
     # kill shell on tty2
@@ -235,6 +241,7 @@ if [ "x$root" = "xluna" ]; then
     luna_init
     luna_start
     luna_ctty=$(_get_luna_ctty)
+    luna_loghost=$(getargs luna.loghost=)
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
     luna_service=$(getargs luna.service=)
@@ -264,6 +271,10 @@ if [ "x$root" = "xluna" ]; then
             done
             /bin/sh /lunatmp/install.sh && RES="success"
             echo "Luna2: install.sh exit status: $RES"
+            if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
+                cat /tmp/luna_install.log | logger -d -n $luna_loghost
+                echo -n '' > /tmp/luna_install.log
+            fi
             sleep 10
         done
     fi
