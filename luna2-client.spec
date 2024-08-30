@@ -1,7 +1,7 @@
 BuildArch:     %{_arch} 
 Name:          luna2-client
 Version:       2.0 
-Release:       15.noarch
+Release:       16.noarch
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes
 
@@ -47,6 +47,7 @@ Requires:      pciutils
 Requires:      dosfstools
 Requires:      dhcp-client
 Requires:      dmidecode
+Requires:      util-linux
 
 %clean
 echo "No need to remove the source"
@@ -67,6 +68,9 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/usr/sbin/dhclient-script-luna"
 
 %changelog
+* Fri Aug 30 2024 Antoine Schonewille
+- added logger and logging support
+
 * Fri Jul 05 2024 Antoine Schonewille
 - added dhclient-script-luna
 
