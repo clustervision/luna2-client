@@ -1,7 +1,7 @@
 BuildArch:     %{_arch} 
 Name:          luna2-client
 Version:       2.0 
-Release:       16.noarch
+Release:       17.noarch
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes
 
@@ -31,6 +31,7 @@ Requires:      nss-softokn
 Requires:      openssh  
 Requires:      openssh-clients  
 Requires:      openssh-server  
+Requires:      dropbear
 Requires:      parted  
 Requires:      rootfiles  
 Requires:      rsync  
@@ -68,6 +69,9 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/usr/sbin/dhclient-script-luna"
 
 %changelog
+* Tue Sep 17 2024 Antoine Schonewille
+- added dropbear lightweight ssh server support
+
 * Fri Aug 30 2024 Antoine Schonewille
 - added logger and logging support
 
