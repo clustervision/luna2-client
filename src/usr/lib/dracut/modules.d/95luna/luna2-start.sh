@@ -78,11 +78,27 @@ function luna_start () {
     local luna_bootproto
     local luna_mac
     echo "$(getargs luna.hostname=)" > /proc/sys/kernel/hostname
-    echo "Luna2: Starting ssh"
-    echo "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin" >> /etc/passwd
-    echo sshd:x:74: >> /etc/group
-    mkdir -p /var/empty/sshd
-    /usr/sbin/sshd > /dev/null 2>&1
+    local dropbear_binary
+    if [ -x /usr/sbin/dropbear ]; then
+        dropbear_binary=/usr/sbin/dropbear
+    else
+        if [ -x /usr/local/sbin/dropbear ]; then
+            dropbear_binary=/usr/local/sbin/dropbear
+        fi
+    fi
+    if [ "$dropbear_binary" ]; then
+        echo "Luna2: Starting dropbear"
+        mkdir /etc/dropbear/
+        $dropbear_binary -R -p 22
+    else
+        if [ -e /usr/sbin/sshd ]; then
+            echo "Luna2: Starting ssh"
+            echo "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin" >> /etc/passwd
+            echo "sshd:x:74:" >> /etc/group
+            mkdir -p /var/empty/sshd
+            /usr/sbin/sshd > /dev/null 2>&1
+        fi
+    fi
     echo "Luna2: Start shell on tty2"
     luna_ctty2=/dev/tty2
     setsid -c /bin/sh -i -l 0<>$luna_ctty2 1<>$luna_ctty2 2<>$luna_ctty2 &
@@ -141,7 +157,7 @@ function luna_start () {
 }
 
 function luna_finish () {
-    luna_loghost=$(getargs luna.loghost=)
+    local luna_loghost=$(getargs luna.loghost=)
     if [ "$luna_loghost" ]; then
         cat /tmp/luna_install.log | logger -d -n $luna_loghost
     else
@@ -151,6 +167,10 @@ function luna_finish () {
     sshdpids=$(ps ax|grep sshd|grep -v grep|awk '{ print $1 }')
     if [ "$sshdpids" ]; then
         kill $sshdpids
+    fi
+    dbpids=$(ps ax|grep dropbear|grep -v grep|awk '{ print $1 }')
+    if [ "$dbpids" ]; then
+        kill $dbpids
     fi
     # shutdown dhclient
     /usr/sbin/dhclient -lf /lunatmp/dhclient.leases -x
