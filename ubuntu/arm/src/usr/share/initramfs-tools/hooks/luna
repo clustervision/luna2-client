@@ -1,0 +1,80 @@
+#!/bin/sh
+
+. /usr/share/initramfs-tools/hook-functions
+LUNA_FILES=/usr/share/initramfs-tools/hooks/luna_files
+
+PREREQ=""
+prereqs()
+{
+   echo "$PREREQ"
+}
+
+case $1 in
+prereqs)
+   prereqs
+   exit 0
+   ;;
+esac
+
+mkdir -p "${DESTDIR}/luna"
+#copy_exec $LUNA_FILES/ltorrent-client /luna
+copy_exec /usr/bin/setsid /usr/bin
+copy_exec /usr/bin/curl /usr/bin
+copy_exec /usr/bin/awk /usr/bin
+copy_exec /usr/bin/tar /usr/bin
+copy_exec /usr/sbin/sshd /usr/sbin
+copy_exec /usr/bin/file /usr/bin
+copy_exec /usr/bin/bash /bin
+copy_exec /usr/bin/bash /usr/bin
+copy_exec /usr/sbin/chroot /usr/sbin
+copy_exec /usr/bin/logger /usr/bin
+
+# efi support
+copy_exec /usr/sbin/mkfs.ext4 /usr/sbin
+copy_exec /usr/sbin/mkfs.xfs /usr/sbin
+copy_exec /usr/sbin/mkfs.vfat /usr/sbin
+copy_exec /usr/sbin/parted /usr/sbin
+copy_exec /usr/bin/efibootmgr /usr/bin
+
+for executable in /usr/bin/base64 /usr/bin/tpm2 /usr/bin/tpm2_pcrread /usr/bin/aria2c /usr/sbin/dmidecode; 
+do
+    if [ -x $executable ]; then
+        path=$(dirname $executable || echo '/usr/bin')
+        copy_exec $executable $path
+    fi
+done
+
+if [ -x /usr/bin/lbzip2 ]; then
+    copy_exec /usr/bin/lbzip2 /usr/bin
+elif [ -x /usr/bin/bzip2 ]; then
+    copy_exec /usr/bin/bzip2 /usr/bin
+else
+    echo "Error: Either lbzip2 or bzip2 must be installed."
+fi
+
+# Note: $HOME is set to / in Debian ramdisk
+copy_file config $LUNA_FILES/ashrc /.ashrc
+copy_file config $LUNA_FILES/profile /.profile
+# ~root rather than /root, just in case somebody decides to use /home/root
+# or something like that
+copy_file config ~root/.ssh/authorized_keys /.ssh/authorized_keys
+
+copy_file config $LUNA_FILES/passwd /etc/passwd
+copy_file config $LUNA_FILES/group /etc/group
+copy_file config $LUNA_FILES/sshd_config /etc/ssh/sshd_config
+copy_file config /etc/ssh/ssh_host_rsa_key
+copy_file config /etc/ssh/ssh_host_ecdsa_key
+copy_file config /etc/ssh/ssh_host_ed25519_key
+copy_file config /etc/pki/tls/certs/ca-bundle.crt
+copy_file config /etc/resolv.conf
+copy_file config /trinity/local/luna/node/config/luna.ini
+copy_file library /usr/lib/aarch64-linux-gnu/libtss2-tcti-device.so.0
+
+if [ -x /usr/bin/grepcidr ]; then
+    copy_exec /usr/bin/grepcidr /usr/bin
+else
+   echo "Error: grepicdr must be installed!"
+   exit 1
+fi
+
+exit 0

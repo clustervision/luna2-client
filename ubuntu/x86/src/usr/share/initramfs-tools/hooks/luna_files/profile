@@ -1,0 +1,3 @@
+if [ -f ~/.ashrc ]; then
+        . ~/.ashrc
+fi

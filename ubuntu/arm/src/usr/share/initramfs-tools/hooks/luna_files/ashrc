@@ -1,0 +1,8 @@
+alias ls='ls --color'
+alias ll='ls -l'
+alias vim='vi'
+alias grep='grep --color'
+export TERM=linux
+# Ash supports fancy colourful prompts, but as a compile option, which Debian/Ubuntu don't enable,
+# so basic prompt only...
+export PS1="lunainstaller$(/usr/bin/grep -q -w luna.service=1 /proc/cmdline && echo '(service)')\$ "
