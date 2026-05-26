@@ -294,6 +294,9 @@ if [ "x$root" = "xluna" ]; then
             if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
                 cat /tmp/luna_install.log | logger -d -n $luna_loghost
 		cat /tmp/luna_install.log > /tmp/luna_install.log.prev
+                if [ ! -f /tmp/luna_install.log.first ]; then
+                    cat /tmp/luna_install.log > /tmp/luna_install.log.first
+                fi
                 echo -n '' > /tmp/luna_install.log
             fi
             sleep 10
