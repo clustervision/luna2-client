@@ -57,7 +57,6 @@ Requires:      jq
 Requires:      lsscsi
 Requires:      lvm2
 
-
 %clean
 echo "No need to remove the source"
 
