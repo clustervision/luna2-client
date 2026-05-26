@@ -1,0 +1,5 @@
+Package: luna2-client
+Version: 2.0
+Maintainer: ClusterVision
+Architecture: x86-64
+Description: Initramfs module for Luna deployment tool

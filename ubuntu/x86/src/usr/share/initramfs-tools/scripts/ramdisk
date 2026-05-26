@@ -1,0 +1,26 @@
+# 
+# Scripts for Luna ramdisk boot
+
+mountroot()
+{
+        # Nothing to do, ramdisk has been filled by Luna
+        :
+}
+
+mount_top()
+{
+        # Note, also called directly in case it's overridden.
+        local_top
+}
+
+mount_premount()
+{
+        # Note, also called directly in case it's overridden.
+        local_premount
+}
+
+mount_bottom()
+{
+        # Note, also called directly in case it's overridden.
+        local_bottom
+}
