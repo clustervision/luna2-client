@@ -1,7 +1,7 @@
 BuildArch:     %{_arch} 
 Name:          luna2-client
 Version:       2.0 
-Release:       19
+Release:       21
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes
 
@@ -48,6 +48,15 @@ Requires:      dosfstools
 Requires:      dhcp-client
 Requires:      dmidecode
 Requires:      util-linux
+Requires:      device-mapper
+Requires:      dmidecode
+Requires:      dosfstools
+Requires:      findutils
+Requires:      gdisk
+Requires:      jq
+Requires:      lsscsi
+Requires:      lvm2
+
 
 %clean
 echo "No need to remove the source"
@@ -68,6 +77,10 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/usr/sbin/dhclient-script-luna"
 
 %changelog
+* Tue May 26 2026 Antoine Schonewille
+- added device-mapper, dmidecode, dosfstools, findutils,
+  gdisk, jq, lsscsi, lvm2
+
 * Mon Feb 10 2025 Antoine Schonewille
 - added log.prev to allow for some install log rotation
 

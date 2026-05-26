@@ -14,7 +14,13 @@ install() {
     dracut_install ssh sshd scp tar wget curl awk sed gzip basename dd partx \
                    parted mkfs.ext2 mkfs.ext3 mkfs.ext4 mkfs.xfs ipmitool ldconfig \
                    blkdiscard fstrim nslookup dig base64 tpm2_pcrread chroot dhclient \
-                   dhclient-script-luna dmidecode aria2c ping logger dropbear
+                   dhclient-script-luna dmidecode aria2c ping logger dropbear \
+                   wc mkswap swapon swaplabel mkfs.vfat mkfs.fat mkdosfs dosfslabel \
+                   fatlabel mdadm top fdisk lspci lsblk lsscsi tee lbzip2 \
+                   sgdisk partprobe wipefs blkid pvcreate vgcreate lvcreate \
+                   lvchange vgremove pvremove lvremove vgchange pvs vgs lvs \
+                   dmsetup jq findmnt dirname cut readlink sort xargs mount umount \
+                   sleep udevadm env mktemp date hostname
     inst_libdir_file libnssdbm3.so libnsspem.so libsoftokn3.chk \
                      libsoftokn3.so libsqlite3.so libtss2-tcti-device.so.0
 

@@ -36,6 +36,56 @@ copy_exec /usr/sbin/mkfs.vfat /usr/sbin
 copy_exec /usr/sbin/parted /usr/sbin
 copy_exec /usr/bin/efibootmgr /usr/bin
 
+# advanced local disk support
+copy_exec /usr/bin/wc /usr/bin
+copy_exec /usr/sbin/mkswap /usr/sbin
+copy_exec /usr/sbin/swapon /usr/sbin
+copy_exec /usr/sbin/swaplabel /usr/sbin
+copy_exec /usr/sbin/mkfs.fat /usr/sbin
+copy_exec /usr/sbin/mkdosfs /usr/sbin
+copy_exec /usr/sbin/dosfslabel /usr/sbin
+copy_exec /usr/sbin/fatlabel /usr/sbin
+copy_exec /usr/sbin/mdadm /usr/sbin
+copy_exec /usr/bin/top /usr/bin
+copy_exec /usr/sbin/fdisk /usr/sbin
+copy_exec /usr/bin/lspci /usr/bin
+copy_exec /usr/bin/lsblk /usr/bin
+copy_exec /usr/bin/lsscsi /usr/bin
+copy_exec /usr/bin/tee /usr/bin
+copy_exec /usr/bin/lbzip2 /usr/bin
+copy_exec /usr/bin/tpm2_pcrread /usr/bin
+copy_exec /usr/sbin/sgdisk /usr/sbin
+copy_exec /usr/sbin/partprobe /usr/sbin
+copy_exec /usr/sbin/wipefs /usr/sbin
+copy_exec /usr/sbin/blkid /usr/sbin
+copy_exec /usr/sbin/pvcreate /usr/sbin
+copy_exec /usr/sbin/vgcreate /usr/sbin
+copy_exec /usr/sbin/lvcreate /usr/sbin
+copy_exec /usr/sbin/lvchange /usr/sbin
+copy_exec /usr/sbin/vgremove /usr/sbin
+copy_exec /usr/sbin/pvremove /usr/sbin
+copy_exec /usr/sbin/lvremove /usr/sbin
+copy_exec /usr/sbin/vgchange /usr/sbin
+copy_exec /usr/sbin/pvs /usr/sbin
+copy_exec /usr/sbin/vgs /usr/sbin
+copy_exec /usr/sbin/lvs /usr/sbin
+copy_exec /usr/sbin/dmsetup /usr/sbin
+copy_exec /usr/bin/jq /usr/bin
+copy_exec /usr/bin/findmnt /usr/bin
+copy_exec /usr/bin/dirname /usr/bin
+copy_exec /usr/bin/cut /usr/bin
+copy_exec /usr/bin/readlink /usr/bin
+copy_exec /usr/bin/sort /usr/bin
+copy_exec /usr/bin/xargs /usr/bin
+copy_exec /usr/bin/mount /usr/bin
+copy_exec /usr/bin/umount /usr/bin
+copy_exec /usr/bin/sleep /usr/bin
+copy_exec /usr/bin/udevadm /usr/bin
+copy_exec /usr/bin/env /usr/bin
+copy_exec /usr/bin/mktemp /usr/bin
+copy_exec /usr/bin/date /usr/bin
+copy_exec /usr/bin/hostname /usr/bin
+
 for executable in /usr/bin/base64 /usr/bin/tpm2 /usr/bin/tpm2_pcrread /usr/bin/aria2c /usr/sbin/dmidecode; 
 do
     if [ -x $executable ]; then
