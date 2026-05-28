@@ -85,6 +85,7 @@ copy_exec /usr/bin/env /usr/bin
 copy_exec /usr/bin/mktemp /usr/bin
 copy_exec /usr/bin/date /usr/bin
 copy_exec /usr/bin/hostname /usr/bin
+copy_exec /usr/bin/chown /usr/bin
 
 for executable in /usr/bin/base64 /usr/bin/tpm2 /usr/bin/tpm2_pcrread /usr/bin/aria2c /usr/sbin/dmidecode; 
 do
