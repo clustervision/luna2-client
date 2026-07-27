@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "sets": [
+    {
+      "name": "data", "role": "data", "selection": "manual", "raid": "none",
+      "persistent": true,
+      "devices": ["/dev/disk/by-path/pci-0000:00:11.0-ata-3.0"],
+      "volumes": [
+        {"name": "data", "mountpoint": "/data", "fs": "xfs", "provider": "partition", "size": "100%"}
+      ]
+    }
+  ]
+}

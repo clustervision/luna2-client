@@ -1,0 +1,61 @@
+# lpart destructive/safe regression manifest -- consumed by run-regression.sh
+# Columns (tab-separated):
+#   id            regression.md test id (e.g. 3.52)
+#   section       3 | 3B | 4 | 4a
+#   safety        safe | destructive
+#   shape         min disk count the test needs (3|4|5) -> scheduled onto a matching node
+#   layout        dl-*.json basename in this dir, or - (driver supplies its own)
+#   mode          install_mode hint (auto|full|memboot|sanitize|legacy|-)
+#   stage         driver:stage  (drv-*.sh + the case label it dispatches on) | orch:<fn> | TODO
+#   distros       all | csv of families it applies to | !family to exclude
+#   timeout_s
+#
+# stage=TODO rows are catalogued-but-not-yet-automated (honest gap markers); the
+# runner reports them as SKIP(unautomated), never as PASS. Known-open product
+# findings (parity/raid10 degraded boot, BE-B10) are wired to their diagnostic
+# driver and expected to yield FINDING, not FAIL.
+#
+#id	section	safety	shape	layout	mode	stage	distros	timeout_s
+3.2	3	destructive	3	dl-single.json	auto	drv-baseline:baseline	all	1500
+3.26	3B	destructive	3	empty-layout.json	memboot	orch:memboot	all	1200
+3.27	3B	destructive	3	dl-single.json	auto	drv-misc3:s327	all	1800
+3.29	3B	destructive	4	dl-n3-raid5.json	full	drv-grub-diag:g1	redhat	2400
+3.30	3B	destructive	5	dl-n4-raid6.json	full	drv-misc4:r6	redhat	2700
+3.31	3B	destructive	4	dl-n3-raid10.json	full	drv-grub-diag:r10	all	2400
+3.32	3B	destructive	3	dl-raid1-vdbc.json	full	drv-yank:y-resync	all	2100
+3.33	3B	safe	3	os-discover-nvme.json	full	drv-misc3:s333	all	1500
+3.34	3B	safe	3	dl-raid1-vdbc.json	full	drv-ctrl:s334	redhat	2400
+3.36	3B	safe	3	os-discover-nvme.json	full	drv-ctrl:s336	all	1500
+3.39	3B	safe	3	dl-single.json	full	drv-ctrl:s339	all	1800
+3.40	3B	safe	3	dl-persist.json	sanitize	drv-ctrl:s340	all	1500
+3.42	3B	destructive	4	dl-byid-os.json	full	drv-misc3:s342	all	1500
+3.43	3B	destructive	4	dl-single.json	full	drv-misc3:s343	all	1800
+3.46	3B	destructive	5	-	full	drv-misc4:s346	all	2100
+3.47	3B	destructive	5	-	full	drv-misc4:s347	all	2100
+3.48	3B	destructive	5	-	full	drv-misc4:s348	all	2100
+3.50	3B	destructive	3	dl-persist.json	sync	drv-san:s350	all	1800
+3.51	3B	destructive	3	dl-351-raid1data.json	full	drv-san:s351	all	2100
+3.52	3B	destructive	3	dl-352-multiset.json	sanitize	drv-san:s352	all	2100
+3.53	3B	destructive	3	dl-persist.json	sanitize	drv-san:s353	all	2100
+3.54	3B	safe	3	empty-layout.json	memboot	drv-ctrl:s354	all	1500
+3.55	3B	destructive	3	empty-layout.json	memboot	drv-ctrl:s355	all	1800
+3.58	3B	safe	3	empty-layout.json	memboot	drv-ctrl:s358	all	1500
+3.59	3B	destructive	3	dl-raid1-vdbc.json	full	drv-yank:y-partition	all	1800
+3.60	3B	destructive	3	dl-single.json	full	drv-ctrl:s360	all	1800
+3.62	3B	destructive	5	dl-n4-raid6.json	full	drv-new:r6retest	redhat	2700
+3.63	3B	destructive	3	dl-raid1-vdbc.json	full	drv-new:t363	all	1800
+3.64	3B	destructive	3	-	full	drv-new:t364	all	1500
+3.65	3B	destructive	4	-	full	drv-new:t365	all	2400
+4a.1	4a	safe	1	-	-	orch:seam_gate	all	300
+4a.2	4a	safe	1	-	-	orch:initramfs_gate	all	300
+# --- catalogued, not yet automated (honest gaps; runner SKIPs these) ---
+3.28	3B	destructive	3	dl-raid1-vdbc.json	full	TODO	all	1800
+3.35	3B	safe	3	empty-layout.json	full	TODO	all	1200
+3.37	3B	safe	3	-	full	TODO	all	1200
+3.41	3B	destructive	3	dl-byid-os.json	full	TODO	all	1800
+3.44	3B	destructive	3	dl-single.json	full	TODO	all	1500
+3.45	3B	destructive	3	dl-345-pressure.json	full	TODO	all	1800
+3.49	3B	destructive	5	-	full	TODO	all	2100
+3.56	3B	destructive	5	-	full	TODO	redhat	2100
+3.57	3B	destructive	5	filter-keep.json	sync	TODO	all	2100
+3.61	3B	safe	3	dl-single.json	auto	TODO	all	1500

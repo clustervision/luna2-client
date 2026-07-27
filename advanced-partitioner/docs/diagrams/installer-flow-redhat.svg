@@ -1,0 +1,167 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 800 1118" font-family="Helvetica,Arial,sans-serif">
+<rect x="0" y="0" width="800" height="1118" fill="white"/>
+<text x="34" y="26" font-size="17" fill="#0f172a" text-anchor="start" font-weight="bold">How a node installs: power-on &#8594; install.sh &#8594; first boot</text>
+<text x="34" y="44" font-size="10.5" fill="#6b7280" text-anchor="start" font-weight="normal">RHEL / dracut 95luna line. Each install.sh step is one block, coloured by who runs it.</text>
+<rect x="34.0" y="60" width="179.5" height="40" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="123.75" y="77" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">Firmware</text>
+<text x="123.75" y="91" font-size="9" fill="#475569" text-anchor="middle" font-weight="normal">DHCP / PXE</text>
+<line x1="213.5" y1="80" x2="223.5" y2="80" stroke="#64748b" stroke-width="1.6"/>
+<rect x="223.5" y="60" width="179.5" height="40" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="313.25" y="77" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">iPXE</text>
+<text x="313.25" y="91" font-size="9" fill="#475569" text-anchor="middle" font-weight="normal">chain to controller</text>
+<line x1="403.0" y1="80" x2="413.0" y2="80" stroke="#64748b" stroke-width="1.6"/>
+<rect x="413.0" y="60" width="179.5" height="40" rx="7" fill="#e2e8f0" stroke="#64748b" stroke-width="1.4"/>
+<text x="502.75" y="77" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">Controller</text>
+<text x="502.75" y="91" font-size="9" fill="#475569" text-anchor="middle" font-weight="normal">discover_mac &#8594; netboot?</text>
+<line x1="592.5" y1="80" x2="602.5" y2="80" stroke="#64748b" stroke-width="1.6"/>
+<rect x="602.5" y="60" width="179.5" height="40" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="692.25" y="77" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">kernel + initramfs</text>
+<text x="692.25" y="91" font-size="9" fill="#475569" text-anchor="middle" font-weight="normal">cmdline: root=luna &#8230;</text>
+<rect x="34" y="116" width="748" height="46" rx="9" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.6"/>
+<text x="48" y="135" font-size="11.5" fill="#1d4ed8" text-anchor="start" font-weight="bold">&#9654;  install ramdisk &#8212; luna2-start.sh  (owns console, network, SSH, the fetch/run/retry loop, the pivot)</text>
+<text x="48" y="151" font-size="9.3" fill="#1e3a8a" text-anchor="start" font-weight="normal">brings up NIC + network &#183; starts dropbear sshd + tty2 login &#183; fetches TPM token &#183; curl /boot/install/&lt;node&gt; &#8594; install.sh</text>
+<rect x="34" y="176" width="386" height="38" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="47" y="199.0" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">1</text>
+<line x1="60" y1="182" x2="60" y2="208" stroke="#94a3b8" stroke-width="1"/>
+<text x="68" y="192" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">lunainit</text>
+<text x="68" y="206" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">create runtime + /sysroot dirs</text>
+<line x1="47" y1="214" x2="47" y2="221" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="221" width="386" height="38" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="47" y="244.0" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">2</text>
+<line x1="60" y1="227" x2="60" y2="253" stroke="#94a3b8" stroke-width="1"/>
+<text x="68" y="237" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">dynamic_ip_check</text>
+<text x="68" y="251" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">if DHCP, report the leased IP</text>
+<line x1="47" y1="259" x2="47" y2="266" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="266" width="386" height="38" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="47" y="289.0" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">3</text>
+<line x1="60" y1="272" x2="60" y2="298" stroke="#94a3b8" stroke-width="1"/>
+<text x="68" y="282" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">node_scripts</text>
+<text x="68" y="296" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">stage any boot-script plugins</text>
+<rect x="328.0" y="273" width="84.0" height="15" rx="7.5" fill="#ede9fe"/>
+<text x="370.0" y="283.6" font-size="8.2" fill="#6d28d9" text-anchor="middle" font-weight="normal" font-family="SFMono-Regular,Consolas,monospace">install.scripts</text>
+<line x1="47" y1="304" x2="47" y2="311" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="311" width="386" height="38" rx="7" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.4"/>
+<text x="47" y="334.0" font-size="11" fill="#b45309" text-anchor="middle" font-weight="bold">4</text>
+<line x1="60" y1="317" x2="60" y2="343" stroke="#f59e0b" stroke-width="1"/>
+<text x="68" y="327" font-size="11.5" fill="#b45309" text-anchor="start" font-weight="bold">prescript</text>
+<text x="68" y="341" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">node/group prescript &#8594; lpart-phase pre</text>
+<rect x="318.0" y="318" width="94.0" height="15" rx="7.5" fill="#ede9fe"/>
+<text x="365.0" y="328.6" font-size="8.2" fill="#6d28d9" text-anchor="middle" font-weight="normal" font-family="SFMono-Regular,Consolas,monospace">install.prescript</text>
+<line x1="47" y1="349" x2="47" y2="356" stroke="#cbd5e1" stroke-width="1.4"/>
+<path d="M420 330.0 H428" stroke="#f59e0b" stroke-width="1.6" fill="none"/>
+<circle cx="420" cy="330.0" r="2.4" fill="#f59e0b"/>
+<rect x="436" y="311.0" width="346" height="38" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="1.2"/>
+<text x="445" y="327.0" font-size="11" fill="#047857" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">prepare-runtime</text>
+<text x="445" y="341.0" font-size="8.8" fill="#475569" text-anchor="start" font-weight="normal">make runtime / sysroot scaffolding</text>
+<rect x="34" y="356" width="386" height="38" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="47" y="379.0" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">5</text>
+<line x1="60" y1="362" x2="60" y2="388" stroke="#94a3b8" stroke-width="1"/>
+<text x="68" y="372" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">write_provisioning_inputs</text>
+<text x="68" y="386" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">storage.json &#183; osimage-filter.json &#183; install-context.json</text>
+<line x1="47" y1="394" x2="47" y2="401" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="401" width="386" height="38" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="47" y="424.0" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">6</text>
+<line x1="60" y1="407" x2="60" y2="433" stroke="#94a3b8" stroke-width="1"/>
+<text x="68" y="417" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">bmcsetup</text>
+<text x="68" y="431" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">configure BMC &#8212; IPMI user + network</text>
+<rect x="323.0" y="408" width="89.0" height="15" rx="7.5" fill="#ede9fe"/>
+<text x="367.5" y="418.6" font-size="8.2" fill="#6d28d9" text-anchor="middle" font-weight="normal" font-family="SFMono-Regular,Consolas,monospace">install.setupbmc</text>
+<line x1="47" y1="439" x2="47" y2="446" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="446" width="386" height="38" rx="7" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.4"/>
+<text x="47" y="469.0" font-size="11" fill="#b45309" text-anchor="middle" font-weight="bold">7</text>
+<line x1="60" y1="452" x2="60" y2="478" stroke="#f59e0b" stroke-width="1"/>
+<text x="68" y="462" font-size="11.5" fill="#b45309" text-anchor="start" font-weight="bold">partscript</text>
+<text x="68" y="476" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">node/group partscript &#8594; lpart-phase part (writes the disk)</text>
+<rect x="313.0" y="453" width="99.0" height="15" rx="7.5" fill="#ede9fe"/>
+<text x="362.5" y="463.6" font-size="8.2" fill="#6d28d9" text-anchor="middle" font-weight="normal" font-family="SFMono-Regular,Consolas,monospace">install.partscript</text>
+<line x1="47" y1="484" x2="47" y2="491" stroke="#cbd5e1" stroke-width="1.4"/>
+<path d="M420 465.0 H428" stroke="#f59e0b" stroke-width="1.6" fill="none"/>
+<circle cx="420" cy="465.0" r="2.4" fill="#f59e0b"/>
+<rect x="436" y="402.0" width="346" height="38" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="1.2"/>
+<text x="445" y="418.0" font-size="11" fill="#047857" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">install-context</text>
+<text x="445" y="432.0" font-size="8.8" fill="#475569" text-anchor="start" font-weight="normal">resolve mode + disklayout</text>
+<rect x="436" y="446.0" width="346" height="38" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="1.2"/>
+<text x="445" y="462.0" font-size="11" fill="#047857" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">storage-prepare</text>
+<text x="445" y="476.0" font-size="8.8" fill="#475569" text-anchor="start" font-weight="normal">discover &#183; partition &#183; RAID &#183; LVM &#183; mkfs &#183; mount</text>
+<rect x="436" y="490.0" width="346" height="38" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="1.2"/>
+<text x="445" y="506.0" font-size="11" fill="#047857" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">osimage-install</text>
+<text x="445" y="520.0" font-size="8.8" fill="#475569" text-anchor="start" font-weight="normal">download &#183; extract &#8594; sysroot &#183; verify</text>
+<rect x="34" y="491" width="386" height="38" rx="7" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.4"/>
+<text x="47" y="514.0" font-size="11" fill="#94a3b8" text-anchor="middle" font-weight="bold">8–9</text>
+<line x1="60" y1="497" x2="60" y2="523" stroke="#cbd5e1" stroke-width="1"/>
+<text x="68" y="507" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">download_image &#183; unpack_imagefile</text>
+<text x="68" y="521" font-size="8.9" fill="#94a3b8" text-anchor="start" font-weight="normal" font-style="italic">no-ops under lpart (owned by osimage-install)</text>
+<line x1="47" y1="529" x2="47" y2="536" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="536" width="386" height="38" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="47" y="559.0" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">10–11</text>
+<line x1="60" y1="542" x2="60" y2="568" stroke="#94a3b8" stroke-width="1"/>
+<text x="68" y="552" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">collect_mac_n_name_net &#183; change_net</text>
+<text x="68" y="566" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">hostname + ifcfg into the new OS</text>
+<rect x="333.0" y="543" width="79.0" height="15" rx="7.5" fill="#ede9fe"/>
+<text x="372.5" y="553.6" font-size="8.2" fill="#6d28d9" text-anchor="middle" font-weight="normal" font-family="SFMono-Regular,Consolas,monospace">install.setnet</text>
+<line x1="47" y1="574" x2="47" y2="581" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="581" width="386" height="38" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="47" y="604.0" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">12</text>
+<line x1="60" y1="587" x2="60" y2="613" stroke="#94a3b8" stroke-width="1"/>
+<text x="68" y="597" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">node_secrets</text>
+<text x="68" y="611" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">fetch node secrets into the new OS</text>
+<rect x="328.0" y="588" width="84.0" height="15" rx="7.5" fill="#ede9fe"/>
+<text x="370.0" y="598.6" font-size="8.2" fill="#6d28d9" text-anchor="middle" font-weight="normal" font-family="SFMono-Regular,Consolas,monospace">install.secrets</text>
+<line x1="47" y1="619" x2="47" y2="626" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="626" width="386" height="38" rx="7" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.4"/>
+<text x="47" y="649.0" font-size="11" fill="#b45309" text-anchor="middle" font-weight="bold">13</text>
+<line x1="60" y1="632" x2="60" y2="658" stroke="#f59e0b" stroke-width="1"/>
+<text x="68" y="642" font-size="11.5" fill="#b45309" text-anchor="start" font-weight="bold">postscript</text>
+<text x="68" y="656" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">node/group postscript &#8594; lpart-phase post (makes it bootable)</text>
+<rect x="313.0" y="633" width="99.0" height="15" rx="7.5" fill="#ede9fe"/>
+<text x="362.5" y="643.6" font-size="8.2" fill="#6d28d9" text-anchor="middle" font-weight="normal" font-family="SFMono-Regular,Consolas,monospace">install.postscript</text>
+<line x1="47" y1="664" x2="47" y2="671" stroke="#cbd5e1" stroke-width="1.4"/>
+<path d="M420 645.0 H428" stroke="#f59e0b" stroke-width="1.6" fill="none"/>
+<circle cx="420" cy="645.0" r="2.4" fill="#f59e0b"/>
+<rect x="436" y="626.0" width="346" height="38" rx="6" fill="#d1fae5" stroke="#10b981" stroke-width="1.2"/>
+<text x="445" y="642.0" font-size="11" fill="#047857" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">bootloader-finalise</text>
+<text x="445" y="656.0" font-size="8.8" fill="#475569" text-anchor="start" font-weight="normal">fstab &#183; shim+GRUB &#8594; ESP &#183; UEFI NVRAM &#183; verify</text>
+<rect x="34" y="671" width="386" height="38" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="47" y="694.0" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">14</text>
+<line x1="60" y1="677" x2="60" y2="703" stroke="#94a3b8" stroke-width="1"/>
+<text x="68" y="687" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">node_roles</text>
+<text x="68" y="701" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">install + enable role units</text>
+<rect x="338.0" y="678" width="74.0" height="15" rx="7.5" fill="#ede9fe"/>
+<text x="375.0" y="688.6" font-size="8.2" fill="#6d28d9" text-anchor="middle" font-weight="normal" font-family="SFMono-Regular,Consolas,monospace">install.roles</text>
+<line x1="47" y1="709" x2="47" y2="716" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="716" width="386" height="38" rx="7" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.4"/>
+<text x="47" y="739.0" font-size="11" fill="#334155" text-anchor="middle" font-weight="bold">15–17</text>
+<line x1="60" y1="722" x2="60" y2="748" stroke="#94a3b8" stroke-width="1"/>
+<text x="68" y="732" font-size="11.5" fill="#0f172a" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">fix_capabilities &#183; restore_selinux_context</text>
+<text x="68" y="746" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">setcap &#183; SELinux relabel &#183; update_system_info (asset tag)</text>
+<line x1="47" y1="754" x2="47" y2="761" stroke="#cbd5e1" stroke-width="1.4"/>
+<rect x="34" y="761" width="386" height="38" rx="7" fill="#dcfce7" stroke="#16a34a" stroke-width="1.4"/>
+<text x="47" y="784.0" font-size="11" fill="#15803d" text-anchor="middle" font-weight="bold">18</text>
+<line x1="60" y1="767" x2="60" y2="793" stroke="#16a34a" stroke-width="1"/>
+<text x="68" y="777" font-size="11.5" fill="#15803d" text-anchor="start" font-weight="bold" font-family="SFMono-Regular,Consolas,monospace">cleanup  +  success</text>
+<text x="68" y="791" font-size="8.9" fill="#475569" text-anchor="start" font-weight="normal">clear scratch, post final state</text>
+<rect x="328.0" y="768" width="84.0" height="15" rx="7.5" fill="#ede9fe"/>
+<text x="370.0" y="778.6" font-size="8.2" fill="#6d28d9" text-anchor="middle" font-weight="normal" font-family="SFMono-Regular,Consolas,monospace">install.success</text>
+<rect x="34" y="810" width="748" height="44" rx="9" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.6"/>
+<text x="48" y="828" font-size="11.5" fill="#1d4ed8" text-anchor="start" font-weight="bold">&#9664;  back to luna2-start.sh  &#8212;  no reboot inside install.sh</text>
+<text x="48" y="844" font-size="9.3" fill="#1e3a8a" text-anchor="start" font-weight="normal">on success: move install log &#8594; /sysroot/var/log, then  switch_root /sysroot  &#8212; the node's first boot of its installed OS</text>
+<text x="34" y="870" font-size="11" fill="#0f172a" text-anchor="start" font-weight="bold">Legend</text>
+<rect x="34" y="880" width="16" height="16" rx="4" fill="#f1f5f9" stroke="#94a3b8" stroke-width="1.2"/>
+<text x="56" y="888" font-size="9.5" fill="#334155" text-anchor="start" font-weight="bold">framework</text>
+<text x="56" y="899" font-size="8" fill="#6b7280" text-anchor="start" font-weight="normal">install.sh plumbing</text>
+<rect x="158" y="880" width="16" height="16" rx="4" fill="#fef3c7" stroke="#f59e0b" stroke-width="1.2"/>
+<text x="180" y="888" font-size="9.5" fill="#b45309" text-anchor="start" font-weight="bold">Luna scripts</text>
+<text x="180" y="899" font-size="8" fill="#6b7280" text-anchor="start" font-weight="normal">pre / part / post</text>
+<rect x="282" y="880" width="16" height="16" rx="4" fill="#d1fae5" stroke="#10b981" stroke-width="1.2"/>
+<text x="304" y="888" font-size="9.5" fill="#047857" text-anchor="start" font-weight="bold">lpart worker</text>
+<text x="304" y="899" font-size="8" fill="#6b7280" text-anchor="start" font-weight="normal">real install work</text>
+<rect x="406" y="880" width="16" height="16" rx="4" fill="#dbeafe" stroke="#3b82f6" stroke-width="1.2"/>
+<text x="428" y="888" font-size="9.5" fill="#1d4ed8" text-anchor="start" font-weight="bold">ramdisk</text>
+<text x="428" y="899" font-size="8" fill="#6b7280" text-anchor="start" font-weight="normal">luna2-start.sh</text>
+<rect x="530" y="880" width="16" height="16" rx="4" fill="#f8fafc" stroke="#cbd5e1" stroke-width="1.2"/>
+<text x="552" y="888" font-size="9.5" fill="#94a3b8" text-anchor="start" font-weight="bold">no-op</text>
+<text x="552" y="899" font-size="8" fill="#6b7280" text-anchor="start" font-weight="normal">legacy step retired</text>
+<rect x="654" y="880" width="16" height="16" rx="8" fill="#ede9fe"/>
+<text x="676" y="888" font-size="9.5" fill="#6d28d9" text-anchor="start" font-weight="bold">install.&lt;stage&gt;</text>
+<text x="676" y="899" font-size="8" fill="#6b7280" text-anchor="start" font-weight="normal">status to controller</text>
+</svg>

@@ -1,0 +1,790 @@
+============================================================================
+LEGACY.configs — every documented pre/part/post configuration that TrinityX
+distributes (roles, daemon plugins, and the mkdocs docs)
+============================================================================
+
+Purpose
+-------
+This is the catalogue of legacy Luna install-hook configurations we ship, so we
+can test `install_mode=legacy` against each of them. Under `legacy` the node
+runs the original bash **prescript / partscript / postscript** plus a full image
+unpack; the new lpart-* Go binaries are NOT invoked. These three hooks ARE what
+`legacy` executes, so this file is the test surface for legacy behaviour.
+
+The three hooks (from the daemon plugin docstrings)
+---------------------------------------------------
+  prescript   runs early, before /sysroot is mounted (set up config / disks)
+  partscript  runs before /sysroot is mounted; it is responsible for CREATING
+              and MOUNTING the root filesystem at /sysroot (tmpfs or a disk)
+  postscript  runs after the image is laid down, before the OS pivot; tailoring,
+              /etc/fstab, bootloader install, hostname, etc.
+
+Everything the scripts touch on the target lives under /sysroot (the running
+installer is a tmpfs; anything outside /sysroot is lost at pivot).
+
+How to set them on a node or group (the "how to use")
+-----------------------------------------------------
+  Inline file content (base64 under the hood):
+    luna node  change <node>  -qpre  <file>  -qpart <file>  -qpost <file>
+    luna group change <group> -qpre  <file>  -qpart <file>  -qpost <file>
+  Interactive editor:
+    luna node change <node> -pre        (also -part / -post)
+  Apply a shipped plugin's pre+part+post in one shot:
+    luna node change <node> --scripts <plugin>      # default | diskfull | raid1 | nodhcp
+  At group creation (what the group-create role does):
+    luna group add --osimage <image> -qpart /tmp/part.rd -qpost /tmp/post.rd <group>
+
+Quick index
+-----------
+  ROLES (github-trinityX/site/roles)
+    1. Diskless tmpfs — RedHat            luna/group-create/files/redhat/{part,post}.rd
+    2. Diskless tmpfs — Ubuntu            luna/group-create/files/ubuntu/{part,post}.rd
+    3. Diskless tmpfs — openSUSE          luna/group-create/files/opensuse/{part,post}.rd
+    4. Cloud single-disk                  cloud/luna/files/{part,post}.rd
+  DAEMON PLUGINS (luna2-daemon: daemon/plugins/boot/scripts/)
+    5. default plugin (empty baseline)    default.py    (--scripts default)
+    6. diskfull plugin                    diskfull.py   (--scripts diskfull)
+    7. raid1 plugin                       raid1.py      (--scripts raid1)
+    8. nodhcp plugin (single-disk)        nodhcp.py     (--scripts nodhcp)
+  MKDOCS (clustervision/trinityx-docs: trinityX/docs/)
+    9. Diskfull how-to (live)             howtos/disk-full-node.md
+   10. Diskfull recipe (orphan dup)       recipes/disk-full-node.md
+   11. Default node-config example        admin/luna.md  (the node show table)
+   12. Tailoring / example postscript     admin/node.md
+   13. Plugin architecture + list         admin/luna-plugins.md
+
+
+============================================================================
+ROLES — the .rd hook files distributed in github-trinityX/site/roles
+============================================================================
+These are the default scripts the `luna/group-create` Ansible role drops into
+/tmp and assigns to the compute group at provisioning time:
+  group-create/tasks/main.yml ->
+    luna group add --osimage {{luna_image_name}} -qpart /tmp/part.rd -qpost /tmp/post.rd {{luna_group_name}}
+NOTE: the role assigns only part + post (no prescript). The distro is chosen by
+the controller OS family (redhat | ubuntu | opensuse).
+
+--- 1. Diskless tmpfs — RedHat ----------------------------------------------
+Where:  site/roles/luna/group-create/files/redhat/part.rd  and  .../post.rd
+What:   The default. Mounts a RAM (tmpfs) root at /sysroot; the image is
+        unpacked into RAM and the node runs entirely from memory. Local disks
+        are left untouched (free for scratch). RedHat uses NUMA-interleaved
+        tmpfs so memory is spread across all NUMA nodes.
+  part.rd:  mount -o mpol=interleave -t tmpfs tmpfs /sysroot
+  post.rd:  echo 'tmpfs / tmpfs mpol=interleave 0 0' >> /sysroot/etc/fstab
+Use:    Default for a RedHat-family compute group; nothing to do. To set by hand:
+        luna group change <group> -qpart redhat/part.rd -qpost redhat/post.rd
+
+--- 2. Diskless tmpfs — Ubuntu ----------------------------------------------
+Where:  site/roles/luna/group-create/files/ubuntu/part.rd  and  .../post.rd
+What:   Same diskless tmpfs idea, written for the Ubuntu/initramfs-tools boot
+        environment, which exposes the root mountpoint as $rootmnt rather than a
+        literal /sysroot.
+  part.rd:  ls "$rootmnt" || mkdir "$rootmnt"
+            mount -t tmpfs tmpfs "$rootmnt"
+  post.rd:  echo 'tmpfs / tmpfs defaults 0 0' >> /$rootmnt/etc/fstab
+Use:    Default for an Ubuntu-family compute group.
+
+--- 3. Diskless tmpfs — openSUSE --------------------------------------------
+Where:  site/roles/luna/group-create/files/opensuse/part.rd  and  .../post.rd
+What:   The plainest diskless tmpfs root (no NUMA option, literal /sysroot).
+  part.rd:  mount -t tmpfs tmpfs /sysroot
+  post.rd:  echo 'tmpfs / tmpfs defaults 0 0' >> /sysroot/etc/fstab
+Use:    Default for an openSUSE-family compute group.
+
+--- 4. Cloud single-disk ----------------------------------------------------
+Where:  site/roles/cloud/luna/files/part.rd  and  .../post.rd
+What:   The cloud variant — boots from a LOCAL DISK instead of tmpfs (cloud
+        instances have a disk and no PXE-friendly RAM-root assumption).
+  part.rd: auto-detects /dev/sda or /dev/nvme0n1; reuses an existing >=4.5 GB
+           "root" partition or (re)creates one with parted using the free tail
+           of the disk (failsafe paths included); mkfs.ext4; mount at /sysroot;
+           records the device in /tmp/disk.dat.
+  post.rd: writes the ext4 / line to /sysroot/etc/fstab (from /tmp/disk.dat, or
+           re-detects), and disables NetworkManager DHCP hostname override
+           (hostname-mode=none) so the cloud DHCP cannot rename the node.
+Use:    Applied by the cloud/luna role on cloud deployments; or by hand:
+        luna group change <group> -qpart part.rd -qpost post.rd
+
+
+============================================================================
+DAEMON PLUGINS — shipped script generators (luna2-daemon)
+============================================================================
+Source:    luna2-daemon: daemon/plugins/boot/scripts/<name>.py
+Installed:  /trinity/local/python/.../site-packages/daemon/plugins/boot/scripts/
+Each plugin is a Python class exposing prescript / partscript / postscript
+strings. Apply all three to a node/group with:
+    luna node change <node> --scripts <name>
+The plugins are designed to be tuned via an override file the prescript writes
+to /tmp (edit it, or pre-seed it, then re-run), so the same plugin serves many
+disk shapes without editing the scripts.
+
+--- 5. default plugin (default.py) ------------------------------------------
+What:   The baseline plugin: prescript, partscript AND postscript are all EMPTY.
+        Applying it clears a node/group back to "no hook scripts". The shipped
+        diskless-tmpfs DEFAULT does NOT come from here — it comes from the
+        group-create role's part.rd/post.rd (configs 1-3); default.py is the
+        empty fallback the plugin loader uses when nothing more specific matches.
+Use:    luna node change node001 --scripts default     # reset scripts to empty
+
+--- 6. diskfull plugin (diskfull.py) ----------------------------------------
+What:   "Default Install for pre, part and post" — a local single-disk install.
+  prescript:  writes /tmp/my-local-disk.sh with the tunables, then prints them:
+                MY_LOCAL_DISK_NAME=/dev/sda     # target disk (or /dev/disk/by-uuid/...)
+                MY_LOCAL_DISK_SECTORS=          # optional size check
+                PARTITION_MY_DISK=yes
+                FORMAT_MY_DISK=yes
+                MAKE_BOOT=yes                   # install grub/shim for standalone boot
+              (if the file already exists it is kept — the override mechanism)
+  partscript: sources /tmp/my-local-disk.sh, resolves by-uuid -> kernel name,
+              partitions/formats the disk per the tunables, mounts it at /sysroot.
+  postscript: finalises the install + bootloader before pivot.
+Use:    luna node change node001 --scripts diskfull
+        # then (optional) edit the disk via -pre or by pre-seeding /tmp/my-local-disk.sh
+        luna node change node001 -pre node001     # tweak the override interactively
+
+--- 7. raid1 plugin (raid1.py) ----------------------------------------------
+What:   A software-RAID1 (mirror) root across two local disks.
+  partscript: parted lays out each disk: EFI (fat32 1g) + boot (ext4 1-2g) +
+              swap (linux-swap 2-4g) + root (ext4 4g-100%, raid flag on);
+              mkfs.fat the ESP, mkfs.ext4 boot; then
+                mdadm --create /dev/md0 --metadata 1.2 --bitmap=internal --force
+                      --assume-clean --level=mirror --raid-devices=2 <d1p4> <d2p4>
+              mkfs.ext4 /dev/md0; mounts the mirror at /sysroot.
+  postscript: bind-mounts proc/dev/sys, writes mdadm.conf ("AUTO -all" + the
+              scanned ARRAY line — note this matches the v1.4 partitioner's own
+              auto-assembly guard), runs dracut --add=mdraid --add-drivers=raid1,
+              installs grub.
+Use:    luna node change node001 --scripts raid1
+
+--- 8. nodhcp plugin (nodhcp.py) --------------------------------------------
+What:   A fixed single-disk (/dev/sda) diskful install. Empty prescript.
+  partscript: parted /dev/sda -> gpt + EFI(fat32 1g) + boot(ext4 1-2g) +
+              swap(linux-swap 2-4g) + root(ext4 4g-100%); waits for the device
+              nodes; mkswap+swaplabel sda3; mkfs.fat sda1, mkfs.ext4 sda2 + sda4;
+              mounts sda4 -> /sysroot, sda2 -> /sysroot/boot, sda1 -> /boot/efi.
+  postscript: restores the 95luna dracut module-setup if stashed, bind-mounts
+              proc/dev/sys, and installs a `luna-postinstall.service` systemd
+              unit into the image (runs post-install on first boot). The "nodhcp"
+              name reflects that this variant manages networking statically rather
+              than via DHCP.
+Use:    luna node change node001 --scripts nodhcp
+        # needs the install_items dracut tools (config 9c) like any disk layout.
+
+
+============================================================================
+MKDOCS — documented configurations in clustervision/trinityx-docs
+============================================================================
+Repo: clustervision/trinityx-docs  (site under trinityX/, nav in trinityX/mkdocs.yml)
+
+--- 9. Diskfull provisioning how-to (LIVE) ----------------------------------
+Where:  trinityX/docs/howtos/disk-full-node.md   (nav: "Diskfull provisioning")
+What:   The canonical how-to. Contains, in order:
+        a) Use the included diskfull plugin:  luna node change --scripts diskfull
+           then  luna node change -pre node001   (edit the disk override)
+        b) Use the included raid1 plugin:     luna node change --scripts raid1
+        c) install_items: a dracut config snippet to bake mkfs/mdadm/parted/etc.
+           into the install initramfs (REQUIRED for any non-diskless layout —
+           the diskless default needs none):
+             install_items+=" /usr/sbin/mkswap /usr/sbin/mkfs.vfat /usr/sbin/mkfs.fat
+               /usr/sbin/mdadm /usr/sbin/fdisk ... "
+        d) Default diskless booting: the tmpfs part/post (same as configs 1-3):
+             partscript:  mount -t tmpfs tmpfs /sysroot
+             postscript:  echo 'tmpfs / tmpfs defaults 0 0' >> /sysroot/etc/fstab
+        e) Manual diskfull, by hand:
+           prescript (Step 1): parted /dev/sda -> gpt + EFI(fat32 1-512m) +
+             boot(ext2 512m-1g) + root(ext4 1g-100%); mkfs.fat/ext2/ext4.
+           postscript (Step 2): bind proc/dev/sys, write /sysroot/etc/fstab
+             (/dev/sda3 /, sda2 /boot, sda1 /boot/efi), remove the stale Shim
+             NVRAM entry, efibootmgr --create a fresh Shim1, grub2-mkconfig.
+             (Distro path varies: note the literal 'rocky' in /EFI/rocky/...)
+Use:    follow the page; the plugin sections are one-liners, the manual section
+        is a copy-paste starting point to adapt per site.
+
+--- 10. Diskfull recipe (ORPHAN duplicate) -----------------------------------
+Where:  trinityX/docs/recipes/disk-full-node.md   (NOT in mkdocs.yml nav)
+What:   An older, shorter (193 vs 270 line) duplicate of #7 with the same
+        diskless tmpfs + disk-full scriptlets.
+Note:   Stale/orphaned — not published. Fold into the live howtos/ page (or
+        delete) when doing docs cleanup.
+
+--- 11. Default node-config example (the node show table) --------------------
+Where:  trinityX/docs/admin/luna.md  (the "luna node show" example table)
+What:   Documents the default values a freshly-created node carries, including:
+          prescript   <empty> (default)
+          partscript  mount -t tmpfs tmpfs /sysroot
+          postscript  echo 'tmpfs / tmpfs defaults 0 0' >> /sysroot/etc/fstab
+        i.e. confirms the shipped default is diskless tmpfs with no prescript.
+Use:    reference for "what does a default node look like".
+
+--- 12. Tailoring / example postscript --------------------------------------
+Where:  trinityX/docs/admin/node.md  ("Tailoring scripts" / "Example postscript")
+What:   Explains postscripts (valid for Luna v1 AND v2) and the /sysroot rule
+        (everything must be prefixed with /sysroot; outside it is the throwaway
+        installer tmpfs). Example postscript:
+          sed -i "s/HOSTNAME/`hostname -s`/g" /sysroot/etc/myapp.yml
+          echo "myhostname = `hostname -f`" >> /sysroot/etc/postfix/main.cf
+        Also documents node-level override of group scripts (test a single node).
+Use:    pattern for per-node tailoring postscripts.
+
+--- 13. Plugin architecture + full plugin list ------------------------------
+Where:  trinityX/docs/admin/luna-plugins.md
+What:   Documents the daemon plugin system and lists every shipped plugin,
+        including the boot/scripts ones used here:
+          boot/scripts/default.py   boot/scripts/diskfull.py
+          boot/scripts/nodhcp.py    boot/scripts/raid1.py
+        Key philosophy: plugins resolve by OS-distro / group / node override —
+        the loader picks the first match, e.g. redhat.py > redhat8.py >
+        default.py. So a site can ship its own boot/scripts/<distro>.py to change
+        the default pre/part/post without editing anything.
+Use:    reference for which --scripts plugins exist and how overrides resolve.
+
+
+============================================================================
+Notes for legacy testing
+============================================================================
+- The shipped DEFAULT everywhere is diskless tmpfs with NO prescript: partscript
+  mounts tmpfs at /sysroot, postscript writes the tmpfs fstab line. This is the
+  primary legacy-tmpfs case to validate (configs 1-3 / 11).
+- Any disk layout (configs 4, 6, 7, 8, 9e) additionally needs the install_items
+  dracut tools in the install initramfs (config 9c); diskless needs none.
+- The plugins 5-8 are the "by --scripts" path; the .rd files (1-4) and the manual
+  doc steps (9e) are the "by -qpart/-qpost" path. Both end up as the node's
+  prescript/partscript/postscript that `install_mode=legacy` runs verbatim.
+- Cross-check: the raid1 plugin already writes "AUTO -all" to mdadm.conf — the
+  same udev-auto-assembly guard the v1.4 Go partitioner now applies itself.
+
+
+============================================================================
+Deltas on the clustervision development branch (checked 2026-06-07)
+============================================================================
+Compared the canonical clustervision repo (gitlab clustervision/trinityx-combined,
+branch `development`) against `main`. (GitHub clustervision/trinityX has only
+`main`, no development.)
+
+- The legacy hook SCRIPTS are UNCHANGED on development: all 8 .rd files
+  (redhat/ubuntu/opensuse part.rd+post.rd, cloud part.rd+post.rd) are byte-for-
+  byte identical to what is catalogued above. No new .rd files, no renames. The
+  diskless-tmpfs and cloud-disk configs themselves did not change.
+- What DID change is the ASSIGNMENT plumbing in the roles' tasks:
+  * luna/group-create/tasks/main.yml: copies part.rd/post.rd to
+    `{{ trix_tmpdir }}` instead of a hardcoded /tmp, and the create command is now
+      luna group add --osimage <img> -qpart {{trix_tmpdir}}/part.rd \
+        -qpost {{trix_tmpdir}}/post.rd --setupbmc no <group>
+    plus an optional follow-up that assigns `default-bmcsetup` on the `ipmi`
+    network when both exist.
+  * cloud/luna/tasks/main.yml: same /tmp -> {{ trix_tmpdir }} change for the
+    cloud part/post copy + group add.
+  * luna/osimage-create/tasks/main.yml: kerneloptions tokens gained a leading
+    underscore (net.ifnames=0 -> _net.ifnames=0) — cosmetic Luna marker, not a
+    hook change.
+  * trinity/image-create/vars/{x64,aa64}/image-ubuntu.yaml: `mdadm` ADDED to the
+    Ubuntu image package list — relevant for legacy RAID/disk installs on Ubuntu
+    (mdadm now present in the Ubuntu osimage).
+  * trinity/luna2 (the daemon role): version/template pins changed; since the
+    daemon ships the diskfull/raid1/nodhcp/default --scripts plugins, a daemon
+    version bump could carry updated plugin bodies (the plugin source is in
+    luna2-daemon, not in these roles).
+- Net: nothing changes the legacy pre/part/post CONTENT to test; only where the
+  role stages the files ({{trix_tmpdir}}) and the added --setupbmc no / Ubuntu
+  mdadm package. Test surface above stands.
+
+
+############################################################################
+============================================================================
+TEST JOURNAL — legacy pre/part/post validation (started 2026-06-07)
+============================================================================
+############################################################################
+
+This is the running journal for the legacy-config test campaign. Goal: run each
+documented legacy config, find what breaks, FIX it, and end with a comprehensive
+"required fixes" doc + the overview table at the bottom.
+
+============================ EXECUTIVE SUMMARY ==============================
+*** RE-BASELINED 2026-06-07 (PM) against the REAL source of truth. ***
+
+SOURCE-OF-TRUTH CORRECTION (important — see [[feedback-daemon-source-of-truth]]).
+The original F1-F11 below were derived against the WRONG sources: the deployed
+runtime daemon (site-packages), the alex/luna2-daemon fork, and prior staged local
+patches. The canonical source is `clustervision/luna2-daemon:development`
+(GIT-FLOW-006 + REPOS.md). Re-checked against development @ cfbf7c4 (cloned at
+/root/git/clustervision-luna2-daemon); several findings were already fixed there.
+
+KEY REFRAME — there is NO lpart in clustervision/luna2-daemon. development (and
+main, development-2.0, main-2.0 — no lpart branch) is the CLASSIC daemon: no
+install_mode lever, no templ_install_lpart.cfg (404), no shim. So the entire lpart
+integration — the F10 install_mode lever, the templ_install.cfg/_lpart rename, the
+shim-skip guard, F11's stale regex — is LOCAL-ONLY to this controller + the alex
+fork. On stock development, legacy IS the normal classic install path (no TUI by
+nature). F10/F11 are therefore NOT upstream defects; they are local lpart-cluster
+coexistence concerns.
+
+PER-FINDING STATUS vs development (supersedes the [A]/[B] tags below):
+  * F1  raid1 NOT disk-fault-tolerant -> STILL A BUG in development (only partly
+        mitigated). development raid1.py RAIDs ONLY root (md0 = p4) and *copies*
+        the bootloader to a second ESP (/boot/efi2 on sdb1), but:
+          - /boot (kernel + initramfs, p2) is on **sda2 ONLY** -- not mirrored,
+            sdb2 left empty; and
+          - the two ESP copies are NOT kept in sync (drift on any grub update).
+        So losing sda: firmware -> sdb1 ESP -> shim -> grub loads, then grub can't
+        find the kernel (/boot was on sda) -> boot fails.
+        HW-CONFIRMED 2026-06-07 (EMPIRICAL, operator pulled sda + rebooted):
+        node001 landed at the **EFI shell = bricked**. The earlier "both ESPs have
+        a bootloader" check was necessary but NOT sufficient -- it only proves the
+        bootloader stage, not the kernel/root stage. (Lesson: a degraded boot must
+        be proven by a real disk-pull + cold reboot, never by inspection or by a
+        post-install "node is up" -- which here reached the OS via the
+        PXE->Luna->local-disk chainload and masked the standalone-disk boot.
+        See [[regression-firmware-disk-boot-gap]].)
+        PROPER FIX = the lpart approach: RAID the WHOLE boot chain -- ESP (md
+        metadata 1.0 so firmware still reads it as FAT) + /boot + root -- so every
+        stage is mirrored AND kept in sync. lpart was dd-failover-tested and boots
+        degraded; development raid1 fails the same test.
+        legacy-lint F1 check corrected: greps for a real /boot-mirror marker
+        (absent in development) -> reports BUG, not the earlier wrong efi2=FIXED.
+  * F3  FAT16 ESP -> FIXED in diskfull + raid1 (mkfs.fat -F 32); REAL only in nodhcp.
+  * F4  parted `name 1"..."` typo -> FIXED in raid1 (has the space); REAL in
+        diskfull + nodhcp (cosmetic).
+  * F5  boot flag on p2 -> development has `set 1 esp on` + `set 2 boot on`; the
+        dev diskfull HW boot SUCCEEDED (Shim1/Boot0000 NVRAM entry added), so the
+        prior "firmware hang" was the STALE plugin, not development. Treat F5 as
+        cosmetic/unconfirmed pending a deliberate re-check.
+  * F6  zero stale md superblocks -> FIXED in development raid1 (mdadm --stop +
+        the /dev/md/* loop before --create).
+  * F8  NVRAM -> development diskfull explicitly adds the Shim1 (Boot0000) entry
+        and reorders BootOrder. Improved vs the old finding.
+  * F2 (doc example), F7 (nodhcp device-name fstab), F9 (cloud device-name fstab)
+        -> STILL REAL on development.
+  * F10/F11 -> LOCAL-ONLY (lpart coexistence), NOT upstream. Kept for this
+        controller's lpart-cluster legacy path only.
+
+WHAT IS DEPLOYED + VALIDATED (this controller, 2026-06-07 PM):
+  * Deployed development's diskfull.py + raid1.py + nodhcp.py and development's
+    templ_install.cfg AS the legacy template, re-applying ONLY the lpart-coexistence
+    shim-skip (now matches tx-node-installer|lpart-node-installer|lpart-phase). The
+    lpart path (lever + templ_install_lpart.cfg) is UNTOUCHED. Backups at
+    /root/luna2-v1.4-patches/legacy/backup-20260607-devsync.
+  * HW: legacy DISKFULL (development plugin + template) installs END-TO-END and
+    boots (sda4 ext4 root, UUID fstab, Shim1/Boot0000 NVRAM entry, status=success).
+
+WHAT REMAINS:
+  * HW-confirm development RAID1 (esp. F1 dual-ESP: pull sdb degraded-OK, pull sda
+    should NOT brick now), nodhcp, and the tmpfs path. (Note: a legacy/stateful
+    node PXE-REINSTALLS on reboot, so dd-failover must be done in a boot-local mode
+    to observe degraded/brick LOCAL boot — see the 2026-06-07 PM journal entry.)
+  * Upstream (clustervision/luna2-daemon:development, human MR): nodhcp F3/F7,
+    diskfull+nodhcp F4, doc F2, cloud F9. Update legacy-lint's F1 check to
+    development's dual-ESP approach.
+
+(The original investigation F1-F11 is retained below as the evidence trail; read
+this summary for current truth.)
+============================================================================
+
+----------------------------------------------------------------------------
+0. How legacy actually runs (architecture — read first)
+----------------------------------------------------------------------------
+`install_mode=legacy` is DAEMON-ONLY. The new Go installer refuses it outright:
+    cmd/lpart-storage-prepare/decide.go:21
+      "install_mode=legacy is daemon-only and must not reach the client"
+So under legacy the node does NOT run the lpart-* binaries. The daemon hands the
+node the old prescript/partscript/postscript (from the role .rd files or the
+`--scripts <plugin>`), and the 95luna dracut network installer (luna2-start.sh)
+executes them verbatim in the install initramfs. The lpart-* tools are bypassed.
+
+Consequence for THIS campaign: we are running the OLD bash scripts inside the
+CURRENT node image / initramfs / daemon. Every failure is therefore one of:
+
+  CLASS A — new-environment regression.
+            The old script worked once but breaks because the CURRENT image,
+            initramfs, daemon, tooling, or path moved under it. Fix = restore
+            the missing capability in the new env (or adapt the staging), NOT
+            the legacy script's logic. Examples to watch:
+              * the installer initramfs no longer writes `AUTO -all` to
+                mdadm.conf in legacy mode (only lpart-storage-prepare does, and it
+                doesn't run here) -> udev incremental assembly can re-grab md
+                members mid-partition (the exact race we killed for the new
+                installer).
+              * a dracut `install_items` tool the old script needs (mkfs.fat,
+                mdadm, parted, swaplabel...) dropped from the current compute
+                image.
+              * the 95luna module path the scripts `rm -rf` moved.
+
+  CLASS B — old-example bug.
+            A defect intrinsic to the legacy script/doc that was always wrong
+            (or wrong-for-UEFI / not-re-entrant / not-HA). Fix = fix the legacy
+            script/plugin/doc itself.
+
+Each finding below is tagged [A] or [B] with a severity (BLOCKER / robustness /
+cosmetic) and a proposed fix. The hardware runs confirm or revise the static
+calls.
+
+----------------------------------------------------------------------------
+1. Static analysis (done 2026-06-07, source-level, pre-hardware)
+----------------------------------------------------------------------------
+Sources read in full: diskfull.py, raid1.py, nodhcp.py, default.py (luna2-daemon
+boot/scripts), the 8 role .rd files, and howtos/disk-full-node.md (live + the
+commented "inspiration" scriptlets).
+
+F1  [B, BLOCKER for sda-loss]  raid1 plugin mirrors ONLY root, not ESP/boot.
+    raid1.py partscript: `set 4 raid on` only; ESP(p1)+boot(p2) are plain and
+    mounted from disk1 alone (mount ${DISK1}1 /boot/efi, ${DISK1}2 /boot). md0 is
+    the root mirror (p4+p4). So losing DISK1 (sda) leaves a healthy root mirror
+    but NO ESP/boot anywhere -> node is unbootable. Losing DISK2 (sdb) is fine
+    (ESP/boot live on the survivor sda). HA is therefore asymmetric and broken
+    for the sda leg. The new installer fixed exactly this with BootMirrorDevice
+    (mirrored os-efi/os-boot md at metadata 1.0). PREDICTS the dd test result:
+    pull sdb -> degraded boot OK; pull sda -> bricked. Fix: mirror p1+p2 as
+    metadata-1.0 md arrays (md-efi, md-boot) like the doc inspiration example /
+    the new installer, write both ESPs, fstab the md.
+
+F2  [B, would-not-run]  doc "inspiration" RAID1 example has a device-path bug.
+    howtos/disk-full-node.md commented block: DISK1=/dev/sda then
+    `mdadm ... /dev/${DISK1}p1` expands to /dev/dev/sdap1. Wrong on two counts
+    (double /dev, and `p1` suffix is for nvme not sata). The example also loops
+    `parted /dev/$DISK ...` with DISK already = /dev/sda -> /dev//dev/sda. It is
+    commented out (not rendered) so it never runs, but it is the example a user
+    copies. Fix: correct to ${DISK1}1 etc, or delete the stale inspiration block.
+    NOTE: this commented example is the ONLY raid example that mirrors ESP+boot
+    (md0/md1/md2) — i.e. its INTENT is more correct than the shipped plugin (F1),
+    it just doesn't execute.
+
+F3  [B, robustness]  FAT16 ESP on every disk plugin. diskfull/raid1/nodhcp all
+    `mkfs.fat -F 16` the ESP even though parted labels it fat32. UEFI wants FAT32
+    on a >512MB ESP; FAT16 is tolerated by many firmwares but not all (and is
+    inconsistent with the parted type). New installer uses vfat/FAT32. Fix:
+    `mkfs.fat -F 32`.
+
+F4  [B, cosmetic/non-fatal]  parted name typo. diskfull + nodhcp:
+    `parted ... -s 'name 1"EFI System Partition"'` — missing space, parted reads
+    the number token as `1"EFI` and errors out (no `set -e`, so it continues; the
+    partition just goes unnamed). raid1 has it correct (`name 1 "EFI ..."`). Fix:
+    add the space.
+
+F5  [B, cosmetic]  boot flag on the wrong partition. diskfull + nodhcp do
+    `set 2 boot on` (flag on /boot, p2) instead of the ESP (p1). On GPT/UEFI the
+    "boot" flag marks the ESP. raid1 correctly does `set 1 boot on`. Harmless on
+    most UEFI but wrong. Fix: `set 1 boot on`.
+
+F6  [B, re-entrancy]  raid1 plugin never zeroes stale md superblocks before
+    `mdadm --create`. Re-running it on disks that already hold an md superblock
+    can make mdadm prompt/refuse, or udev can re-assemble a stale array from the
+    survivors first (Class-A interaction: no `AUTO -all` in the legacy initramfs).
+    This is precisely the re-entrancy failure mode we hardened the new installer
+    against (defensive --zero-superblock + wipefs + AUTO -all). Fix: zero + wipefs
+    each member before create; write `AUTO -all` early.
+
+F7  [B, robustness]  nodhcp uses a device-name fstab (not UUID).
+    CORRECTION (2026-06-07, via legacy-lint against the INSTALLED daemon, not a
+    stale backup): the CURRENT nodhcp.py (159 lines, the version the daemon
+    actually serves) DOES install a bootloader — efibootmgr Shim1 + grub2-mkconfig
+    with DISTRO auto-detect, identical to diskfull's MAKE_BOOT (postscript lines
+    ~142-152). An older backup copy lacked it; the shipped one does not. So
+    nodhcp is "diskfull pinned to /dev/sda + a first-boot dracut re-run service".
+    The remaining real defect: its fstab is hardcoded `/dev/sda4 / ext4` etc.
+    (NOT blkid UUID), so it breaks if the kernel enumerates the disk differently
+    (added controller, NVMe, etc.). It also carries F3/F4/F5 like the others.
+    Fix: switch fstab to UUIDs (as diskfull does).
+
+F8  [B, info]  diskfull NVRAM method vs the new installer. diskfull MAKE_BOOT:
+    deletes any existing Shim1, `efibootmgr --disk <d> --part 1 --create --label
+    Shim1 --loader /EFI/<distro>/shimx64.efi`, grub2-mkconfig. It does NOT create
+    the removable-media fallback EFI/BOOT/BOOTX64.EFI, does NOT set BootNext/Order,
+    and does NOT clear the firmware-recreated <distro>/fbx64 NVRAM entry. The new
+    installer (lpart-bootloader-finalise) adds BOOTX64.EFI fallback + degraded-safe
+    grub.cfg + handles the fbx64 CSV. So legacy diskfull is more fragile on
+    firmwares that drop/re-order NVRAM (and on VMware, per the §3.4b flakiness in
+    the new-installer journal). To analyse empirically in the diskfull hardware run.
+
+F9  [B, robustness, cloud-scoped]  cloud part/post.rd: single ext4 root only.
+    No ESP, no /boot, no bootloader install — makes one ext4 "root" partition,
+    mkfs.ext4, mounts /sysroot, fstabs it by DEVICE NAME (not UUID). Boots only
+    where the cloud platform supplies the boot chain. Uses a `parted
+    ---pretend-input-tty | fix` hack to auto-answer GPT-repair prompts (fragile).
+    By-design for cloud images; document as "not standalone-bootable on bare
+    metal", and the device-name fstab is a fragility note (Class B, cloud niche).
+
+CLASS-A resolution (checked on the controller's /trinity/images/compute-image,
+2026-06-07):
+A1  RESOLVED — NO baked `AUTO -all` mdadm.conf in the compute image, and
+    lpart-storage-prepare (the only writer) does not run in legacy. => the legacy
+    install initramfs has NO udev-assembly guard. This CONFIRMS F6 is a real
+    exposure: a re-run raid1 plugin can lose the md-create race to udev. (The
+    raid1 plugin's own postscript writes AUTO -all into the INSTALLED system's
+    mdadm.conf, but that is post-pivot — too late to protect the install-time
+    create.) Severity of F6 stands: re-entrancy BLOCKER on second run.
+A2  RESOLVED — install_items DOES bake the disk tools:
+      mkswap swaplabel mkfs.vfat mkfs.fat mkdosfs mdadm fdisk parted ... (and
+      mkfs.ext4 + the binaries are present in the image rootfs). efibootmgr and
+      grub2-mkconfig run via `chroot /sysroot` from the installed OS, so they do
+      not need to be in install_items. => missing-tool Class-A risk LOW.
+A3  RESOLVED — 95luna is at /lib/dracut/modules.d/95luna in the image; the
+      diskfull/nodhcp `rm -rf /sysroot/lib/dracut/modules.d/95luna/` path is
+      correct. => path-moved Class-A risk NONE.
+
+Net Class-A surface: small. The one live Class-A interaction is A1 (no AUTO -all)
+which amplifies the Class-B re-entrancy bug F6. Everything else the current image
+still provides.
+
+F10 [A, BLOCKER — legacy is DEAD on the current client]  the lpart thin-shim
+    install.sh front-runs lpart-node-installer in every phase, and the part phase
+    hard-refuses install_mode=legacy, so NO legacy customscript ever runs.
+    CONFIRMED ON HARDWARE (node001, 2026-06-07, diskfull run — see §2a):
+      * The daemon, for install_mode=legacy + scripts=diskfull, served the NEW
+        lpart-shim install.sh and STAGED the legacy plugin scripts at
+        /lunatmp/scripts/diskfull-{pre,part,post}.sh.
+      * install.sh runs each phase as: (1) a "thin shim" that execs
+        `lpart-node-installer --phase <p>`, then (2) `customscript <p>` which runs
+        the staged legacy diskfull-<p>.sh — BUT only if the shim returned 0.
+      * Phase pre: lpart pre = prepare-runtime (no storage) -> exit 0 -> diskfull-pre
+        ran (we saw "DISKFULL script: my-local-disk override found").
+      * Phase part: lpart part -> lpart-storage-prepare -> sees install_mode=legacy ->
+          "lpart-storage-prepare: install_mode=legacy is daemon-only and must not
+           reach the client"  -> exit status 1
+        (decide.go:21). install.sh then prints "Part script exited with exit code
+        1. Stop install." and ABORTS -> `customscript part` is never reached ->
+        diskfull-part.sh NEVER EXECUTES (grep of the whole install log: no
+        "DISKFULL script: creating/formatting/mounting"). 6 retry loops, all
+        identical (lpart-node-installer-part.log).
+    ROOT CAUSE: a contract break between daemon and client. decide.go says legacy
+    "must not reach the client", i.e. the daemon was supposed to (a) never send
+    install_mode=legacy to a lpart-shim node, or (b) serve the OLD install.sh for
+    legacy (no lpart shims; just unpack + customscript). Neither happened: the daemon
+    sent legacy AND served the lpart-shim install.sh. The client correctly refuses;
+    the daemon's legacy routing is missing.
+    IMPACT: ALL 8 legacy hook configs (diskfull/raid1/nodhcp + the 5 .rd/tmpfs
+    cases via customscript) are untestable & unusable as-is on a cluster running
+    the current luna2-client — they all die at this same point, before their own
+    partscript. This supersedes the per-script findings F1-F9 as the thing to fix
+    FIRST: until F10 is fixed, F1-F9 can only be checked statically (legacy-lint).
+    Additional secondary conflicts the legacy path would hit even past part (must
+    also be handled by the fix): lpart pre drops /lunatmp/skip_unpack (the legacy
+    path needs the image unpack), and lpart post = lpart-bootloader-finalise would
+    collide with the plugin's own grub/shim postscript.
+    REQUIRED FIX (see §4): primarily daemon-side (serve a legacy install.sh, or
+    reject legacy at luna-CLI on lpart-client clusters); optionally a clearer
+    client-side guard. Tracked for staging, not pushed (clustervision repo).
+    SECONDARY OBSERVATION (good news): in THIS install initramfs udev did NOT
+    auto-assemble the prior md arrays (mdstat "unused devices: <none>"), so the
+    A1/F6 race did not fire on this boot — though sda1/2/3 still carry
+    linux_raid_member superblocks (parted never got to repartition them).
+
+----------------------------------------------------------------------------
+2. Hardware runs (node001)
+----------------------------------------------------------------------------
+2a. diskfull legacy install (2026-06-07) -> FIRST RUN BLOCKED by F10 (install
+    fails at partscript "exit code 1" because the lpart-shim part phase refuses
+    legacy; diskfull-part.sh never executed). This DIAGNOSED F10.
+    --- F10 FIX BUILT + DEPLOYED (2026-06-07) ---
+    Implemented the daemon-side fix (staged at /root/luna2-v1.4-patches/legacy,
+    deployed live on this controller, see §4 P0 + that README). Naming convention:
+    the ORIGINAL name templ_install.cfg is reserved for legacy/original behaviour;
+    the v1.4 lpart pipeline is renamed to templ_install_lpart.cfg.
+      * daemon/templates/templ_install.cfg (now the LEGACY/original template) —
+        restores real unpack_imagefile + download_image, and runs pre/part/post via
+        customscript (skipping the lpart-shim FIELD via `grep -q lpart-node-installer`).
+        No lpart pipeline, no TUI.
+      * daemon/templates/templ_install_lpart.cfg — the v1.4 lpart-pipeline template,
+        byte-for-byte the file that used to be templ_install.cfg.
+      * daemon/base/boot.py install() lever — default (no-method) path routes by
+        install_mode: legacy -> templ_install.cfg; everything else ->
+        templ_install_lpart.cfg (mirrors kickstart's per-method template). boot.py
+        compiles; daemon restarted clean.
+    VERIFIED both renders: GET /boot/install/node001 returns templ_install_lpart.cfg
+    when install_mode=auto, and the LEGACY templ_install.cfg when
+    install_mode=legacy — real "Un-packing imagefile", legacy shim-guards,
+    download_torrent/http injected, customscript wired to diskfull, flow
+    prescript->partscript->download_image->unpack_imagefile->postscript, no
+    lpart-osimage no-op stub.
+    --- SECOND RUN (post-fix) : SUCCESS (2026-06-07) ---
+    With the legacy template (templ_install.cfg) deployed, the legacy diskfull ran
+    END-TO-END and the node BOOTED the disk. node001 layout (was xfs/LVM under
+    auto; now the diskfull scheme):
+        sda1 vfat  /boot/efi (953M)   sda2 ext4 /boot (953M)
+        sda3 swap  (1.9G)             sda4 ext4 /     (21.3G)
+    findmnt / = /dev/sda4 ext4; UUID fstab; luna status="Luna installer: success".
+    => F10 FIX VALIDATED: the diskfull plugin's own pre/part/post executed (was
+    impossible pre-fix). The fix is correct + sufficient for the --scripts path.
+
+    EMPIRICAL confirmation of the static defects on this live install:
+    * F5 CONFIRMED (with real consequence): `set 2 boot on` placed the EF00
+      ESP-type GPT flag on PARTITION 2 (the ext4 /boot), not the real vfat ESP
+      (sda1). parted: "2 ... ext4 boot  boot, esp". Firmware ESP-by-type lands on
+      a partition with NO EFI payload -> the node boots via the Luna
+      netboot->localboot chain (BootCurrent=EFI Network), not a clean disk ESP
+      entry. So F5 is not cosmetic on this firmware path.
+    * F3 CONFIRMED: ESP is FAT16 (blkid SEC_TYPE="msdos") from `mkfs.fat -F 16`.
+    * F8 REVISED: EFI/BOOT/BOOTX64.EFI + fbx64.efi ARE present (from the OS
+      image's shim RPM, NOT created by diskfull -- correcting the earlier guess).
+      No persistent "Shim1" disk NVRAM entry stuck (BootOrder has a dangling
+      0000); boot relies on the netboot->localboot chain (matches the VMware
+      NVRAM flakiness noted for the new installer in JOURNAL §G 2026-06-04).
+    * F4 (parted `name 1"` typo) ran harmlessly (no set -e); partition 1 just
+      came up unnamed/efi-labelled -- consistent with static call.
+    Note: diskfull is single-disk (sda); sdb/sdc/sdd still carry stale md
+      superblocks from the prior install (inactive md124-127) -- diskfull never
+      touches them (expected; the F6 re-entrancy concern is raid1-specific).
+2b. raid1 dd-failover (Task #21) — STALLED: node001 did NOT come back after the
+    reboot into the raid1 attempt. Symptoms (2026-06-07): ping 100% loss / SSH
+    "No route to host"; ARP for node001 INCOMPLETE; NO new DHCP request; NO
+    /boot/install/node001 fetch in the daemon log for this cycle. => the node
+    never PXE'd for raid1 — it hung at FIRMWARE on the reboot, most likely due to
+    the prior diskfull install leaving VMware EFI unbootable: F5 put the EF00/ESP
+    GPT flag on the wrong partition (ext4 /boot, not the vfat ESP) AND a dangling
+    Boot0000 NVRAM entry sat first in BootOrder. So this is a downstream
+    consequence of the diskfull F5/NVRAM defects, not a raid1-install failure (the
+    raid1 install never started). node001 IPMI is dead; recovery needs a vSphere
+    power-cycle (govc is installed but unconfigured here). Node pre-set back to
+    install_mode=auto/default so a power-cycle yields a clean reinstall.
+    AWAITING operator power-cycle to resume. The raid1 + dd-failover (confirm F1)
+    is deferred to the next session/cycle once node001 is recovered.
+    [ ] 2c. tmpfs-by-hand diskless — pending (will work now F10 is fixed; the
+            legacy template's shim-guard runs a -qpart .rd field directly).
+
+----------------------------------------------------------------------------
+3. Overview table — every legacy script example
+----------------------------------------------------------------------------
+(status: STATIC = source-reviewed only; HW = hardware-confirmed)
+*** GLOBAL: F10 (legacy dead on lpart clients) — FIXED 2026-06-07. The daemon now
+    serves the LEGACY templ_install.cfg (original name reclaimed) for
+    install_mode=legacy and the renamed templ_install_lpart.cfg for the v1.4 lpart
+    pipeline (deployed on this controller; staged at /root/luna2-v1.4-patches/
+    legacy for the MR). Legacy diskfull HW-VALIDATED: installs + boots. raid1 HW
+    test deferred (node power-cycle). Remaining per-script defects
+    (F1,F3-F6,F9) still apply. ***
+
+  #  Example (path)                         Boot model      Findings        Status
+  -- -------------------------------------- --------------- --------------- ------
+  1  redhat part/post.rd                    tmpfs (NUMA)    mpol ok; doc     STATIC
+     group-create/files/redhat                             omits mpol(C1*)
+  2  ubuntu part/post.rd                    tmpfs ($rootmnt) ok              STATIC
+  3  opensuse part/post.rd                  tmpfs (plain)   ok (= doc dflt)  STATIC
+  4  cloud part/post.rd                     local disk      F9 (cloud niche) STATIC
+     cloud/luna/files                       (ext4 root only)
+  5  default.py (--scripts default)         none (empty)    ok (resets)      STATIC
+  6  diskfull.py (--scripts diskfull)       single disk     F3 F5 confirmed; HW ✓
+     (post-F10-fix: installs+boots)                         F4 harmless; F8 rev
+  7  raid1.py (--scripts raid1)             2-disk mirror   F1 F3 F6         DEFERRED*
+  8  nodhcp.py (--scripts nodhcp)           single disk     F3 F4 F5 F7      STATIC
+  9  howtos/disk-full-node.md (live)        plugins         describes 6/7 ok STATIC
+  9e howtos/.. manual diskfull (commented)  single disk     diverges fr. #6  STATIC
+  9r howtos/.. manual raid1 (commented)     3-md mirror     F2 (won't run)   STATIC
+  10 recipes/disk-full-node.md (orphan)     dup of 9        stale dup        STATIC
+  11 admin/luna.md default table            tmpfs           C1*: omits mpol  STATIC
+  12 admin/node.md tailoring postscript     n/a             ok               STATIC
+  13 admin/luna-plugins.md plugin list      n/a             ok               STATIC
+
+  C1* = doc shows plain `mount -t tmpfs tmpfs /sysroot` as the default, but the
+        RedHat-family default .rd ships `mount -o mpol=interleave` — doc/ship drift.
+
+----------------------------------------------------------------------------
+4. Required fixes (the deliverable)
+----------------------------------------------------------------------------
+Ordered by priority. F10 is the gate: nothing else can be hardware-validated
+until it lands. Repo column: where the fix lives (clustervision repos are STAGED
+locally + documented for a human MR, not pushed — repo-scope rule).
+
+PRIORITY 0 — make legacy runnable again  [DONE — implemented + deployed]
+  F10 [A, BLOCKER]  luna2-daemon.  install_mode=legacy must select the legacy
+      install template instead of the lpart-pipeline one. IMPLEMENTED as a NAMING
+      convention (the original name is reserved for legacy; the lpart pipeline gets
+      its own name), reusing the per-method-template machinery
+      (daemon/base/boot.py:1362-1363; templ_install_kickstart.cfg precedent):
+        (a) RENAME daemon/templates/templ_install.cfg -> templ_install_lpart.cfg
+            (the v1.4 lpart pipeline, unchanged content).
+        (b) ADD daemon/templates/templ_install.cfg = the LEGACY/original template:
+            prescript/partscript/postscript run `customscript <stage>` (skipping
+            the node FIELD when it is the lpart thin shim, via `grep -q
+            lpart-node-installer`), and the image is laid down by the template's own
+            restored unpack_imagefile + download_image (NOT lpart-osimage-install).
+            No /lunatmp/skip_unpack drop, no TUI.
+        (c) boot.py install() lever: default (no-method) path routes by
+            install_mode — legacy -> templ_install.cfg; everything else ->
+            templ_install_lpart.cfg. (install_mode is already in the node data.)
+      Net: in legacy the node never invokes lpart-node-installer; it runs the old
+      prescript/partscript/postscript + unpack, exactly as pre-lpart Luna did. The
+      client guard (decide.go:21) then correctly never sees legacy.
+      STATUS: staged at /root/luna2-v1.4-patches/legacy + deployed on this
+      controller; both renders verified; legacy diskfull HW-validated (boots).
+      ALT (if legacy is being retired): instead reject install_mode=legacy at the
+      luna CLI / daemon with a clear message ("legacy unsupported on lpart clients")
+      rather than letting it fail opaquely at the partscript. Either way the
+      current silent "Part script exited with exit code 1" must go.
+      Client-side (THIS repo, optional hardening): lpart-storage-prepare/decide.go
+      could emit a louder, actionable error naming the daemon-template fix, so a
+      mis-served legacy node fails with a diagnosis, not a bare refusal.
+
+PRIORITY 1 — raid1 HA correctness (once F10 lets it run)
+  F1 [B, BLOCKER]  luna2-daemon raid1.py: mirror ESP(p1)+boot(p2) as metadata-1.0
+      md arrays (md-efi/md-boot), write both ESPs, fstab the md — so either leg
+      boots alone. Model: the new installer's BootMirrorDevice (and the doc's own
+      commented md0/md1/md2 example). Without it, losing disk1 = unbootable.
+  F6 [B, BLOCKER]  raid1.py: zero+wipefs each md member before `mdadm --create`,
+      and write `AUTO -all` early in the partscript (the legacy initramfs has no
+      such guard — A1), so a re-run over stale superblocks is deterministic.
+
+PRIORITY 2 — UEFI/ESP hygiene (all disk plugins)
+  F3  mkfs.fat -F 32 (not -F 16) for the ESP.            diskfull/raid1/nodhcp
+  F4  parted: `name 1 "EFI System Partition"` (add space). diskfull/nodhcp
+  F5  `set 1 boot on` (ESP), not `set 2`.                 diskfull/nodhcp
+
+PRIORITY 3 — fstab robustness / docs
+  F7  nodhcp: fstab by UUID, not /dev/sdaN.               luna2-daemon nodhcp.py
+  F9  cloud post.rd: fstab root by UUID, not device name. trinityx-combined
+  F2  howto raid1 inspiration: fix /dev/${DISK}p1 -> ${DISK}1 (or delete the
+      commented block). It is the only example that mirrors ESP+boot — worth
+      fixing into the live page as the correct raid1 recipe.  trinityx-docs
+  C1* admin/luna.md: note the RedHat default uses mpol=interleave.  trinityx-docs
+
+VALIDATION HOOKS
+  * scripts/dev/legacy-lint.sh — static guard for F1-F9 (flips green per fix).
+  * regression.md §3.21 (lint), §3.22 (diskfull+NVRAM), §3.23 (raid1 dd-failover).
+  * §3.22 (diskfull) PASSED post-fix; §3.23 (raid1) deferred to node recovery.
+    Both depend on the legacy templ_install.cfg + templ_install_lpart.cfg routing.
+
+(Assembled by Task #22 from F1-F10 + the 2026-06-07 diskfull hardware run.)
+
+############################################################################
+
+F11 [A, BLOCKER — supersedes F10's root cause]  legacy lever works, but its
+    shim-skip regex is stale after the tx->lpart rename.
+    CONFIRMED ON HARDWARE (node001, 2026-06-07 PM, diskfull re-run):
+      * F10's fix (the install_mode legacy lever in base/boot.py + a legacy
+        templ_install.cfg whose pre/part/post SKIP the lpart thin-shim FIELD and
+        run customscript instead) IS deployed live and the lever DOES serve
+        templ_install.cfg for install_mode=legacy. So F10's stated root cause
+        ("legacy routing missing") is no longer the issue.
+      * BUT the shim-skip guard greps the PRE-RENAME marker:
+            grep -qE 'tx-node-installer|lpart-node-installer' /lunatmp/<stage>script.sh
+        The GLOBAL RENAME changed the thin shim to `exec /usr/bin/lpart-phase
+        <stage>`, which matches NEITHER alternative. Verified: the guard prints
+        "legacy mode -- skipping ..." when it fires; the 16:04-16:09 retry cycles
+        on node001 show ZERO such lines (the 6 in history are pre-rename). Direct
+        check: `printf 'exec /usr/bin/lpart-phase part' | grep -qE
+        'tx-node-installer|lpart-node-installer'` -> NO MATCH.
+      * Net: guard never skips -> the lpart-phase shim runs under legacy ->
+        lpart-storage-prepare hits decide.go:21 ("install_mode=legacy is
+        daemon-only and must not reach the client") -> exit 1 -> "Part script
+        exited with exit code 1. Stop install." -> luna2-start.sh retries the
+        same un-retryable failure forever. This is also why the operator saw the
+        TUI in legacy mode at all.
+    ROOT CAUSE: one stale regex in templ_install.cfg (3 occurrences). The rename
+    updated the shims and the client but not the legacy template's shim detector.
+    FIX (staged at /root/luna2-v1.4-patches/legacy, NOT pushed — clustervision):
+      (A) templ_install.cfg: add `|lpart-phase` to the 3 shim-skip greps. With the
+          shim skipped, legacy runs ONLY customscript (the --scripts plugin): no
+          lpart, no TUI -- "legacy means legacy". [APPLIED in the staged copy.]
+      (B) both templates: `exit 1` -> `exit $LUNARET` in the pre/part/post
+          handlers, so install.sh propagates a fatal exit code. [Specified in the
+          staged README; deliberately left for the human MR.]
+    CLIENT-SIDE (luna2-client, branch advanced-partitioner — DONE, make check green):
+      * lpart-node-installer refuses install_mode=legacy at startup: plain console
+        FATAL, NO TUI, NO pipeline, exit code 3 (exitFatalConfig). Reads the
+        daemon-written install-context.json (installcontext.LoadFile). Backstop so
+        a mis-served legacy node fails plainly instead of in a buried TUI error.
+        (cmd/lpart-node-installer/main.go + main_test.go TestLegacyRefusal.)
+      * luna2-start.sh (redhat/x86): captures install.sh's real exit code and, on
+        the fatal sentinel (3), parks in a maintenance shell (fatal_park) instead
+        of the retry_countdown loop. Needs daemon fix (B) to receive the 3.
+    STATUS: campaign still BLOCKED on hardware until fix (A) is deployed to the
+    live daemon (or the node's shim overrides are cleared). node001 left at its
+    healthy auto baseline.

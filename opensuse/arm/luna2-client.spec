@@ -47,9 +47,15 @@ Requires:      bind-utils
 Requires:      mdadm                                                                                                                                                                         
 Requires:      pciutils                                                                                                                                                                      
 Requires:      dosfstools                                                                                                                                                                    
-Requires:      dhcp-client                                                                                                                                                                   
-Requires:      dmidecode                                                                                                                                                                     
-Requires:      util-linux                                                                                                                                                                    
+Requires:      dhcp-client
+Requires:      dmidecode
+Requires:      util-linux
+# advanced-partitioner (lpart) storage steps need sgdisk + jq in the install
+# initramfs; SLE's image_core_packages ships neither, so pull them via the
+# client package (mirrors the ubuntu deb Depends gdisk,jq). Without these the
+# opensuse install initramfs lacks sgdisk/jq and lpart dies at partition time.
+Requires:      gptfdisk
+Requires:      jq
                                                                                                                                                                                              
 %clean                                                                                                                                                                                       
 echo "No need to remove the source"                                                                                                                                                          

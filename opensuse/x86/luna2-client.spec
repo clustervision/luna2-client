@@ -1,7 +1,7 @@
 BuildArch:     %{_arch} 
 Name:          luna2-client
-Version:       2.0 
-Release:       20
+Version:       2.0
+Release:       21
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes for Suse/SLE based distributions
 
@@ -50,6 +50,12 @@ Requires:      dosfstools
 Requires:      dhcp-client
 Requires:      dmidecode
 Requires:      util-linux
+# advanced-partitioner (lpart) storage steps need sgdisk + jq in the install
+# initramfs; SLE's image_core_packages ships neither, so pull them via the
+# client package (mirrors the ubuntu deb Depends gdisk,jq). Without these the
+# opensuse install initramfs lacks sgdisk/jq and lpart dies at partition time.
+Requires:      gptfdisk
+Requires:      jq
 
 %clean
 echo "No need to remove the source"
@@ -62,14 +68,29 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/bashrc"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-parse-cmdline.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna2-start.sh"
+%attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-installer.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/module-setup.sh"
+%attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/lpart-phase"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/profile"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/sshd_config"
 %attr(0755, root, root) "/usr/lib64/libluna-fakeuname.so"
 %attr(0755, root, root) "/etc/dracut.conf.d/luna2.conf"
 %attr(0755, root, root) "/usr/sbin/dhclient-script-luna"
+%attr(0755, root, root) "/usr/bin/lpart-storage-prepare"
+%attr(0755, root, root) "/usr/bin/lpart-storage-check"
+%attr(0755, root, root) "/usr/bin/lpart-osimage-install"
+%attr(0755, root, root) "/usr/bin/lpart-bootloader-finalise"
+%attr(0755, root, root) "/usr/bin/lpart-node-installer"
+%attr(0755, root, root) "/usr/bin/lpart-emit"
+%attr(0755, root, root) "/usr/bin/lpart-tui"
 
 %changelog
+* Tue Jun 09 2026 Alex Ninaber
+- Align opensuse to the shared 95luna dracut module: ship luna-installer.sh
+  (the byte-identical installer body sourced by luna2-start.sh), the lpart-phase
+  pre/part/post shim, and the advanced-partitioner lpart-* localboot binaries
+  (built + staged by create_rpm.sh, as on redhat). Brings SUSE onto the single
+  unified installer, incl. the dropbear /etc/shells SSH-into-installer fix.
 * Thu Apr 17 2025 Antoine Schonewille
 - allowing dhclient in non standard locations
 

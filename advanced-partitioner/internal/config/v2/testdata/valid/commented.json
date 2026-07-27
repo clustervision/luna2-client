@@ -1,0 +1,1 @@
+{"version":2,"comment":"production compute nodes","sets":[{"name":"os","role":"os","selection":"discover","raid":"none","comment":"the OS set","volumes":[{"name":"uefi","mountpoint":"/boot/efi","fs":"vfat","provider":"partition","size":"600M"},{"name":"root","mountpoint":"/","fs":"xfs","provider":"lvm","size":"100%","comment":"root fs"}]}]}

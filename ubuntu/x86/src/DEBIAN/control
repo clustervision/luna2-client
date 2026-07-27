@@ -1,5 +1,6 @@
 Package: luna2-client
 Version: 2.0
 Maintainer: ClusterVision
-Architecture: x86-64
-Description: Initramfs module for Luna deployment tool
+Architecture: amd64
+Depends: initramfs-tools, shim-signed, grub-efi-amd64-signed, grub-efi-amd64-bin, mdadm, lvm2, gdisk, fdisk, lsscsi, jq, parted, dosfstools, lbzip2, aria2, efibootmgr, grepcidr, curl, openssh-server, dropbear-bin, tpm2-tools
+Description: Luna node install module (initramfs-tools, with lpart advanced-partitioner support)

@@ -1,0 +1,136 @@
+flowchart TD
+    Start([Operator pins Luna fields:<br/>install_mode, osimage_sync,<br/>disklayout, discover_config, osimage_filter]) --> LunaTrigger
+
+    subgraph LunaPhase[Luna phase]
+        LunaTrigger["Luna PXE-boots node<br/>into minimal Linux on tmpfs"]
+        LunaTrigger --> InstallSh["Luna install.sh template runs<br/>download_image + unpack_imagefile<br/>are no-op stubs (Phase 14f patch)"]
+        InstallSh --> WriteJsons["write_lpart_inputs:<br/>inline Luna fields into runtime/"]
+        WriteJsons --> IC[("install-context.json<br/>install_mode<br/>osimage_sync")]
+        WriteJsons --> Storage[("storage.json<br/>v2 layout, may be empty")]
+        WriteJsons --> Discover[("discover-config.json<br/>lpart-discover inputs, may be empty")]
+        WriteJsons --> Filter[("osimage-filter.json<br/>preserve/preserve_empty/no_new_files")]
+        WriteJsons --> Prescript
+    end
+
+    subgraph Pre[Prescript]
+        Prescript["prescript.sh<br/>tool: curl + tar"]
+        Prescript --> Toolbox["Fetch installer-go-toolbox-amd64.tar.gz<br/>from Luna files server<br/>extract to /tmp/install_files/"]
+    end
+
+    Toolbox --> InstallCtx
+
+    subgraph Part[Partscript]
+        InstallCtx["lpart-install-context<br/>--json-in / --out round-trip<br/>(precedence: explicit &gt; file &gt; defaults)"]
+        IC -.read.-> InstallCtx
+        InstallCtx --> IC2[("install-context.json<br/>resolved + validated")]
+        IC2 --> ModeDecision
+
+        ModeDecision{"install_mode?"}
+        ModeDecision -->|mem| MemDefault["Use storage.json as-is<br/>or write memory-root default"]
+        ModeDecision -->|force-init| ForceInit["Require discover-config.json"]
+        ModeDecision -->|auto| AutoRoute{"storage.json populated?"}
+        AutoRoute -->|yes| UseStorage["Use storage.json as-is"]
+        AutoRoute -->|no| AutoDisc{"discover-config.json<br/>populated?"}
+        AutoDisc -->|yes| RunDiscover
+        AutoDisc -->|no| MemDefault
+        ForceInit --> RunDiscover
+
+        RunDiscover["lpart-discover --config / --out<br/>tool: lsblk"]
+        Discover -.read.-> RunDiscover
+        RunDiscover --> StorageWritten[("storage.json<br/>WRITTEN by lpart-discover")]
+
+        UseStorage --> Prepare
+        MemDefault --> Prepare
+        StorageWritten --> Prepare
+
+        Prepare["lpart-storage-prepare --wipe --details<br/>per-set orchestrator"]
+        Storage -.read.-> Prepare
+        Prepare --> PersistDecision{"set.safety.persistent?"}
+        PersistDecision -->|true| MountOnly["Skip cleanup+create<br/>predict + mount only"]
+        PersistDecision -->|false| Cleanup["Cleanup cascade<br/>tool: lsblk / wipefs / dmsetup /<br/>vgremove / mdadm --stop / sgdisk --zap-all"]
+        Cleanup --> Partition["Partition<br/>tool: sgdisk + partprobe"]
+        Partition --> RaidDecision{"raid mode?"}
+        RaidDecision -->|none| LVMStage
+        RaidDecision -->|raid1/5/6/10| RAID["RAID assembly<br/>tool: mdadm --create<br/>(metadata 1.0 for /boot, /boot/efi;<br/>1.2 for storage)"]
+        RAID --> LVMStage
+        LVMStage["LVM<br/>tool: pvcreate, vgcreate, lvcreate"]
+        LVMStage --> FS["Filesystems<br/>tool: wipefs, mkfs.xfs / mkfs.ext4 /<br/>mkfs.fat / mkswap"]
+        FS --> MountTree["Mount tree under /sysroot<br/>tool: mount"]
+        MountOnly --> MountTree
+        MountTree --> PrepareOut
+
+        PrepareOut[("storage-result.json<br/>+ storage-resolved.json<br/>WRITTEN by lpart-storage-prepare<br/>FirstInstall set when --wipe applied")]
+        PrepareOut --> SyncDecision
+
+        SyncDecision{"osimage_sync?"}
+        SyncDecision -->|Sync| OsImageSync["lpart-osimage-install --config<br/>filter: preserve / preserve_empty /<br/>no_new_files"]
+        Filter -.read.-> OsImageSync
+        SyncDecision -->|Full| OsImageFull["lpart-osimage-install<br/>(no filter)"]
+        SyncDecision -->|Local| StorageCheck["lpart-storage-check<br/>tool: blkid + fsck.*<br/>(exit 2 = safety_refusal=persistent)"]
+
+        PrepareOut -.read FirstInstall + persistent excludes.-> OsImageSync
+        PrepareOut -.read.-> OsImageFull
+
+        OsImageSync --> FirstInstallCheck{"FirstInstall?"}
+        FirstInstallCheck -->|true| PromoteFull["Promote Sync -&gt; Full<br/>filter list zeroed"]
+        FirstInstallCheck -->|false| KeepFilter["Honour filter"]
+        PromoteFull --> Download
+        KeepFilter --> Download
+        OsImageFull --> Download
+
+        Download["Download OS image<br/>tool: aria2c (torrent)<br/>fallback: curl (HTTP)<br/>LUNA_TOKEN read from<br/>/lunatmp/install.sh"]
+        Download --> Extract["Extract to /sysroot<br/>tool: tar -x<br/>--exclude per filter + persistent mountpoints"]
+    end
+
+    Extract --> LunaInternals
+    StorageCheck --> LunaInternals
+
+    LunaInternals["Luna bash flow continues:<br/>change_net + node_secrets<br/>populate /sysroot/etc/"]
+    LunaInternals --> Postscript
+
+    subgraph Post[Postscript]
+        Postscript["postscript.sh"]
+        Postscript --> Finalise["lpart-bootloader-finalise --result --boot-context-out"]
+        PrepareOut -.read.-> Finalise
+        Finalise --> Fstab["Write /sysroot/etc/fstab"]
+        Fstab --> Family{"distro family?<br/>(detect via<br/>/sysroot/etc/os-release)"}
+        Family -->|rhel / rocky / alma| RhelAdapter["RHEL adapter"]
+        Family -->|debian / ubuntu| DebianAdapter["Debian adapter"]
+        Family -->|suse| SuseStub["SUSE stub<br/>(not implemented)"]
+        Family -->|none| NoBootloader["No-op<br/>(boot.method = none)"]
+
+        RhelAdapter --> FwModeR{"FirmwareMode?"}
+        DebianAdapter --> FwModeD{"FirmwareMode?"}
+        FwModeR -->|bios| BiosR["grub2-install per disk<br/>via chroot /sysroot"]
+        FwModeR -->|uefi| UefiSigned["StageSignedShim:<br/>copy distro's signed<br/>shimx64.efi + grubx64.efi<br/>to /EFI/BOOT/<br/>write BOOTX64.CSV"]
+        FwModeD -->|bios| BiosD["grub-install per disk<br/>via chroot /sysroot"]
+        FwModeD -->|uefi| UefiSigned
+
+        BiosR --> Mkconfig["grub2-mkconfig -o<br/>/boot/grub2/grub.cfg<br/>via chroot"]
+        BiosD --> Mkconfig
+        UefiSigned --> Mkconfig
+
+        Mkconfig --> Dracut["dracut -f --omit luna --kver &lt;ver&gt;<br/>via chroot /sysroot"]
+        Dracut --> BindMount["Bind-mount /proc /sys /dev<br/>tool: mount --rbind + --make-rslave<br/>(plain --bind hides efivars)"]
+        BindMount --> ClearDecision{"ClearUEFINVRAM?"}
+        ClearDecision -->|true| ClearNvram["Delete stale UEFI entries<br/>(label NOT in PXE/Network/Luna/iPXE)<br/>tool: efibootmgr in chroot"]
+        ClearDecision -->|false| RegisterNvram
+        ClearNvram --> RegisterNvram["Register TrinityX entries<br/>per BootDevice + reorder BootOrder<br/>tool: efibootmgr in chroot"]
+        NoBootloader --> BootCtxOut
+        RegisterNvram --> BootCtxOut
+
+        BootCtxOut[("boot-context.json<br/>WRITTEN by lpart-bootloader-finalise")]
+        BootCtxOut --> PostBack
+        SuseStub --> PostBack
+
+        PostBack["POST storage-resolved.json<br/>back to Luna as disklayout_b64<br/>tool: curl<br/>(failure logged, not fatal)"]
+        PrepareOut -.read.-> PostBack
+    end
+
+    PostBack --> Reboot([Reboot into provisioned node])
+
+    classDef json fill:#fef3c7,stroke:#92400e,stroke-width:1.5px,color:#000;
+    classDef decision fill:#dbeafe,stroke:#1e40af,stroke-width:1.5px,color:#000;
+    classDef tool fill:#ecfdf5,stroke:#065f46,stroke-width:1px,color:#000;
+    class IC,IC2,Storage,Discover,Filter,StorageWritten,PrepareOut,BootCtxOut json;
+    class ModeDecision,AutoRoute,AutoDisc,PersistDecision,RaidDecision,SyncDecision,FirstInstallCheck,Family,FwModeR,FwModeD,ClearDecision decision;

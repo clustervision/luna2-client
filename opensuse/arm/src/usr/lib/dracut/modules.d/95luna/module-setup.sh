@@ -19,6 +19,11 @@ install() {
                      libsoftokn3.so libsqlite3.so libtss2-tcti-device.so.0
 
     inst "$moddir/sshd_config" "/etc/ssh/sshd_config"
+    # sshd privilege-separation dir (compiled-in default on el9; sshd refuses to start without it)
+    inst_dir /usr/share/empty.sshd
+    # OpenSSH >=9.8 (el9) splits per-connection handling into sshd-session;
+    # sshd refuses to start without it. Optional: older images lack it.
+    inst_multiple -o /usr/libexec/openssh/sshd-session /usr/libexec/openssh/sftp-server
     inst "$moddir/bashrc" "/root/.bashrc"
     inst "$moddir/profile" "/root/.profile"
     inst_simple /etc/ssh/ssh_host_rsa_key

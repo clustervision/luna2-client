@@ -1,0 +1,32 @@
+# Build output
+bin/
+dist/
+*.test
+*.out
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test coverage
+coverage.out
+coverage.html
+
+# Local-only overrides
+.envrc
+local.env
+
+# Toolbox tarballs (built artefacts only)
+*.tar
+*.tar.gz
+*.tar.bz2
+
+# Generated doc intermediate (the .pdf is the tracked deliverable; build-pdf.py writes this)
+docs/storage-provisioning-model.html

@@ -1,0 +1,52 @@
+# golangci-lint configuration for installer-go.
+#
+# Rationale and review notes live in BOOKKEEPING.md (section "Linting baseline").
+
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - errcheck
+    - ineffassign
+    - unused
+    - misspell
+    - revive
+    - unconvert
+    - unparam
+    - nakedret
+    - bodyclose
+    - gosec
+
+  settings:
+    revive:
+      severity: warning
+      rules:
+        - name: var-naming
+        - name: error-return
+        - name: error-naming
+        - name: if-return
+        - name: increment-decrement
+        - name: range
+        - name: receiver-naming
+        - name: time-naming
+        - name: unused-parameter
+          disabled: true   # noisy for interface implementations
+        - name: unexported-return
+        - name: indent-error-flow
+        - name: superfluous-else
+    gosec:
+      # The installer runs sgdisk/mkfs/etc. by design; suppress G204 for the
+      # executor package only (justified inline). All other paths must obey it.
+      excludes:
+        - G115  # integer overflow conversion — too noisy for size math; we audit manually
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
