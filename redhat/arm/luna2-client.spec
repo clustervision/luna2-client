@@ -68,12 +68,21 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/bashrc"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-parse-cmdline.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna2-start.sh"
+%attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-installer.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/module-setup.sh"
+%attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/lpart-phase"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/profile"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/sshd_config"
 %attr(0755, root, root) "/usr/lib64/libluna-fakeuname.so"
 %attr(0755, root, root) "/etc/dracut.conf.d/luna2.conf"
 %attr(0755, root, root) "/usr/sbin/dhclient-script-luna"
+%attr(0755, root, root) "/usr/bin/lpart-storage-prepare"
+%attr(0755, root, root) "/usr/bin/lpart-storage-check"
+%attr(0755, root, root) "/usr/bin/lpart-osimage-install"
+%attr(0755, root, root) "/usr/bin/lpart-bootloader-finalise"
+%attr(0755, root, root) "/usr/bin/lpart-node-installer"
+%attr(0755, root, root) "/usr/bin/lpart-emit"
+%attr(0755, root, root) "/usr/bin/lpart-tui"
 
 %changelog
 * Tue May 26 2026 Antoine Schonewille

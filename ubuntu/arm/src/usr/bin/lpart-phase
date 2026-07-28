@@ -1,0 +1,23 @@
+#!/bin/bash
+# lpart-phase <pre|part|post> -- shared Luna hook shim (node-agnostic).
+#
+# Single source for the compute-group pre/part/post hook scripts: each Luna
+# hook field is just `exec /usr/bin/lpart-phase <phase>`. All install
+# orchestration lives in lpart-node-installer --phase, baked into the install
+# initramfs by the luna2-client RPM. Set LPART_BIN to override for a hand-run.
+phase="${1:?usage: lpart-phase pre|part|post}"
+LPART_BIN="${LPART_BIN:-/usr/bin}"
+[ -x "${LPART_BIN}/lpart-node-installer" ] \
+    || { echo "lpart-phase: lpart-node-installer missing in ${LPART_BIN}" >&2; exit 127; }
+# Bind the phase to /dev/console only when the kernel actually bound a console
+# device: with an unbindable console= token (wrong-serial name, headless) the
+# open fails ENODEV, and a redirection failure on `exec` aborts the exec and
+# falls through -- which used to misreport the binary as missing (exit 127).
+# Fall back to the inherited stdio (luna's logger pipe) instead.
+if { : <>/dev/console; } 2>/dev/null; then
+    exec "${LPART_BIN}/lpart-node-installer" --phase "$phase" --bin-dir "${LPART_BIN}" \
+        --log-file "/tmp/install_files/logs/lpart-node-installer-${phase}.log" \
+        <>/dev/console >&0 2>&1
+fi
+exec "${LPART_BIN}/lpart-node-installer" --phase "$phase" --bin-dir "${LPART_BIN}" \
+    --log-file "/tmp/install_files/logs/lpart-node-installer-${phase}.log"

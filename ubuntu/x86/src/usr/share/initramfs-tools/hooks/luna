@@ -128,11 +128,10 @@ else
    exit 1
 fi
 
-# Advanced partitioner (lpart). Ubuntu stays on initramfs-tools -- the lpart
-# binaries are copied in here the same way every other tool is, rather than
-# moving this client to dracut. Each is optional: an image built without the
-# lpart package simply does not get them, and install_mode=legacy never calls
-# them.
+# Advanced partitioner (lpart). Copied in here the same way every other tool is:
+# whichever builder packs this image, the lpart binaries reach the initramfs through
+# that builder's own integration. Each is optional -- an image built without the
+# lpart package simply does not get them, and install_mode=legacy never calls them.
 for _lpart in lpart-node-installer lpart-storage-prepare lpart-storage-check \
               lpart-osimage-install lpart-bootloader-finalise lpart-emit \
               lpart-tui lpart-phase; do
