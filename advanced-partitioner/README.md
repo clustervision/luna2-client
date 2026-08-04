@@ -34,6 +34,12 @@ The toolbox tarball produced by `make toolbox` is uploaded to
 `/trinity/local/luna/files/installer-go-toolbox-amd64.tar.gz` and fetched
 by the prescript via Luna HTTP.
 
+**For a release you do not run any of this by hand.** The pipeline runs
+`make build-linux` and stages the resulting binaries into each package tree
+before packing, for every family and architecture in one go — see the README at
+the root of this repository. The targets above remain the way to build and test
+locally; they are no longer how a shipped package gets its binaries.
+
 ## Layout
 
 ```
