@@ -1,0 +1,30 @@
+#
+# This file is written to support the CI/CD process of Gitlab.
+# Status: Production
+# copyright: Copyright 2026, Luna2 Project
+# license: GPL
+#
+# Build the RPMs and debs for every family and architecture this repository
+# carries a tree for, and publish them per branch. The build logic lives once in
+# ClusterVision/gitlab-cicd-pipelines rather than being copied into this project.
+#
+# The lpart binaries are COMPILED by the pipeline and staged into each tree before
+# packing, so an arm or ubuntu tree no longer depends on build output having been
+# committed to make it packable. Only the two x86 rpm scripts ever built anything;
+# the other four assumed the binaries were already in src/usr/bin.
+#
+# Version and release come from the VERSION file at the root of this repository -
+# one place, six trees. Editing it is how the version moves.
+#
+# Branch -> stream:  main -> $PACKAGE_LOCATION,  version-2.2 -> $PACKAGE_LOCATION_22
+# Any other branch is built but not published, and a stream whose variable is not
+# set is skipped with a message rather than failing.
+#
+# Required project CI/CD variables to publish: PACKAGE_LOCATION and/or
+# PACKAGE_LOCATION_22, IPADDRESS, SSH_USER, SSH_PASSWORD.
+#
+
+include:
+  - project: 'ClusterVision/gitlab-cicd-pipelines'
+    file: '/os-package-pipeline.yml'
+    ref: 'main'
