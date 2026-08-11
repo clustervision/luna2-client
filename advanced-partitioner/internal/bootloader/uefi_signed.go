@@ -59,9 +59,10 @@ import (
 // overrides any stale distro-shipped CSV so we are not relying on
 // the OS-image's text. The cosmetic mislabel is harmless: the
 // primary `Boot####* TrinityX <disk>` entries (registered by
-// RegisterUEFIEntries in nvram.go) are first in BootOrder and are
-// what firmware actually selects; the "rocky"/"debian"/... entry
-// only matters if shim's fallback is ever invoked.
+// RegisterUEFIEntries in nvram.go) are the local boot path firmware
+// actually selects -- ordered after the network entry, so the
+// controller decides first -- and the "rocky"/"debian"/... entry only
+// matters if shim's fallback is ever invoked.
 
 // StageSignedShimOpts is the input to StageSignedShim.
 type StageSignedShimOpts struct {

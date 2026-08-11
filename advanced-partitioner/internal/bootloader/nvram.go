@@ -48,6 +48,24 @@ var bootEntryRE = regexp.MustCompile(`^Boot([0-9A-Fa-f]{4})\*?\s+(.*)$`)
 // bootOrderRE matches the "BootOrder: 0001,0042,..." line.
 var bootOrderRE = regexp.MustCompile(`^BootOrder:\s*(.+)\s*$`)
 
+// trailingEntryRE matches entries that must never sit in front of our disk
+// entry. Two different kinds, one consequence:
+//
+//   - The firmware's own UI -- shell, setup, boot menu, vendor diagnostics.
+//     These do not fall through. An empty CD-ROM fails and firmware moves to the
+//     next entry; a shell SUCCEEDS and the machine sits at a prompt. One ahead of
+//     our entry strands the node rather than booting it.
+//   - A foreign OS boot manager left behind by a previous install. It would boot
+//     that OS instead of the one we just provisioned.
+//
+// The match is deliberately broad, because the two errors are not equal: a false
+// positive only moves some entry behind ours, costing a boot position, while a
+// false negative leaves a trapping or wrong-OS entry in front of the disk. So
+// "Linux Boot Manager" (systemd-boot) and "Windows Boot Manager" are caught on
+// purpose -- on a node TrinityX has just provisioned, ours should win.
+var trailingEntryRE = regexp.MustCompile(
+	`(?i)(shell|setup|boot\s*menu|device\s*manager|diagnostic|firmware|boot\s*manager)`)
+
 // bootNextRE matches the "BootNext: 0042" line.
 var bootNextRE = regexp.MustCompile(`^BootNext:\s*(.+)\s*$`)
 
@@ -106,8 +124,8 @@ func parseClearableBootNums(efibootmgrOutput string) []string {
 
 // trinityNumsFromOutput pulls every boot-num whose label contains
 // BootloaderID (i.e. "TrinityX"). Used both to delete stale entries
-// before re-creation and to find the entries to promote to the front
-// of BootOrder.
+// before re-creation and to find the entries to move to the end of
+// BootOrder.
 func trinityNumsFromOutput(efibootmgrOutput string) []string {
 	var out []string
 	for _, line := range strings.Split(efibootmgrOutput, "\n") {
@@ -121,6 +139,21 @@ func trinityNumsFromOutput(efibootmgrOutput string) []string {
 		}
 	}
 	return out
+}
+
+// bootLabelsFromOutput maps each boot-num in the listing to its label, so the
+// reorder can classify entries. A boot-num present in BootOrder but absent from
+// the listing (a stale reference) simply has no label and is treated as an
+// ordinary device -- it keeps its place rather than being promoted or demoted on
+// a guess.
+func bootLabelsFromOutput(efibootmgrOutput string) map[string]string {
+	labels := map[string]string{}
+	for _, line := range strings.Split(efibootmgrOutput, "\n") {
+		if m := bootEntryRE.FindStringSubmatch(line); m != nil {
+			labels[m[1]] = m[2]
+		}
+	}
+	return labels
 }
 
 // bootOrderFromOutput returns the current BootOrder list (comma-
@@ -157,11 +190,26 @@ type RegisterUEFIEntriesOptions struct {
 }
 
 // RegisterUEFIEntries deletes any stale TrinityX entries, creates one
-// per boot disk with the architecture-specific removable fallback
-// loader, then re-orders BootOrder to put the TrinityX entries first
+// per boot disk pointing at the distro's signed shim (falling back to the
+// architecture-specific removable loader only when no shim is on the ESP),
+// then re-orders BootOrder to put the TrinityX entries LAST
 // and clears BootNext. Mirrors bootloader_rhel_register_uefi_nvram_entries
 // and its Debian sibling; the only family-specific bit was the
 // snapshot file name, which is parameterised via SnapshotDir.
+//
+// The order is network, then other boot devices, then ours, then the firmware's
+// own shell/menu entries. Not first: the node must keep asking the controller
+// what to do.
+// Luna already decides locally-vs-network per node (the netboot flag, and
+// the iPXE chain that boots the local disk when that is what is wanted), and
+// a disk entry ahead of the network entry takes that decision away from the
+// controller and hands it to firmware -- the node then provisions once and
+// never returns, so a changed install_mode or a re-provision needs someone at
+// the BMC. Ordering the disk after the network entry keeps the redundancy
+// this function exists for (one entry per boot disk, so a dead mirror leg
+// still boots) while leaving the controller in charge. It also matches the
+// shim ordering the boot-script path has always used, which appends its
+// entry last.
 //
 // Returns nil and skips entirely when RegisterNVRAM == "no", when the
 // sysroot doesn't expose /sys/firmware/efi/efivars, or when efibootmgr
@@ -199,6 +247,34 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 	if err != nil {
 		return err
 	}
+	// Register the distro's signed shim directly where we can find it, and only
+	// fall back to the removable path when we cannot.
+	//
+	// The removable path IS shim's fallback.efi. Booting it makes fallback.efi
+	// read <ESP>/EFI/<distro>/BOOT<arch>.CSV, create a SECOND TrinityX entry
+	// pointing at the real shim, and put that entry FIRST -- which is its job,
+	// it exists to rebuild lost NVRAM. Observed on a node: one local boot turned
+	// a single entry into two and moved the new one to the head of BootOrder.
+	// So registering the removable path costs us both properties this function
+	// is trying to hold: exactly one entry per disk, and the disk ordered behind
+	// the network. Pointing at the shim means fallback.efi never runs on a normal
+	// boot, so neither happens.
+	//
+	// It is also the entry Secure Boot wants: the shim is the signed binary, and
+	// the removable path is not guaranteed to be in db.
+	//
+	// StageSignedShim runs before this (see rhel.go), so the shim is already on
+	// the ESP by the time we look. The CSV is deliberately left in place: it is
+	// the recovery path for a machine whose NVRAM has been cleared, and there
+	// re-promoting itself is the correct behaviour.
+	loader := fallback
+	if shimLoader, ok := signedShimLoaderPath(opts.Sysroot, opts.Arch); ok {
+		loader = shimLoader
+	} else if opts.Logger != nil {
+		opts.Logger.Warn("no signed shim found on the ESP; registering the removable " +
+			"loader " + fallback + " instead -- shim's fallback will add its own boot entry " +
+			"ahead of this one on the first local boot")
+	}
 
 	// 1. Delete stale TrinityX entries first.
 	current, err := runEFIBootmgr(ctx, opts.Runner, opts.Sysroot)
@@ -226,7 +302,7 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 			Path: eb, Chroot: opts.Sysroot,
 			Args: []string{
 				"--create", "--disk", disk, "--part", fmt.Sprintf("%d", espPart),
-				"--label", label, "--loader", fallback,
+				"--label", label, "--loader", loader,
 			},
 			CaptureStdout: true, CaptureStderr: true,
 		}); err != nil {
@@ -238,7 +314,7 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 	clearBootNext(ctx, opts.Runner, opts.Sysroot)
 	maybeSnapshot(ctx, opts.Runner, opts.Sysroot, opts.SnapshotDir, "efibootmgr-after-create.txt")
 
-	// 4. Reorder BootOrder so the new TrinityX entries come first.
+	// 4. Reorder BootOrder so the new TrinityX entries come last.
 	current, err = runEFIBootmgr(ctx, opts.Runner, opts.Sysroot)
 	if err != nil {
 		return err
@@ -261,15 +337,32 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 	for _, t := range trinity {
 		inTrinity[t] = struct{}{}
 	}
-	var residual []string
+	// Three classes, each keeping its existing relative order:
+	//   network  -- must stay ahead of us; it is how the controller keeps control
+	//   device   -- CD-ROM, other disks: legitimate to prefer, and they fall
+	//               through harmlessly when empty
+	//   trailing -- shells, menus, foreign OS managers: must stay behind us
+	// With no trailing entries the list simply ends with ours, which is the
+	// intended fallback rather than a special case.
+	labels := bootLabelsFromOutput(current)
+	var network, device, trailing []string
 	for _, n := range order {
 		if _, ok := inTrinity[n]; ok {
 			continue
 		}
-		residual = append(residual, n)
+		switch {
+		case pxeAllowRE.MatchString(labels[n]):
+			network = append(network, n)
+		case trailingEntryRE.MatchString(labels[n]):
+			trailing = append(trailing, n)
+		default:
+			device = append(device, n)
+		}
 	}
-	newOrder := append([]string(nil), trinity...)
-	newOrder = append(newOrder, residual...)
+	newOrder := append([]string(nil), network...)
+	newOrder = append(newOrder, device...)
+	newOrder = append(newOrder, trinity...)
+	newOrder = append(newOrder, trailing...)
 	joined := strings.Join(newOrder, ",")
 	if _, err := opts.Runner.Run(ctx, executor.CommandSpec{
 		Path: eb, Chroot: opts.Sysroot,
@@ -281,8 +374,8 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 	clearBootNext(ctx, opts.Runner, opts.Sysroot)
 	maybeSnapshot(ctx, opts.Runner, opts.Sysroot, opts.SnapshotDir, "efibootmgr-after-bootorder.txt")
 
-	// 5. Validate that TrinityX is first in BootOrder.
-	return validateTrinityFirst(ctx, opts.Runner, opts.Sysroot)
+	// 5. Validate that TrinityX is registered and reachable from BootOrder.
+	return validateTrinityRegistered(ctx, opts.Runner, opts.Sysroot)
 }
 
 func runEFIBootmgr(ctx context.Context, runner executor.Runner, sysroot string) (string, error) {
@@ -329,10 +422,16 @@ func maybeSnapshot(ctx context.Context, runner executor.Runner, sysroot, dir, na
 	_ = os.WriteFile(filepath.Join(dir, name), []byte(out), 0o640)
 }
 
-// validateTrinityFirst returns an error when the first entry in
-// BootOrder is not a TrinityX entry, mirroring
-// bootloader_uefi_validate_trinityx_first.
-func validateTrinityFirst(ctx context.Context, runner executor.Runner, sysroot string) error {
+// validateTrinityRegistered returns an error when registration did not leave a
+// usable TrinityX entry: none created, none reachable from BootOrder, or a
+// BootNext still pinned over it.
+//
+// It deliberately does NOT assert the entry is first. The disk entry is ordered
+// last so the controller keeps deciding how the node boots (see
+// RegisterUEFIEntries), so "first" would now fail on every correct install. What
+// still has to hold is that the entry exists and firmware can reach it -- an
+// entry absent from BootOrder is invisible no matter where the disk sits.
+func validateTrinityRegistered(ctx context.Context, runner executor.Runner, sysroot string) error {
 	out, err := runEFIBootmgr(ctx, runner, sysroot)
 	if err != nil {
 		return err
@@ -345,18 +444,40 @@ func validateTrinityFirst(ctx context.Context, runner executor.Runner, sysroot s
 	if len(order) == 0 {
 		return fmt.Errorf("no UEFI BootOrder found after %s registration", BootloaderID)
 	}
-	first := order[0]
-	inTrinity := map[string]struct{}{}
-	for _, t := range trinity {
-		inTrinity[t] = struct{}{}
+	inOrder := map[string]struct{}{}
+	for _, n := range order {
+		inOrder[n] = struct{}{}
 	}
-	if _, ok := inTrinity[first]; !ok {
+	reachable := false
+	for _, t := range trinity {
+		if _, ok := inOrder[t]; ok {
+			reachable = true
+			break
+		}
+	}
+	if !reachable {
 		return fmt.Errorf(
-			"first UEFI BootOrder entry is not %s: first=%s, expected a %s local boot entry first",
-			BootloaderID, first, BootloaderID)
+			"no %s UEFI boot entry appears in BootOrder (%s): firmware cannot reach the local boot path",
+			BootloaderID, strings.Join(order, ","))
 	}
 	if bootNext != "" {
 		return fmt.Errorf("UEFI BootNext is still set after %s registration", BootloaderID)
 	}
 	return nil
+}
+
+// signedShimLoaderPath returns the EFI-style path of the distro's signed shim on
+// the ESP (e.g. `\EFI\rocky\shimx64.efi`), and whether one was found. Reuses the
+// same discovery StageSignedShim uses, so registration and staging cannot
+// disagree about where the shim is.
+func signedShimLoaderPath(sysroot, arch string) (string, bool) {
+	shimName, _, err := archShimAndGrub(arch)
+	if err != nil {
+		return "", false
+	}
+	distroDir, _, _, err := findSignedShimDir(filepath.Join(sysroot, "boot", "efi"), arch)
+	if err != nil {
+		return "", false
+	}
+	return `\EFI\` + filepath.Base(distroDir) + `\` + shimName, true
 }
