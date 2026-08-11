@@ -46,8 +46,11 @@ install() {
 
     # Optional / distro-specific tools -- install only if present (-o), so the
     # same module builds on redhat (dhclient/ipmitool/dig) and ubuntu (no dhclient).
+    # script: run_install_sh uses it to give install.sh a pty, so the lpart steps
+    # can size a terminal and render their TUI. Optional on purpose -- where it is
+    # absent run_install_sh falls back to the plain call.
     inst_multiple -o dhclient dhclient-script-luna ipmitool nslookup dig wget \
-                     mkfs.ext2 mkfs.ext3 mkdosfs top lspci lsscsi efibootmgr
+                     mkfs.ext2 mkfs.ext3 mkdosfs top lspci lsscsi efibootmgr script
 
     # TPM TCTI + sqlite are needed for the token; the NSS/softokn set is a
     # redhat NSS-curl concern -- pull whatever the platform actually ships.

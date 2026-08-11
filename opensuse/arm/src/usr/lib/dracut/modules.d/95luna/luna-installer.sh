@@ -244,6 +244,22 @@ function luna_finish () {
         fi
     fi
     mv /tmp/luna_install.log /sysroot/var/log/
+    # The lpart steps write their own per-tool logs, and /tmp is the initramfs --
+    # it does not survive the pivot, so without this the detailed record of the
+    # install is discarded exactly when someone would want to read it. These are
+    # also the clean copy: luna_install.log is a pty typescript and carries every
+    # TUI redraw, so it is complete but verbose.
+    if [ -d /tmp/install_files/logs ]; then
+        mkdir -p /sysroot/var/log/luna
+        cp -a /tmp/install_files/logs/. /sysroot/var/log/luna/ 2>/dev/null \
+            || echo "Luna2: could not preserve the lpart logs"
+    fi
+    # On a pty the install's children see a terminal and emit control sequences
+    # (aria2c and curl draw progress meters, the lpart steps draw a TUI). Strip
+    # them so the saved log stays readable; a failure here must not cost us the
+    # log, hence the guard.
+    sed -i 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r$//' /sysroot/var/log/luna_install.log 2>/dev/null \
+        || echo "Luna2: could not strip terminal escapes from luna_install.log"
     # kill shell on tty2
     ps h t tty2 o pid | while read pid; do kill -9 $pid; done
 
@@ -426,6 +442,22 @@ function run_install_sh () {
         local rc=$?
         stop_lpart_tui
         return $rc
+    fi
+    # install.sh otherwise inherits luna2-start's tee, which is a PIPE: the lpart
+    # steps cannot read a window size off it, so they fall back to plain output and
+    # no TUI is ever drawn. A pty is both a terminal and capturable, so run under
+    # script(1) where it exists. -a because the tee has already written to this log
+    # and script truncates without it; -e so the child's exit code still decides the
+    # install; -f so a node that dies mid-install still has its log on disk.
+    # Binding the console is what gives the pty a real size -- without it script
+    # inherits the tee pipe and the TUI stays plain, which looks like this change
+    # not working.
+    local ctty="${luna_ctty:-/dev/console}"
+    if command -v script > /dev/null 2>&1 && { exec 9<>"$ctty"; } 2>/dev/null; then
+        exec 9>&-
+        script -q -a -e -f -c "bash /lunatmp/install.sh" /tmp/luna_install.log \
+               <>"$ctty" 1>&0 2>&0
+        return $?
     fi
     bash /lunatmp/install.sh
 }
