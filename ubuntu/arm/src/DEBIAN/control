@@ -2,8 +2,15 @@ Package: luna2-client
 Version: 2.2-0
 Maintainer: ClusterVision
 Architecture: arm64
-Depends: initramfs-tools | dracut, shim-signed, grub-efi-arm64-signed, grub-efi-arm64-bin, mdadm, lvm2, gdisk, fdisk, lsscsi, jq, parted, dosfstools, lbzip2, aria2, efibootmgr, grepcidr, curl, openssh-server, dropbear-bin, tpm2-tools
+Depends: initramfs-tools | dracut, dracut-network | initramfs-tools, shim-signed, grub-efi-arm64-signed, grub-efi-arm64-bin, mdadm, lvm2, gdisk, fdisk, lsscsi, jq, parted, dosfstools, lbzip2, aria2, efibootmgr, grepcidr, curl, openssh-server, dropbear-bin, tpm2-tools
 Description: Luna node install module with lpart advanced-partitioner support
  Ships both an initramfs-tools hook and a dracut 95luna module. Ubuntu 22.04 and
  24.04 default to initramfs-tools; 25.10 and later default to dracut. The daemon
  packs with whichever the image provides, so one package covers both.
+ .
+ The second alternative pulls dracut's network modules, which ubuntu ships as a
+ separate package. 95luna depends on dracut's 'network' module, and without it
+ dracut drops the whole luna module, still exits 0, and the node boots to
+ "don't know how to handle root=luna". Ordered dracut-network first because
+ installing initramfs-tools on a dracut image removes dracut; on 22.04 and 24.04
+ initramfs-tools is already present, so the clause is satisfied and pulls nothing.
