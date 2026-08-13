@@ -28,6 +28,14 @@ installkernel() {
     # forces inclusion regardless of the pack's hostonly mode. One list for
     # every distro.
     hostonly='' instmods raid0 raid1 raid10 raid456
+
+    # GUARANTEE the filesystems lpart formats with -- same reasoning as the raid
+    # personalities above, same distro. ubuntu26/resolute packed no xfs module, so
+    # lpart made an XFS root and could not then mount what it had just made:
+    # 'unknown filesystem type xfs', mount exit 32, the installer looping on it
+    # (2026-08-13). One name here for every mkfs.* in install() below, because the
+    # gap is the two lists disagreeing; nls_* are what vfat needs to mount at all.
+    hostonly='' instmods xfs ext4 ext3 ext2 vfat fat nls_cp437 nls_iso8859-1
 }
 
 install() {
