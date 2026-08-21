@@ -24,10 +24,15 @@ installkernel() {
     # contract: ubuntu26/resolute's dracut packed ZERO raid .ko modules, so
     # every mdadm --create died with 'RUN_ARRAY failed: Invalid argument'
     # (raid personality unloadable) while ubuntu24 happened to include them
-    # (2026-07-17). instmods skips modules a kernel does not ship; hostonly=''
+    # (2026-07-17). The same goes for the disk controllers a diskfull install
+    # needs: dracut picks block drivers from =drivers by a symbol scan, which
+    # misses the fusion family (VMware LSI Logic SAS) and the common hardware
+    # SAS/RAID HBAs, so a diskfull node never sees its disk (2026-08-20).
+    # instmods skips modules a kernel does not ship; hostonly=''
     # forces inclusion regardless of the pack's hostonly mode. One list for
     # every distro.
-    hostonly='' instmods raid0 raid1 raid10 raid456
+    hostonly='' instmods raid0 raid1 raid10 raid456 \
+                          =drivers/message/fusion mpt3sas megaraid_sas smartpqi
 
     # GUARANTEE the filesystems lpart formats with -- same reasoning as the raid
     # personalities above, same distro. ubuntu26/resolute packed no xfs module, so
