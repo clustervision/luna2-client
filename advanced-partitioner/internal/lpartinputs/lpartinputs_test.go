@@ -1,66 +1,11 @@
 package lpartinputs
 
 import (
-	"encoding/base64"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 )
-
-func TestWriteJSONField(t *testing.T) {
-	dir := t.TempDir()
-
-	b64 := base64.StdEncoding.EncodeToString([]byte(`{"a":1}`))
-	p := filepath.Join(dir, "s.json")
-	if !writeJSONField(p, b64) {
-		t.Fatal("base64 JSON should populate")
-	}
-	got, err := os.ReadFile(p) //nolint:gosec // test temp path
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != `{"a":1}` {
-		t.Fatalf("decoded = %q, want {\"a\":1}", got)
-	}
-
-	if !writeJSONField(filepath.Join(dir, "s2.json"), `{"b":2}`) {
-		t.Fatal("plain JSON should populate")
-	}
-	if writeJSONField(filepath.Join(dir, "e.json"), "") {
-		t.Fatal("empty value should not populate")
-	}
-	if writeJSONField(filepath.Join(dir, "g.json"), "notjson") {
-		t.Fatal("non-JSON garbage should not populate")
-	}
-}
-
-func TestExtractNodeFields(t *testing.T) {
-	body := []byte(`{"config":{"node":{"node001":{"install_mode":"full","disklayout":"eyJhIjoxfQ=="}}}}`)
-	f, err := extractNodeFields(body, "node001")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if f.InstallMode != "full" {
-		t.Fatalf("fields = %+v", f)
-	}
-	if f.Disklayout == "" {
-		t.Fatal("disklayout missing")
-	}
-}
-
-func TestWriteInputsDefaultsModeAuto(t *testing.T) {
-	dir := t.TempDir()
-	// No install_mode in the daemon response -> defaults to auto.
-	in := writeInputs(dir, nodeFields{Disklayout: ""})
-	if in.InstallMode != "auto" {
-		t.Fatalf("absent install_mode should default to auto, got %q", in.InstallMode)
-	}
-	// A populated install_mode is carried through verbatim.
-	in = writeInputs(dir, nodeFields{InstallMode: "memboot"})
-	if in.InstallMode != "memboot" {
-		t.Fatalf("install_mode should pass through, got %q", in.InstallMode)
-	}
-}
 
 func TestInstallContextRoundTrip(t *testing.T) {
 	dir := t.TempDir()
@@ -87,7 +32,13 @@ func TestResolveFromFiles(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "storage.json"), []byte(`{"x":1}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	writeInstallContext(dir, installContext{InstallMode: "full"})
+	// The install template writes install_mode AND the provision_* fields.
+	writeInstallContext(dir, installContext{
+		InstallMode:        "full",
+		ProvisionMethod:    "torrent",
+		ProvisionFallback:  "http",
+		ProvisionInterface: "BOOTIF",
+	})
 
 	in, err := resolveFromFiles(dir)
 	if err != nil {
@@ -98,5 +49,37 @@ func TestResolveFromFiles(t *testing.T) {
 	}
 	if in.InstallMode != "full" || in.Source != "file" {
 		t.Fatalf("resolved = %+v", in)
+	}
+
+	// The provision_* the template supplied must survive lpart's normalisation,
+	// since the download phase reads them back out of install-context.json.
+	var ic installContext
+	data, err := os.ReadFile(filepath.Join(dir, "install-context.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(data, &ic); err != nil {
+		t.Fatal(err)
+	}
+	if ic.ProvisionMethod != "torrent" || ic.ProvisionFallback != "http" || ic.ProvisionInterface != "BOOTIF" {
+		t.Fatalf("provision_* not preserved through Resolve: %+v", ic)
+	}
+}
+
+// Resolve is the public entry point; with only the template files present it
+// must resolve from them and report Source "file".
+func TestResolvePublicEntry(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "runtime") // not yet created; Resolve mkdirs it
+	writeDir := dir
+	if err := os.MkdirAll(writeDir, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	writeInstallContext(writeDir, installContext{InstallMode: "sync"})
+	in, err := Resolve(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if in.Source != "file" || in.InstallMode != "sync" {
+		t.Fatalf("Resolve = %+v", in)
 	}
 }
