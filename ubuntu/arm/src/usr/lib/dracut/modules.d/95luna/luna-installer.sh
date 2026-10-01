@@ -142,7 +142,7 @@ function luna_start () {
     # controller -- the last snapshot before the hang shows where it stopped.
     ( _plh=$(getargs luna.loghost=)
       [ -n "$_plh" ] && while sleep 20; do
-          tail -n 120 /tmp/luna_install.log 2>/dev/null \
+          readable_log < /tmp/luna_install.log 2>/dev/null | tail -n 120 2>/dev/null \
             | logger -d -n "$_plh" -P 514 -t luna-progress 2>/dev/null
       done ) &
     # Bounded + instrumented settle: on ubuntu26/resolute an unbounded settle
@@ -210,10 +210,36 @@ function luna_start () {
     fi
 }
 
+# The install log is a pty typescript, so it carries the lpart TUI: one
+# alternate-screen session per phase, whose content the lpart tools already
+# forward themselves. Cut those sessions, the control sequences and the blank
+# padding, so the loghost gets the install narrative and not the rendering.
+function readable_log () {
+    awk 'BEGIN { skip = 0 }
+    {
+        line = $0; out = ""
+        while (1) {
+            if (!skip) {
+                i = index(line, "\033[?1049h")
+                if (i == 0) { out = out line; break }
+                out = out substr(line, 1, i - 1); line = substr(line, i + 8); skip = 1
+            } else {
+                i = index(line, "\033[?1049l")
+                if (i == 0) break
+                line = substr(line, i + 8); skip = 0
+            }
+        }
+        if (out != "") print out
+    }' \
+    | sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\x1b\][^\x07\x1b]*\x07//g' \
+          -e 's/\x1b\][^\x07\x1b]*\x1b\\//g' -e 's/\x1b.//g' -e 's/\r//g' \
+    | grep -v '^[[:space:]]*$'
+}
+
 function luna_finish () {
     local luna_loghost=$(getargs luna.loghost=)
     if [ "$luna_loghost" ]; then
-        cat /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
+        readable_log < /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
     else
         echo "Luna2: loghost not defined, cannot forward logs."
     fi
@@ -508,7 +534,7 @@ if [ "x$root" = "xluna" ]; then
                 dmesg > /tmp/luna_install.dmesg.last 2>/dev/null || true
             fi
             if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
-                cat /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
+                readable_log < /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
                 cat /tmp/luna_install.log > /tmp/luna_install.log.prev
                 if [ ! -f /tmp/luna_install.log.first ]; then
                     cat /tmp/luna_install.log > /tmp/luna_install.log.first
