@@ -231,7 +231,7 @@ function readable_log () {
         }
         if (out != "") print out
     }' \
-    | sed -e 's/\x1b\[[0-9;?]*[a-zA-Z]//g' -e 's/\x1b\][^\x07\x1b]*\x07//g' \
+    | sed -e 's/\x1b\[[0-9:;<=>?]*[a-zA-Z]//g' -e 's/\x1b\][^\x07\x1b]*\x07//g' \
           -e 's/\x1b\][^\x07\x1b]*\x1b\\//g' -e 's/\x1b.//g' -e 's/\r//g' \
     | grep -v '^[[:space:]]*$'
 }
@@ -284,7 +284,7 @@ function luna_finish () {
     # (aria2c and curl draw progress meters, the lpart steps draw a TUI). Strip
     # them so the saved log stays readable; a failure here must not cost us the
     # log, hence the guard.
-    sed -i 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r$//' /sysroot/var/log/luna_install.log 2>/dev/null \
+    sed -i 's/\x1b\[[0-9:;<=>?]*[a-zA-Z]//g; s/\r$//' /sysroot/var/log/luna_install.log 2>/dev/null \
         || echo "Luna2: could not strip terminal escapes from luna_install.log"
     # kill shell on tty2
     ps h t tty2 o pid | while read pid; do kill -9 $pid; done
