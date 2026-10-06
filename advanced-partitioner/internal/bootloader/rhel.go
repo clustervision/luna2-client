@@ -129,6 +129,9 @@ func (a *rhelAdapter) Install(ctx context.Context) error {
 // partition, so a mirrored set boots from either member. There is no shim for
 // firmware to verify and no NVRAM to register an entry in outside UEFI, so the
 // install is grub2-install plus the same configuration generation.
+//
+// i386-pc names the legacy BIOS platform, not the word size: GRUB has no
+// 64-bit BIOS target, and the kernel this loads is still the 64-bit one.
 func (a *rhelAdapter) installBIOS(ctx context.Context) error {
 	sysroot := a.deps.BootContext.Sysroot
 	for _, disk := range a.deps.BootContext.StorageResult.BootDevices {
