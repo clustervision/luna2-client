@@ -72,13 +72,33 @@ func preflightBoot(p bootPlan, env bootEnv) error {
 		cause, alternative)
 }
 
-// detectRamdiskPivots mirrors luna-installer.sh's post-install test: a dracut
-// install ramdisk pivots to /sysroot after install.sh and needs no bootloader,
-// anything else reboots into the installed disk. Package var (not a plain
-// func) so tests can pin the result independently of the host the suite runs
-// on.
+// ramdiskPivotMarkers identify an install ramdisk that hands off to /sysroot
+// after install.sh instead of rebooting into the disk, so a disk OS on it needs
+// no bootloader. Two families qualify: dracut, via its library; and Luna's own
+// initramfs-tools hook, which Debian and Ubuntu images use -- it mounts the
+// installed root at /sysroot and returns to the boot scripts, exactly as the
+// dracut 95luna module does. Testing for dracut alone refuses every Ubuntu
+// node a bootloader="none" layout it can in fact honour.
+var ramdiskPivotMarkers = []string{
+	// Luna's own handoff script, in each ramdisk family: these name the thing
+	// that actually pivots, so they are the markers that mean what the question
+	// asks. Verified present in a built ramdisk of each kind.
+	"/usr/share/luna/luna-installer.sh",
+	"/scripts/local-premount/luna-start",
+	// The dracut library, kept because it is what this test has always used on
+	// EL and SUSE. It identifies the framework rather than the handoff, so it
+	// also matches a dracut ramdisk built without the luna module -- which does
+	// not pivot. Narrowing that is a behaviour change for working nodes, so it
+	// is left alone here.
+	"/lib/dracut-lib.sh",
+	"/usr/lib/dracut/dracut-lib.sh",
+}
+
+// detectRamdiskPivots mirrors the installers' post-install test. Package var
+// (not a plain func) so tests can pin the result independently of the host the
+// suite runs on.
 var detectRamdiskPivots = func() bool {
-	for _, p := range []string{"/lib/dracut-lib.sh", "/usr/lib/dracut/dracut-lib.sh"} {
+	for _, p := range ramdiskPivotMarkers {
 		if _, err := os.Stat(p); err == nil {
 			return true
 		}

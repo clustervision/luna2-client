@@ -2,6 +2,8 @@ package main
 
 import (
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -141,5 +143,50 @@ func TestPreflightBootNoneDoesNotBlameFirmware(t *testing.T) {
 func TestPreflightBootIgnoresRamdiskOnUEFI(t *testing.T) {
 	if err := preflightBoot(bootPlan{DiskOS: true, InstallsGRUB: true}, bootEnv{Firmware: "uefi"}); err != nil {
 		t.Fatalf("a UEFI GRUB install must not depend on the ramdisk type: %v", err)
+	}
+}
+
+// An Ubuntu/Debian install ramdisk carries Luna's initramfs-tools hook instead
+// of dracut, and that hook pivots to /sysroot just as the dracut module does.
+// Pinned because testing for dracut alone refused every Ubuntu node a
+// bootloader="none" layout it can honour, and the node then reinstalled in a
+// loop rather than reporting the refusal.
+func TestRamdiskPivotsDetectsInitramfsToolsHook(t *testing.T) {
+	// The fix itself: the hook has to be one of the markers. Asserted on the
+	// default list, because a test that supplies its own list only exercises
+	// the lookup and passes just as happily with the marker removed.
+	for _, want := range []string{
+		"/scripts/local-premount/luna-start", // initramfs-tools: Debian, Ubuntu
+		"/usr/share/luna/luna-installer.sh",  // dracut, as module-setup.sh installs it
+	} {
+		found := false
+		for _, m := range ramdiskPivotMarkers {
+			if m == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("%s must be a pivot marker; markers are %v", want, ramdiskPivotMarkers)
+		}
+	}
+
+	dir := t.TempDir()
+	hook := filepath.Join(dir, "luna-start")
+	if err := os.WriteFile(hook, []byte("#!/bin/sh\n"), 0o755); err != nil {
+		t.Fatalf("writing the fake hook: %v", err)
+	}
+
+	saved := ramdiskPivotMarkers
+	t.Cleanup(func() { ramdiskPivotMarkers = saved })
+
+	ramdiskPivotMarkers = []string{filepath.Join(dir, "absent"), hook}
+	if !detectRamdiskPivots() {
+		t.Fatal("a ramdisk carrying the initramfs-tools luna hook pivots")
+	}
+
+	ramdiskPivotMarkers = []string{filepath.Join(dir, "absent")}
+	if detectRamdiskPivots() {
+		t.Fatal("a ramdisk carrying no marker does not pivot")
 	}
 }
