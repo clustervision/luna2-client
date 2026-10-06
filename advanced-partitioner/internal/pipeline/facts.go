@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/bootloader"
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/engine"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installcontext"
@@ -269,7 +270,10 @@ type layoutInfo struct {
 type setProbe struct {
 	Role          string `json:"role"`
 	RaidMode      string `json:"raid_mode"`
+	FirmwareMode  string `json:"firmware_mode"`
 	RegisterNVRAM string `json:"register_nvram"`
+	BootMethod    string `json:"boot_method"`
+	BootOrder     string `json:"boot_order"`
 	SelectedDisks []struct {
 		ResolvedPath   string `json:"resolved_path"`
 		ConfiguredPath string `json:"configured_path"`
@@ -307,6 +311,9 @@ func parseLayout(path string) layoutInfo {
 	firmware := bootMode()
 	var methodParts, summaryParts []string
 	nvram := false
+	diskOSNoBootloader := false
+	osOnUEFI := false
+	diskFirst := false
 	dataIdx := 0
 	for _, s := range sets {
 		isData := strings.EqualFold(s.Role, "data")
@@ -328,6 +335,12 @@ func parseLayout(path string) layoutInfo {
 				summaryParts = append(summaryParts, "OS -> tmpfs (RAM)")
 			}
 			continue
+		}
+
+		if !isData {
+			diskOSNoBootloader = strings.EqualFold(s.BootMethod, "none")
+			osOnUEFI = strings.EqualFold(s.FirmwareMode, "uefi")
+			diskFirst = strings.EqualFold(s.BootOrder, "first")
 		}
 
 		var names []string
@@ -356,10 +369,22 @@ func parseLayout(path string) layoutInfo {
 	}
 
 	boot := "Boot: " + firmware + "/GRUB"
-	if info.MemOS && len(info.Disks) == 0 {
+	switch {
+	case info.MemOS && len(info.Disks) == 0:
 		boot = "Boot: none (memory-root)"
-	} else if strings.EqualFold(firmware, "UEFI") && nvram {
+	case diskOSNoBootloader && osOnUEFI:
+		boot = "Boot: none (bootloader: none; node PXE-boots every time)"
+	case diskOSNoBootloader:
+		boot = "Boot: none (BIOS firmware: GRUB, shim and boot order skipped; node PXE-boots every time)"
+	case strings.EqualFold(firmware, "UEFI") && nvram:
 		boot += " + NVRAM"
+		switch {
+		case !diskFirst:
+		case bootOrderHeld(path):
+			boot += " (disk first)"
+		default:
+			boot += " (disk first requested, firmware kept network first)"
+		}
 	}
 	summaryParts = append(summaryParts, boot)
 	info.Summary = strings.Join(summaryParts, "   ")
@@ -568,7 +593,17 @@ func rawBool(raw json.RawMessage) bool {
 
 // --- host facts -----------------------------------------------------------
 
-func bootMode() string {
+// bootOrderHeld reports whether a bootloader=first request survived the
+// finalise's NVRAM read-back: the finalise leaves a marker beside the storage
+// result when the firmware re-sorted the order behind its back.
+func bootOrderHeld(resultPath string) bool {
+	_, err := os.Stat(filepath.Join(filepath.Dir(resultPath), bootloader.BootOrderNotHonouredMarker))
+	return err != nil
+}
+
+// bootMode reports the firmware the node PXE-booted in. Package var (not a
+// plain func) so tests can pin it independently of the host the suite runs on.
+var bootMode = func() string {
 	if _, err := os.Stat("/sys/firmware/efi"); err == nil {
 		return "UEFI"
 	}

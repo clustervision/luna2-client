@@ -211,3 +211,40 @@ func mustHaveCalls(t *testing.T, f *executor.FakeRunner, want []string) {
 		}
 	}
 }
+
+// The ESP is formatted whatever the firmware. The health probe and the
+// mount-existing prediction both expect a vfat filesystem on every OS set that
+// declares one, so skipping it on BIOS would make the next boot classify the
+// set as broken and rebuild it forever.
+func TestMakeFilesystemsFormatsESPOnBIOS(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	set := &v2.Set{
+		Name: "os", Role: "os",
+		Volumes: []v2.Volume{
+			{Name: "uefi", Provider: "partition", Mountpoint: "/boot/efi", FS: "vfat", Size: "600M"},
+			{Name: "boot", Provider: "partition", Mountpoint: "/boot", FS: "xfs", Size: "1G"},
+			{Name: "root", Provider: "lvm", Mountpoint: "/", FS: "xfs", Size: "100%"},
+		},
+	}
+	layout := partition.Layout{
+		Role:           "os",
+		FirmwareMode:   "bios",
+		RAIDMode:       "none",
+		BootFS:         "xfs",
+		EFIPartitions:  []string{"/dev/sda1"},
+		BootPartitions: []string{"/dev/sda2"},
+	}
+	lvmState := lvm.State{VGName: "os", PVDevice: "/dev/sda3"}
+	got, err := New(Options{Runner: f, MkfsFatName: "mkfs.fat"}).MakeFilesystems(
+		context.Background(), set, layout, raid.State{RAIDMode: "none"}, lvmState)
+	if err != nil {
+		t.Fatalf("MakeFilesystems: %v", err)
+	}
+	if len(got.Filesystems) != 3 {
+		t.Fatalf("expected 3 filesystems on BIOS; got %d: %+v", len(got.Filesystems), got.Filesystems)
+	}
+	if got.Filesystems[0].Mount != "/boot/efi" || got.Filesystems[0].FS != "vfat" {
+		t.Fatalf("efi fs wrong: %+v", got.Filesystems[0])
+	}
+	mustHaveCalls(t, f, []string{"wipefs -af /dev/sda1", "mkfs.fat -F 32 /dev/sda1"})
+}

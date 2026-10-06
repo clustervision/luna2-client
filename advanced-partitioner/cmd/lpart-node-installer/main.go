@@ -139,8 +139,12 @@ func run() error {
 			os.Exit(renderExit)
 		}
 	case res.Done && res.Class.Fatal():
+		// Say what the code means, not just what it is: the wrapper's
+		// retry-vs-park decision rides on it and the operator reads this line.
+		fmt.Fprintf(os.Stderr, "lpart-node-installer: exit %d -- non-retryable configuration or safety error; the node is parked for an operator, not retried\n", exitFatalConfig)
 		os.Exit(exitFatalConfig)
 	case res.Done:
+		fmt.Fprintln(os.Stderr, "lpart-node-installer: exit 1 -- retryable failure; the install wrapper retries after a countdown")
 		os.Exit(1)
 	default:
 		// No terminal state: the pipeline was interrupted (quit/SIGINT/

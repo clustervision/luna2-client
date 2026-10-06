@@ -1,0 +1,15 @@
+{
+  "version": 2,
+  "comment": "No bootloader at all: the node PXE-boots every time and the ESP is left empty of loaders.",
+  "sets": [
+    {
+      "name": "os", "role": "os", "selection": "discover", "raid": "none",
+      "bootloader": "none",
+      "volumes": [
+        {"name": "uefi", "mountpoint": "/boot/efi", "fs": "vfat", "provider": "partition", "size": "600M"},
+        {"name": "boot", "mountpoint": "/boot", "fs": "xfs", "provider": "partition", "size": "1G"},
+        {"name": "root", "mountpoint": "/", "fs": "xfs", "provider": "lvm", "size": "100%"}
+      ]
+    }
+  ]
+}

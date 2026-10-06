@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
 )
 
 const sampleEFIOutput = `BootCurrent: 0001
@@ -464,4 +465,140 @@ func createdLoader(t *testing.T, f *executor.FakeRunner) string {
 	}
 	t.Fatal("registration never issued efibootmgr --create ... --loader")
 	return ""
+}
+
+// trinityFixtureListing is the listing the ordering tests drive: five stale
+// TrinityX entries and one network entry, with BootOrder already headed by a
+// TrinityX entry.
+const trinityFixtureListing = `BootOrder: 0007,0001,0002,0003,0004,0010
+Boot0001* TrinityX sda
+Boot0002* TrinityX sda
+Boot0003  TrinityX-old (sdb)
+Boot0004* TrinityX
+Boot0007* TrinityX sdb
+Boot0010* UEFI: PXE IP4 Intel(R) Ethernet
+`
+
+// registerOrderArgv runs a registration over trinityFixtureListing with the
+// given boot order and returns every argv the run issued, plus the
+// --bootorder list it asked for.
+func registerOrderArgv(t *testing.T, bootOrder string) (argv [][]string, order string) {
+	t.Helper()
+	sysroot := mkEFISysroot(t)
+	f := executor.NewFakeRunner(executor.FakeResponse{Stdout: []byte(trinityFixtureListing)})
+	if err := RegisterUEFIEntries(context.Background(), RegisterUEFIEntriesOptions{
+		Runner:        f,
+		Sysroot:       sysroot,
+		Arch:          "x86_64",
+		BootDevices:   []string{"/dev/sda", "/dev/sdb"},
+		RegisterNVRAM: "auto",
+		BootOrder:     bootOrder,
+	}); err != nil {
+		t.Fatalf("RegisterUEFIEntries: %v", err)
+	}
+	for _, c := range f.Calls() {
+		argv = append(argv, c.Args)
+		if len(c.Args) == 2 && c.Args[0] == "--bootorder" {
+			order = c.Args[1]
+		}
+	}
+	return argv, order
+}
+
+// The default and an explicit "last" must issue the SAME efibootmgr calls as
+// before the key existed -- the whole point of the key is that not setting it
+// changes nothing.
+func TestRegisterUEFIEntriesBootOrderLastIsTodaysOrder(t *testing.T) {
+	absentArgv, absentOrder := registerOrderArgv(t, "")
+	lastArgv, lastOrder := registerOrderArgv(t, "last")
+	if len(absentArgv) != len(lastArgv) {
+		t.Fatalf("call count differs: absent=%d last=%d", len(absentArgv), len(lastArgv))
+	}
+	for i := range absentArgv {
+		if strings.Join(absentArgv[i], "\x00") != strings.Join(lastArgv[i], "\x00") {
+			t.Fatalf("call %d differs:\n absent: %v\n last:   %v", i, absentArgv[i], lastArgv[i])
+		}
+	}
+	const want = "0010,0007,0004,0003,0002,0001"
+	if absentOrder != want || lastOrder != want {
+		t.Fatalf("BootOrder absent=%q last=%q, want %q (network first, TrinityX after)", absentOrder, lastOrder, want)
+	}
+}
+
+// bootloader=first puts the whole TrinityX group at the head of BootOrder,
+// keeping the intra-group order the "last" path uses, and leaves the network
+// entry behind it rather than dropping it.
+func TestRegisterUEFIEntriesOrdersTrinityFirstWhenAsked(t *testing.T) {
+	_, order := registerOrderArgv(t, "first")
+	const want = "0007,0004,0003,0002,0001,0010"
+	if order != want {
+		t.Fatalf("BootOrder = %q, want %q", order, want)
+	}
+}
+
+// A firmware that re-applies its own Setup priorities at POST leaves the
+// network entry first whatever we wrote. That is a warning, not a failure --
+// the node still boots -- and it has to be visible in the install summary, so
+// the marker the summary reads must be there too.
+func TestRegisterUEFIEntriesWarnsWhenFirstNotHonoured(t *testing.T) {
+	sysroot := mkEFISysroot(t)
+	snapDir := t.TempDir()
+	logPath := filepath.Join(t.TempDir(), "finalise.log")
+	logger, err := txlog.Init(txlog.Options{LogFile: logPath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listing := `BootOrder: 0010,0001
+Boot0001* TrinityX sda
+Boot0010* UEFI: PXE IP4 Intel(R) Ethernet
+`
+	f := executor.NewFakeRunner(executor.FakeResponse{Stdout: []byte(listing)})
+	if err := RegisterUEFIEntries(context.Background(), RegisterUEFIEntriesOptions{
+		Runner:        f,
+		Logger:        logger,
+		Sysroot:       sysroot,
+		Arch:          "x86_64",
+		BootDevices:   []string{"/dev/sda"},
+		RegisterNVRAM: "auto",
+		BootOrder:     "first",
+		SnapshotDir:   snapDir,
+	}); err != nil {
+		t.Fatalf("a firmware that re-sorts the order must not fail the install: %v", err)
+	}
+	if err := logger.Close(); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(logPath) //nolint:gosec // test artefact
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"level=WARN", "did not keep"} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("log missing %q:\n%s", want, body)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(snapDir, BootOrderNotHonouredMarker)); err != nil {
+		t.Fatalf("the summary's marker was not written: %v", err)
+	}
+}
+
+// The honoured case must leave no marker, or every install would report the
+// firmware fighting it.
+func TestRegisterUEFIEntriesLeavesNoMarkerWhenHonoured(t *testing.T) {
+	sysroot := mkEFISysroot(t)
+	snapDir := t.TempDir()
+	f := executor.NewFakeRunner(executor.FakeResponse{Stdout: []byte(trinityFixtureListing)})
+	if err := RegisterUEFIEntries(context.Background(), RegisterUEFIEntriesOptions{
+		Runner:      f,
+		Sysroot:     sysroot,
+		Arch:        "x86_64",
+		BootDevices: []string{"/dev/sda", "/dev/sdb"},
+		BootOrder:   "first",
+		SnapshotDir: snapDir,
+	}); err != nil {
+		t.Fatalf("RegisterUEFIEntries: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(snapDir, BootOrderNotHonouredMarker)); err == nil {
+		t.Fatal("BootOrder was honoured; no marker must be written")
+	}
 }

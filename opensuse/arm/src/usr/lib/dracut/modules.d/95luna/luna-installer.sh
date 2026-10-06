@@ -142,7 +142,7 @@ function luna_start () {
     # controller -- the last snapshot before the hang shows where it stopped.
     ( _plh=$(getargs luna.loghost=)
       [ -n "$_plh" ] && while sleep 20; do
-          tail -n 120 /tmp/luna_install.log 2>/dev/null \
+          readable_log < /tmp/luna_install.log 2>/dev/null | tail -n 120 2>/dev/null \
             | logger -d -n "$_plh" -P 514 -t luna-progress 2>/dev/null
       done ) &
     # Bounded + instrumented settle: on ubuntu26/resolute an unbounded settle
@@ -210,10 +210,36 @@ function luna_start () {
     fi
 }
 
+# The install log is a pty typescript, so it carries the lpart TUI: one
+# alternate-screen session per phase, whose content the lpart tools already
+# forward themselves. Cut those sessions, the control sequences and the blank
+# padding, so the loghost gets the install narrative and not the rendering.
+function readable_log () {
+    awk 'BEGIN { skip = 0 }
+    {
+        line = $0; out = ""
+        while (1) {
+            if (!skip) {
+                i = index(line, "\033[?1049h")
+                if (i == 0) { out = out line; break }
+                out = out substr(line, 1, i - 1); line = substr(line, i + 8); skip = 1
+            } else {
+                i = index(line, "\033[?1049l")
+                if (i == 0) break
+                line = substr(line, i + 8); skip = 0
+            }
+        }
+        if (out != "") print out
+    }' \
+    | sed -e 's/\x1b\[[0-9:;<=>?]*[a-zA-Z]//g' -e 's/\x1b\][^\x07\x1b]*\x07//g' \
+          -e 's/\x1b\][^\x07\x1b]*\x1b\\//g' -e 's/\x1b.//g' -e 's/\r//g' \
+    | grep -v '^[[:space:]]*$'
+}
+
 function luna_finish () {
     local luna_loghost=$(getargs luna.loghost=)
     if [ "$luna_loghost" ]; then
-        cat /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
+        readable_log < /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
     else
         echo "Luna2: loghost not defined, cannot forward logs."
     fi
@@ -258,7 +284,7 @@ function luna_finish () {
     # (aria2c and curl draw progress meters, the lpart steps draw a TUI). Strip
     # them so the saved log stays readable; a failure here must not cost us the
     # log, hence the guard.
-    sed -i 's/\x1b\[[0-9;?]*[a-zA-Z]//g; s/\r$//' /sysroot/var/log/luna_install.log 2>/dev/null \
+    sed -i 's/\x1b\[[0-9:;<=>?]*[a-zA-Z]//g; s/\r$//' /sysroot/var/log/luna_install.log 2>/dev/null \
         || echo "Luna2: could not strip terminal escapes from luna_install.log"
     # kill shell on tty2
     ps h t tty2 o pid | while read pid; do kill -9 $pid; done
@@ -327,6 +353,38 @@ function fetch_token {
     fi
 }
 
+# The install pipeline writes the stage, the reason and the failing step's
+# stderr here. Printing it on the console is the only chance an operator gets:
+# the node reboots into the next attempt before anyone can open a log.
+LUNA_FAILURE_FILE=/tmp/install_files/logs/last-failure.txt
+function print_failure_reason () {
+    [ -s "$LUNA_FAILURE_FILE" ] || return 0
+    echo "Luna2: Reason:"
+    awk -v pfx="Luna2:   " -v w=67 -v cap=15 '
+        {
+            line = $0
+            do {
+                if (n >= cap) { cut = 1; exit }
+                if (length(line) <= w) { print pfx line; n++; break }
+                # Break at the last space in the row, so a word is not split
+                # across two lines; a row holding one long token is cut.
+                brk = 0
+                for (i = w; i > 1; i--) {
+                    if (substr(line, i, 1) == " ") { brk = i; break }
+                }
+                if (brk > 1 && substr(line, 1, brk - 1) ~ /[^ ]/) {
+                    print pfx substr(line, 1, brk - 1)
+                    line = substr(line, brk + 1)
+                } else {
+                    print pfx substr(line, 1, w)
+                    line = substr(line, w + 1)
+                }
+                n++
+            } while (length(line) > 0)
+        }
+        END { if (cut) print pfx "... (see log)" }' "$LUNA_FAILURE_FILE"
+}
+
 # Visible, interruptible pause between failed install attempts. Replaces a
 # silent `sleep 10` so the operator can see that the installer FAILED (rather
 # than the screen just churning through another bmcsetup/ipmi reload) and can
@@ -335,10 +393,13 @@ function fetch_token {
 # not readable so it never busy-spins.
 function retry_countdown () {
     local secs="${1:-30}"
+    local rc="${2:-1}"
     local ctty="${luna_ctty:-/dev/tty1}"
     echo ""
     echo "Luna2: ============================================================"
     echo "Luna2: INSTALLER FAILED -- retrying in ${secs}s."
+    print_failure_reason
+    echo "Luna2: Exit ${rc}: a retryable failure; the reason is above. Retrying."
     echo "Luna2: Press any key to drop to a shell (exit to resume, poweroff to stop)."
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: ============================================================"
@@ -380,8 +441,22 @@ function fatal_park () {
     echo ""
     echo "Luna2: ============================================================"
     echo "Luna2: INSTALL FAILED FATALLY (exit ${rc}) -- NOT retrying."
-    echo "Luna2: This error recurs on every attempt; it needs operator or daemon"
-    echo "Luna2: attention (e.g. install_mode=legacy reaching the lpart client)."
+    print_failure_reason
+    case "$rc" in
+        "$LUNA_SAFETY_RC")
+            echo "Luna2: Exit ${rc} is a safety refusal: lpart declined to touch the disk;"
+            echo "Luna2: the reason is above. Fix the layout or the node's data, then boot."
+            ;;
+        "$LUNA_FATAL_RC")
+            echo "Luna2: Exit ${rc} is a non-retryable configuration or safety error from an"
+            echo "Luna2: install step; the reason is above. It would recur on every attempt,"
+            echo "Luna2: so the node is parked instead of reinstalling in a loop."
+            ;;
+        *)
+            echo "Luna2: This error recurs on every attempt; it needs operator or daemon"
+            echo "Luna2: attention (e.g. install_mode=legacy reaching the lpart client)."
+            ;;
+    esac
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
     echo "Luna2: ============================================================"
@@ -508,7 +583,7 @@ if [ "x$root" = "xluna" ]; then
                 dmesg > /tmp/luna_install.dmesg.last 2>/dev/null || true
             fi
             if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
-                cat /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
+                readable_log < /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
                 cat /tmp/luna_install.log > /tmp/luna_install.log.prev
                 if [ ! -f /tmp/luna_install.log.first ]; then
                     cat /tmp/luna_install.log > /tmp/luna_install.log.first
@@ -522,7 +597,7 @@ if [ "x$root" = "xluna" ]; then
                 if [ "$rc" = "$LUNA_FATAL_RC" ] || [ "$rc" = "$LUNA_SAFETY_RC" ]; then
                     fatal_park "$rc"   # never returns
                 fi
-                retry_countdown 30
+                retry_countdown 30 "$rc"
             fi
         done
     fi

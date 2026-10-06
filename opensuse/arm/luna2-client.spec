@@ -1,6 +1,6 @@
 Name:          luna2-client
 Version:       %{?luna_version}%{!?luna_version:2.2}
-Release:       %{?luna_release}%{!?luna_release:0}
+Release:       %{?luna_release}%{!?luna_release:2}
 Group:         Unspecified
 Summary:       Kernel module for Luna2-client to deploy nodes for Suse/SLE based distributions
 

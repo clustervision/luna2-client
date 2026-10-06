@@ -143,3 +143,36 @@ func TestBuildPinnableConfig_SkipsDisklessSets(t *testing.T) {
 		t.Errorf("nil config must yield nil, got %+v", got)
 	}
 }
+
+// The operator's bootloader choice is operator intent, like persistent: a
+// save:true install must pin it alongside the devices, or the next boot of a
+// pinned node silently reverts to the default boot order.
+func TestBuildPinnableConfig_CarriesBootloader(t *testing.T) {
+	orig0 := byIDDir
+	byIDDir = t.TempDir()
+	defer func() { byIDDir = orig0 }()
+
+	orig := &v2.Config{
+		Version: v2.SchemaVersion,
+		Sets: []v2.Set{{
+			Name: "os", Role: "os", Selection: "discover", Raid: "none",
+			Save:       true,
+			Bootloader: v2.BootloaderFirst,
+			Volumes: []v2.Volume{
+				{Name: "esp", Mountpoint: "/boot/efi", FS: "vfat", Size: "600M", Provider: "partition"},
+				{Name: "root", Mountpoint: "/", FS: "xfs", Size: "100%", Provider: "lvm"},
+			},
+		}},
+	}
+	resolved := []result.ResolvedSet{{
+		Name: "os", Role: "os",
+		SelectedDisks: []selector.Resolved{{ConfiguredPath: "/dev/sda", ResolvedPath: "/dev/sda"}},
+	}}
+	pin := buildPinnableConfig(orig, resolved, nil)
+	if pin == nil {
+		t.Fatal("expected a pinnable config, got nil")
+	}
+	if pin.Sets[0].Bootloader != v2.BootloaderFirst {
+		t.Fatalf("bootloader = %q, want first", pin.Sets[0].Bootloader)
+	}
+}

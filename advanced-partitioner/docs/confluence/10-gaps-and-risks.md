@@ -58,7 +58,7 @@ Each carries a *why now / why not the obvious thing*:
 
 Each risk below is accepted deliberately by the installer's design owners as of this revision (10 Jun 2026):
 
-- **UEFI only; no BIOS/CSM path.** Accepted deliberately (it is also what the Secure-Boot / measured-boot work builds on). ARM boots UEFI via SBBR, the same path.
+- **GRUB is UEFI-only; a BIOS/CSM node installs without a bootloader.** Accepted deliberately (the Secure-Boot / measured-boot work builds on the UEFI path). A BIOS node partitions, extracts and mounts like a UEFI one and PXE-boots every time; it is refused only when its install ramdisk is not dracut-based, which would loop it back into PXE for ever. ARM boots UEFI via SBBR, the same path.
 - **`legacy` mode is supported indefinitely** as a thin per-node choice, so a cluster can migrate node-by-node; it is not a deprecation deadline.
 
 ---

@@ -187,7 +187,20 @@ type RegisterUEFIEntriesOptions struct {
 	// disk (from storage-result esp_partition); 0 falls back to 1.
 	ESPPartition int
 	SnapshotDir  string // optional; if non-empty, efibootmgr -v captures are written here
+	// BootOrder is "first" or "last" (empty = last), from the os set's
+	// bootloader key.
+	BootOrder string
 }
+
+// BootOrderNotHonouredMarker names the file RegisterUEFIEntries leaves in the
+// snapshot (runtime) directory when a "first" request survived the efibootmgr
+// write but not the read-back. The installer summary reads it to report what
+// the firmware actually did; nothing else depends on it.
+const BootOrderNotHonouredMarker = "boot-order-not-honoured.txt"
+
+// bootOrderFirst is the one BootOrder value that changes what this file does;
+// anything else (including the empty default) orders the disk last.
+const bootOrderFirst = "first"
 
 // RegisterUEFIEntries deletes any stale TrinityX entries, creates one
 // per boot disk pointing at the distro's signed shim (falling back to the
@@ -211,6 +224,13 @@ type RegisterUEFIEntriesOptions struct {
 // shim ordering the boot-script path has always used, which appends its
 // entry last.
 //
+// An operator who wants the opposite asks for it per set with
+// `bootloader: first`, which puts the TrinityX group at the head instead. That
+// is for a cluster whose nodes must come up without the controller; it hands
+// the boot decision to firmware, so it is opt-in and never the default. Some
+// firmware re-applies its own Setup boot priorities at POST and ignores the
+// request; the read-back says so rather than claiming success.
+//
 // Returns nil and skips entirely when RegisterNVRAM == "no", when the
 // sysroot doesn't expose /sys/firmware/efi/efivars, or when efibootmgr
 // is not installed. Mirrors the bash early-return ladder.
@@ -220,6 +240,9 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 	if opts.RegisterNVRAM == "no" {
 		if opts.Logger != nil {
 			opts.Logger.Info("skipping UEFI NVRAM registration because register_nvram=no")
+			if opts.BootOrder == bootOrderFirst {
+				opts.Logger.UserInfo("bootloader=first is ignored with register_nvram=no: there is no UEFI boot order to arrange")
+			}
 		}
 		return nil
 	}
@@ -359,9 +382,16 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 			device = append(device, n)
 		}
 	}
-	newOrder := append([]string(nil), network...)
-	newOrder = append(newOrder, device...)
-	newOrder = append(newOrder, trinity...)
+	var newOrder []string
+	if opts.BootOrder == bootOrderFirst {
+		newOrder = append(newOrder, trinity...)
+		newOrder = append(newOrder, network...)
+		newOrder = append(newOrder, device...)
+	} else {
+		newOrder = append(newOrder, network...)
+		newOrder = append(newOrder, device...)
+		newOrder = append(newOrder, trinity...)
+	}
 	newOrder = append(newOrder, trailing...)
 	joined := strings.Join(newOrder, ",")
 	if _, err := opts.Runner.Run(ctx, executor.CommandSpec{
@@ -374,8 +404,48 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 	clearBootNext(ctx, opts.Runner, opts.Sysroot)
 	maybeSnapshot(ctx, opts.Runner, opts.Sysroot, opts.SnapshotDir, "efibootmgr-after-bootorder.txt")
 
-	// 5. Validate that TrinityX is registered and reachable from BootOrder.
+	// 5. A disk-first request is a request: report what the firmware kept.
+	if opts.BootOrder == bootOrderFirst {
+		reportDiskFirstReadBack(ctx, opts)
+	}
+
+	// 6. Validate that TrinityX is registered and reachable from BootOrder.
 	return validateTrinityRegistered(ctx, opts.Runner, opts.Sysroot)
+}
+
+// reportDiskFirstReadBack re-reads BootOrder after the reorder and, when a
+// TrinityX entry is not at the head, warns and leaves the marker the installer
+// summary reads. Not an error: the node still boots, and the firmware is
+// entitled to its own priorities -- the install must not be failed for it.
+// A failed read is left to validateTrinityRegistered, which reports it next.
+func reportDiskFirstReadBack(ctx context.Context, opts RegisterUEFIEntriesOptions) {
+	out, err := runEFIBootmgr(ctx, opts.Runner, opts.Sysroot)
+	if err != nil {
+		return
+	}
+	order, _ := bootOrderFromOutput(out)
+	if len(order) == 0 {
+		return
+	}
+	head := bootLabelsFromOutput(out)[order[0]]
+	if strings.Contains(head, BootloaderID) {
+		return
+	}
+	if opts.Logger != nil {
+		opts.Logger.Warn(fmt.Sprintf(
+			"bootloader=first was requested but the firmware did not keep it: BootOrder now starts with %q -- "+
+				"some AMI and Supermicro firmware re-applies its Setup boot priorities at POST; "+
+				"put the disk first in the node's BIOS boot menu to make it stick", head))
+	}
+	if opts.SnapshotDir == "" {
+		return
+	}
+	if err := os.MkdirAll(opts.SnapshotDir, 0o750); err != nil {
+		return
+	}
+	//nolint:gosec // diagnostic marker in operator-controlled dir
+	_ = os.WriteFile(filepath.Join(opts.SnapshotDir, BootOrderNotHonouredMarker),
+		[]byte(strings.Join(order, ",")+"\n"), 0o640)
 }
 
 func runEFIBootmgr(ctx context.Context, runner executor.Runner, sysroot string) (string, error) {

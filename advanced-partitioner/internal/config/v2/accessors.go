@@ -39,18 +39,33 @@ func SelectorTypeOf(dev string) (SelectorType, error) {
 
 // Boot is UEFI only under v1.4 (decisions/0003); these accessors return the
 // fixed values the storage stack and bootloader finaliser expect, so the
-// downstream builders need no special-casing.
+// downstream builders need no special-casing. The os set's bootloader key is
+// the one thing an operator can vary — see Set.BootMethodOrNone and
+// Set.BootOrderOrLast.
 
-// BootMethod is always "grub" — every disk-based OS set installs a bootloader.
+// BootMethod is the layout-wide default; the per-set Set.BootMethodOrNone is
+// what the installer reads.
 func (c *Config) BootMethod() string { return "grub" }
 
-// BootMethodOrNone returns "none" for a memory (memboot RAM-root) set, which
-// installs no bootloader, and "grub" for any disk-based set.
+// BootMethodOrNone returns "none" when no bootloader is installed — a memory
+// (memboot RAM-root) set, or an os set whose bootloader key says none — and
+// "grub" otherwise.
 func (s *Set) BootMethodOrNone() string {
-	if s.StorageType() == StorageMemory {
+	if s.StorageType() == StorageMemory || s.Bootloader == BootloaderNone {
 		return "none"
 	}
 	return "grub"
+}
+
+// BootOrderOrLast returns where the node's own disk sits in the UEFI boot
+// order: "first" only when the os set asks for it, else "last". An absent key
+// means last (today's behaviour); an explicit false means none, which has no
+// boot order to arrange and so reads as last here too.
+func (s *Set) BootOrderOrLast() string {
+	if s.Bootloader == BootloaderFirst {
+		return string(BootloaderFirst)
+	}
+	return string(BootloaderLast)
 }
 
 // BootFirmware is always "uefi".

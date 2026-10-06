@@ -103,8 +103,11 @@ func (b *Builder) MakeFilesystems(ctx context.Context, set *v2.Set, layout parti
 		RAIDMode:     layout.RAIDMode,
 	}
 
-	// EFI partition.
-	if set.Role == "os" && layout.FirmwareMode == "uefi" && len(layout.EFIPartitions) > 0 {
+	// EFI partition. Formatted whatever the firmware: the health probe
+	// (storagehealth) and the mount-existing prediction (predict.go) both
+	// expect a vfat ESP on every OS set that declares one, so skipping it on
+	// BIOS would make the next boot classify the set as broken.
+	if set.Role == "os" && len(layout.EFIPartitions) > 0 {
 		efiDev := preferMD(md.EFIMDDevice, layout.EFIPartitions[0])
 		if err := b.wipeAndFormat(ctx, efiDev, "vfat"); err != nil {
 			return Filesystems{}, err

@@ -50,7 +50,7 @@ install() {
                    blkdiscard fstrim base64 tpm2_pcrread chroot \
                    dmidecode aria2c ping logger dropbear \
                    wc mkswap swapon swaplabel mkfs.vfat mkfs.fat dosfslabel \
-                   fatlabel mdadm fdisk lsblk tee lbzip2 \
+                   fatlabel mdadm fdisk lsblk tee tail touch lbzip2 \
                    sgdisk partprobe wipefs blkid pvcreate vgcreate lvcreate \
                    lvchange vgremove pvremove lvremove vgchange pvs vgs lvs \
                    dmsetup jq findmnt dirname cut readlink sort xargs mount umount \

@@ -59,3 +59,5 @@
 3.56	3B	destructive	5	-	full	TODO	redhat	2100
 3.57	3B	destructive	5	filter-keep.json	sync	TODO	all	2100
 3.61	3B	safe	3	dl-single.json	auto	TODO	all	1500
+3.66	3B	destructive	3	dl-bootloader-first.json	auto	TODO	all	1800
+3.67	3B	destructive	3	dl-bootloader-none.json	auto	TODO	all	1800

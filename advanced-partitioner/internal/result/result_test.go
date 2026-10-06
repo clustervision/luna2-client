@@ -215,3 +215,114 @@ func TestWriteResolved(t *testing.T) {
 		t.Fatalf("wrong shape: %+v", got)
 	}
 }
+
+// GRUB, shim and the UEFI boot order are UEFI-only, so a disk set on BIOS
+// firmware installs no bootloader: boot_method is "none" and
+// lpart-bootloader-finalise stops after writing fstab.
+func TestAssembleDiskSetOnBIOSHasNoBootMethod(t *testing.T) {
+	set := &v2.Set{
+		Name: "os", Role: "os", Selection: "manual", Raid: "none",
+		Devices: []string{"/dev/sda"},
+		Volumes: []v2.Volume{
+			{Name: "uefi", Mountpoint: "/boot/efi", FS: "vfat", Size: "600M", Provider: "partition"},
+			{Name: "root", Mountpoint: "/", FS: "xfs", Size: "100%", Provider: "lvm"},
+		},
+	}
+	in := AssembleInput{
+		Set:          set,
+		FirmwareMode: "bios",
+		Selected:     []selector.Resolved{{ConfiguredPath: "/dev/sda", ResolvedPath: "/dev/sda"}},
+		Filesystems: fsmod.Filesystems{
+			Role: "os", FirmwareMode: "bios", RAIDMode: "none",
+			Filesystems: []fsmod.Filesystem{
+				{Mount: "/boot/efi", Device: "/dev/sda1", FS: "vfat"},
+				{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs"},
+			},
+		},
+		Mount: mount.Result{MountedTargetRoot: "/sysroot", RootDevice: "/dev/mapper/os-root"},
+	}
+	got := Assemble(in)
+	if got.BootMethod != "none" {
+		t.Fatalf("BootMethod = %q, want none on BIOS firmware", got.BootMethod)
+	}
+	if got.FirmwareMode != "bios" {
+		t.Fatalf("FirmwareMode = %q, want bios", got.FirmwareMode)
+	}
+	// The ESP is still laid down and formatted, so a later switch to UEFI
+	// needs no repartition.
+	if got.Filesystems[0].Mount != "/boot/efi" || got.Filesystems[0].FS != "vfat" {
+		t.Fatalf("the ESP must still be present on BIOS: %+v", got.Filesystems)
+	}
+}
+
+// osSetForBoot is a minimal disk OS set; the boot fields are the only thing
+// the bootloader tests below vary.
+func osSetForBoot(bl v2.Bootloader) *v2.Set {
+	return &v2.Set{
+		Name: "os", Role: "os", Selection: "manual", Raid: "none",
+		Devices:    []string{"/dev/sda"},
+		Bootloader: bl,
+		Volumes: []v2.Volume{
+			{Name: "uefi", Mountpoint: "/boot/efi", FS: "vfat", Size: "600M", Provider: "partition"},
+			{Name: "root", Mountpoint: "/", FS: "xfs", Size: "100%", Provider: "lvm"},
+		},
+	}
+}
+
+func assembleUEFI(set *v2.Set) StorageResult {
+	return Assemble(AssembleInput{
+		Set:          set,
+		FirmwareMode: "uefi",
+		Selected:     []selector.Resolved{{ConfiguredPath: "/dev/sda", ResolvedPath: "/dev/sda"}},
+		Filesystems: fsmod.Filesystems{
+			Role: "os", FirmwareMode: "uefi", RAIDMode: "none",
+			Filesystems: []fsmod.Filesystem{
+				{Mount: "/boot/efi", Device: "/dev/sda1", FS: "vfat"},
+				{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs"},
+			},
+		},
+		Mount: mount.Result{MountedTargetRoot: "/sysroot", RootDevice: "/dev/mapper/os-root"},
+	})
+}
+
+// The set's bootloader key reaches the storage result through boot_method and
+// boot_order, which is what the finalise and the summary read.
+func TestAssembleCarriesBootloaderChoice(t *testing.T) {
+	cases := []struct {
+		bl         v2.Bootloader
+		wantMethod string
+		wantOrder  string
+	}{
+		{"", "grub", "last"},
+		{v2.BootloaderLast, "grub", "last"},
+		{v2.BootloaderFirst, "grub", "first"},
+		{v2.BootloaderNone, "none", "last"},
+	}
+	for _, c := range cases {
+		t.Run(string(c.bl), func(t *testing.T) {
+			got := assembleUEFI(osSetForBoot(c.bl))
+			if got.BootMethod != c.wantMethod {
+				t.Errorf("BootMethod = %q, want %q", got.BootMethod, c.wantMethod)
+			}
+			if got.BootOrder != c.wantOrder {
+				t.Errorf("BootOrder = %q, want %q", got.BootOrder, c.wantOrder)
+			}
+			// Everything else is unaffected by the choice.
+			if got.StorageType != "lvm" || got.RootDevice != "/dev/mapper/os-root" ||
+				len(got.Filesystems) != 2 || got.ESPPartition != 0 {
+				t.Errorf("the bootloader choice must not change the storage layout: %+v", got)
+			}
+		})
+	}
+}
+
+// boot_order is always written, so a consumer never has to guess the default.
+func TestAssembleAlwaysWritesBootOrder(t *testing.T) {
+	body, err := json.Marshal(assembleUEFI(osSetForBoot("")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"boot_order":"last"`) {
+		t.Fatalf("boot_order missing from the result JSON: %s", body)
+	}
+}

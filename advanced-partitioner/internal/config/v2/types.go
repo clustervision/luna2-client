@@ -18,6 +18,11 @@
 //     mode needs exactly one os set") live in the decision engine.
 package v2
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // SchemaVersion is the only supported value of Config.Version.
 const SchemaVersion = 2
 
@@ -63,6 +68,10 @@ type Set struct {
 	// partitioned, formatted, or written, only mounted. It survives auto,
 	// sync, and full; only sanitize erases it. Operator-set only.
 	Persistent bool `json:"persistent,omitempty"`
+	// Bootloader, on the os set, places the node's own disk in the UEFI boot
+	// order or takes the bootloader away altogether. Absent means "last" —
+	// today's behaviour, the network entry ahead of the disk.
+	Bootloader Bootloader `json:"bootloader,omitempty"`
 	// Origin is provenance written by the installer when it pins a discovered
 	// layout (Save). It is not operator input; it round-trips when the pinned
 	// layout is read back on a later boot. nil on operator-authored configs.
@@ -72,6 +81,68 @@ type Set struct {
 	// Comment is free-text operator documentation, carried as data and ignored
 	// by all logic (see Config.Comment).
 	Comment string `json:"comment,omitempty"`
+}
+
+// Bootloader is the normalised value of the os set's `bootloader` key.
+//
+// Several spellings reach the same value because operators and an earlier
+// design write this differently (a YAML `yes`, a JSON boolean, the word `grub`
+// for "install one"); the accepted set is exactly what the daemon's store-time
+// validator accepts, so a layout that installs on a node can always be saved
+// on the controller.
+type Bootloader string
+
+const (
+	// BootloaderFirst puts the TrinityX entries at the head of the UEFI boot
+	// order, so the node boots its own disk when the network does not answer.
+	BootloaderFirst Bootloader = "first"
+	// BootloaderLast is the default: the network entry stays ahead of the
+	// disk, so the controller keeps deciding how the node boots.
+	BootloaderLast Bootloader = "last"
+	// BootloaderNone installs no bootloader at all and removes any existing
+	// one; the node PXE-boots every time.
+	BootloaderNone Bootloader = "none"
+)
+
+// bootloaderSpellings maps every accepted spelling to its normalised value.
+// Matching is exact: the daemon rejects anything else, including a capitalised
+// word, and the two validators must not drift.
+var bootloaderSpellings = map[string]Bootloader{
+	"first": BootloaderFirst,
+	"grub":  BootloaderFirst,
+	"yes":   BootloaderFirst,
+	"true":  BootloaderFirst,
+	"last":  BootloaderLast,
+	"none":  BootloaderNone,
+	"no":    BootloaderNone,
+	"false": BootloaderNone,
+}
+
+// UnmarshalJSON accepts a string or a JSON boolean and normalises it. An
+// unrecognised string is kept verbatim so Validate can name it in the enum
+// error, like every other enum in this grammar; any other JSON type is a
+// decode error, because no number or object spells a boot order.
+func (b *Bootloader) UnmarshalJSON(raw []byte) error {
+	switch {
+	case string(raw) == "null":
+		return nil // absent, per the Unmarshaler convention
+	case string(raw) == "true":
+		*b = BootloaderFirst
+		return nil
+	case string(raw) == "false":
+		*b = BootloaderNone
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err != nil {
+		return fmt.Errorf("bootloader must be a string or a boolean, got %s", raw)
+	}
+	if norm, ok := bootloaderSpellings[s]; ok {
+		*b = norm
+		return nil
+	}
+	*b = Bootloader(s)
+	return nil
 }
 
 // Origin records how a set's pinned manual layout came to be: stamped by
@@ -123,7 +194,7 @@ var (
 	allowedTopLevel = []string{"version", "sets", "comment"}
 	allowedSet      = []string{
 		"name", "role", "selection", "raid", "count", "spares",
-		"match", "devices", "save", "persistent", "origin", "volumes", "comment",
+		"match", "devices", "save", "persistent", "bootloader", "origin", "volumes", "comment",
 	}
 	allowedMatch  = []string{"tags", "min_size", "max_size", "model"}
 	allowedOrigin = []string{"from", "at", "by", "host"}

@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/bootloader"
 )
 
 func writeResult(t *testing.T, body string) string {
@@ -105,6 +107,30 @@ func TestParseLayoutMemOS(t *testing.T) {
 	}
 }
 
+// A disk OS with boot_method=none (BIOS firmware) must not claim GRUB in the
+// summary: the node PXE-boots every time. bootMode() reads the host's /sys, so
+// only the boot segment is asserted.
+func TestParseLayoutDiskOSWithoutBootloader(t *testing.T) {
+	info := parseLayout(writeResult(t, `{"role":"os","raid_mode":"none","boot_method":"none",
+	  "selected_disks":[{"resolved_path":"/dev/sda","serial":"S1"}]}`))
+	want := "Boot: none (BIOS firmware: GRUB, shim and boot order skipped; node PXE-boots every time)"
+	if !strings.Contains(info.Summary, want) {
+		t.Errorf("summary = %q, want it to contain %q", info.Summary, want)
+	}
+	if strings.Contains(info.Summary, "/GRUB") {
+		t.Errorf("summary must not claim GRUB: %q", info.Summary)
+	}
+}
+
+// A disk OS with a bootloader still reports GRUB.
+func TestParseLayoutDiskOSWithGRUB(t *testing.T) {
+	info := parseLayout(writeResult(t, `{"role":"os","raid_mode":"none","boot_method":"grub",
+	  "selected_disks":[{"resolved_path":"/dev/sda","serial":"S1"}]}`))
+	if !strings.Contains(info.Summary, "/GRUB") {
+		t.Errorf("summary = %q, want it to contain /GRUB", info.Summary)
+	}
+}
+
 func TestHostFromURL(t *testing.T) {
 	cases := map[string]string{
 		"https://10.141.255.252:7050": "10.141.255.252:7050",
@@ -170,5 +196,56 @@ func TestDiskUID(t *testing.T) {
 	}
 	if got := diskUID("", "", "", "sda"); got != "sda" {
 		t.Errorf("name last: %q", got)
+	}
+}
+
+// bootloader: none on a UEFI node must not be reported as the BIOS case: the
+// operator chose it, and the remedy is the key, not the firmware.
+func TestParseLayoutBootloaderNoneOnUEFI(t *testing.T) {
+	info := parseLayout(writeResult(t, `{"role":"os","raid_mode":"none","firmware_mode":"uefi",
+	  "boot_method":"none","boot_order":"last",
+	  "selected_disks":[{"resolved_path":"/dev/sda","serial":"S1"}]}`))
+	want := "Boot: none (bootloader: none; node PXE-boots every time)"
+	if !strings.Contains(info.Summary, want) {
+		t.Errorf("summary = %q, want it to contain %q", info.Summary, want)
+	}
+}
+
+// pinBootMode fixes the firmware the summary reports, so a test asserting the
+// UEFI boot line does not depend on the firmware of the machine running it.
+func pinBootMode(t *testing.T, mode string) {
+	t.Helper()
+	orig := bootMode
+	bootMode = func() string { return mode }
+	t.Cleanup(func() { bootMode = orig })
+}
+
+// bootloader: first, and the firmware kept it: the summary says the disk is
+// first so the operator can see the request landed.
+func TestParseLayoutBootOrderFirstHonoured(t *testing.T) {
+	pinBootMode(t, "UEFI")
+	info := parseLayout(writeResult(t, `{"role":"os","raid_mode":"none","firmware_mode":"uefi",
+	  "boot_method":"grub","boot_order":"first","register_nvram":"auto",
+	  "selected_disks":[{"resolved_path":"/dev/sda","serial":"S1"}]}`))
+	if !strings.Contains(info.Summary, "(disk first)") {
+		t.Errorf("summary = %q, want it to report the disk first", info.Summary)
+	}
+}
+
+// Same request, but the finalise's read-back found the firmware had re-sorted
+// the order. The summary must say what actually happened, not what was asked.
+func TestParseLayoutBootOrderFirstNotHonoured(t *testing.T) {
+	pinBootMode(t, "UEFI")
+	path := writeResult(t, `{"role":"os","raid_mode":"none","firmware_mode":"uefi",
+	  "boot_method":"grub","boot_order":"first","register_nvram":"auto",
+	  "selected_disks":[{"resolved_path":"/dev/sda","serial":"S1"}]}`)
+	marker := filepath.Join(filepath.Dir(path), bootloader.BootOrderNotHonouredMarker)
+	if err := os.WriteFile(marker, []byte("0010,0001\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info := parseLayout(path)
+	want := "(disk first requested, firmware kept network first)"
+	if !strings.Contains(info.Summary, want) {
+		t.Errorf("summary = %q, want it to contain %q", info.Summary, want)
 	}
 }

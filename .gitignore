@@ -2,3 +2,14 @@ advanced-partitioner/bin/
 advanced-partitioner/dist/
 *.o
 *.test
+
+# Compiled lpart binaries. The pipeline compiles them and stages them into
+# each tree before packing, and the two x86 rpm scripts build them locally, so
+# a committed copy only goes stale and gets believed.
+*/*/src/usr/bin/lpart-bootloader-finalise
+*/*/src/usr/bin/lpart-emit
+*/*/src/usr/bin/lpart-node-installer
+*/*/src/usr/bin/lpart-osimage-install
+*/*/src/usr/bin/lpart-storage-check
+*/*/src/usr/bin/lpart-storage-prepare
+*/*/src/usr/bin/lpart-tui

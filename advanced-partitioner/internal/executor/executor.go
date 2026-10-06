@@ -256,18 +256,14 @@ func (r *realRunner) Run(ctx context.Context, spec CommandSpec) (CommandResult, 
 		}
 		// Include the captured stderr so command failures are diagnosable from
 		// the install log (rsyslog stream). Without this, "exit status 5" gives
-		// no clue why (e.g. an LVM/pvcreate rejection). Trimmed + tail-truncated.
-		stderrTail := strings.TrimSpace(string(res.Stderr))
-		if len(stderrTail) > 1000 {
-			stderrTail = "..." + stderrTail[len(stderrTail)-1000:]
-		}
+		// no clue why (e.g. an LVM/pvcreate rejection).
 		r.log.Slog().Log(cctx, level, "run_cmd failed",
 			slog.String("path", path),
 			slog.Int("exit_code", res.ExitCode),
 			slog.Duration("duration", elapsed),
 			slog.Bool("timed_out", res.TimedOut),
 			slog.String("err", runErr.Error()),
-			slog.String("stderr", stderrTail),
+			slog.String("stderr", stderrExcerpt(res.Stderr)),
 		)
 		return res, fmt.Errorf("%s: %w", FormatArgv(path, redactArgs(args)...), runErr)
 	}
@@ -277,6 +273,24 @@ func (r *realRunner) Run(ctx context.Context, spec CommandSpec) (CommandResult, 
 		slog.Duration("duration", elapsed),
 	)
 	return res, nil
+}
+
+// stderrExcerptEnd bounds each end of the excerpt kept in the log entry.
+const stderrExcerptEnd = 1000
+
+// stderrExcerpt trims the captured stderr and, when it is longer than both
+// ends together, keeps the HEAD and the TAIL with a count of what was dropped.
+// The head is what matters: a command's first error is normally the cause and
+// the tail the cascade, so a tail-only excerpt points the reader at the wrong
+// thing (a tar out of space prints hundreds of ENOSPC lines, then a handful of
+// deferred-ACL warnings).
+func stderrExcerpt(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) <= 2*stderrExcerptEnd {
+		return s
+	}
+	return fmt.Sprintf("%s\n... %d bytes omitted ...\n%s",
+		s[:stderrExcerptEnd], len(s)-2*stderrExcerptEnd, s[len(s)-stderrExcerptEnd:])
 }
 
 // --- DryRun runner --------------------------------------------------------

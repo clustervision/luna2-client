@@ -106,7 +106,7 @@ Top to bottom; **no reboot inside it** — it ends by reporting success and cont
 | **`lpart-storage-prepare`** | part | discover disks (tags/size), resolve the layout, then partition / RAID / LVM / mkfs and **mount the tree at the sysroot** — dispatching on `install_mode`, enforcing the data fence (defined on **06**); `sanitize` securely erases here, `memboot` makes a tmpfs root |
 | **`lpart-storage-check`** | part | the health probe for an *existing* layout (`auto`/`sync`): healthy → reuse-and-mount, broken → recreate; the whole job for `local` |
 | **`lpart-osimage-install`** | part | **download + extract** the OS image into the sysroot — honouring `provision_method`/`fallback`, the `osimage_filter`, the first-install→full promotion, and the persistent-set excludes — then verify (`/etc/os-release` present) |
-| **`lpart-bootloader-finalise`** | post | write `fstab`, install signed shim + GRUB into the ESP, register the UEFI **NVRAM** entry — then verify by re-reading `efibootmgr` / the ESP / `grub.cfg`. Skipped for `memboot` |
+| **`lpart-bootloader-finalise`** | post | write `fstab`, install signed shim + GRUB into the ESP, register the UEFI **NVRAM** entry — then verify by re-reading `efibootmgr` / the ESP / `grub.cfg`. Skipped for `memboot`, on legacy BIOS, and for `bootloader: none` (which also removes an existing setup) |
 
 While the pipeline runs, `lpart-node-installer` shows a live dashboard on the console — the Luna context, hardware discovery, the storage decision, and the run log streaming the part phase:
 

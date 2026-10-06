@@ -215,6 +215,21 @@ func TestInvalidCases(t *testing.T) {
 			`{"version":2,"sets":[{"name":"x","role":"data","selection":"manual","raid":"none","devices":["/dev/sda"],"origin":{"bogus":"x"},"volumes":[` + dataVol() + `]}]}`,
 			"origin: unknown field 'bogus'",
 		},
+		{
+			"bootloader-bad-value",
+			`{"version":2,"sets":[{"name":"os","role":"os","selection":"discover","raid":"none","bootloader":"lilo","volumes":[` + osVols() + `]}]}`,
+			"bootloader unsupported: 'lilo'",
+		},
+		{
+			"bootloader-empty",
+			`{"version":2,"sets":[{"name":"os","role":"os","selection":"discover","raid":"none","bootloader":"","volumes":[` + osVols() + `]}]}`,
+			"bootloader unsupported: ''",
+		},
+		{
+			"bootloader-on-data-set",
+			`{"version":2,"sets":[{"name":"d","role":"data","selection":"manual","raid":"none","devices":["/dev/sdc"],"bootloader":"none","volumes":[` + dataVol() + `]}]}`,
+			"bootloader is valid on the os set only",
+		},
 	}
 
 	for _, c := range cases {
@@ -308,9 +323,137 @@ func TestCommentRoundTrips(t *testing.T) {
 
 // osSet renders a minimal valid os set with the given name (discover, raid none).
 func osSet(name string) string {
-	return `{"name":"` + name + `","role":"os","selection":"discover","raid":"none","volumes":[` +
-		`{"name":"uefi","mountpoint":"/boot/efi","fs":"vfat","provider":"partition","size":"600M"},` +
-		`{"name":"root","mountpoint":"/","fs":"xfs","provider":"lvm","size":"100%"}]}`
+	return `{"name":"` + name + `","role":"os","selection":"discover","raid":"none","volumes":[` + osVols() + `]}`
+}
+
+// osVols renders the ESP + root pair every valid os set needs.
+func osVols() string {
+	return `{"name":"uefi","mountpoint":"/boot/efi","fs":"vfat","provider":"partition","size":"600M"},` +
+		`{"name":"root","mountpoint":"/","fs":"xfs","provider":"lvm","size":"100%"}`
+}
+
+// TestBootloaderSpellings pins the accepted spellings of the os set's
+// `bootloader` key and what each one means for the two accessors the installer
+// reads: where the disk sits in the UEFI boot order, and whether a bootloader
+// is installed at all.
+func TestBootloaderSpellings(t *testing.T) {
+	cases := []struct {
+		json      string // the raw value, or "" for an absent key
+		wantOrder string
+		wantBoot  string
+	}{
+		{"", "last", "grub"},
+		{`"first"`, "first", "grub"},
+		{`"grub"`, "first", "grub"},
+		{`"yes"`, "first", "grub"},
+		{`"true"`, "first", "grub"},
+		{`true`, "first", "grub"},
+		{`"last"`, "last", "grub"},
+		{`"none"`, "last", "none"},
+		{`"no"`, "last", "none"},
+		{`"false"`, "last", "none"},
+		{`false`, "last", "none"},
+	}
+	for _, c := range cases {
+		name := c.json
+		if name == "" {
+			name = "absent"
+		}
+		t.Run(name, func(t *testing.T) {
+			key := ""
+			if c.json != "" {
+				key = `"bootloader":` + c.json + `,`
+			}
+			j := `{"version":2,"sets":[{"name":"os","role":"os","selection":"discover","raid":"none",` +
+				key + `"volumes":[` + osVols() + `]}]}`
+			cfg, err := Parse([]byte(j))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if err := cfg.ValidateRaw([]byte(j)); err != nil {
+				t.Fatalf("ValidateRaw: %v", err)
+			}
+			s := cfg.OSSet()
+			if got := s.BootOrderOrLast(); got != c.wantOrder {
+				t.Errorf("BootOrderOrLast() = %q, want %q", got, c.wantOrder)
+			}
+			if got := s.BootMethodOrNone(); got != c.wantBoot {
+				t.Errorf("BootMethodOrNone() = %q, want %q", got, c.wantBoot)
+			}
+		})
+	}
+}
+
+// A memboot RAM root installs no bootloader whatever the key says: the guard
+// that keeps memboot out of the new field's reach.
+func TestBootloaderMemorySetStaysNone(t *testing.T) {
+	s := Set{Role: "os", Bootloader: BootloaderFirst, Volumes: []Volume{
+		{Name: "root", Mountpoint: "/", FS: "tmpfs", Provider: "memory"},
+	}}
+	if got := s.BootMethodOrNone(); got != "none" {
+		t.Fatalf("BootMethodOrNone() = %q, want none for a memory set", got)
+	}
+}
+
+// TestBootloaderRoundTrips: the operator's key survives a re-marshal in its
+// normalised spelling (the pinned layout a save:true install writes back must
+// still carry it), and a layout without the key marshals without it, so
+// existing stored layouts are untouched.
+func TestBootloaderRoundTrips(t *testing.T) {
+	j := `{"version":2,"sets":[{"name":"os","role":"os","selection":"discover","raid":"none",` +
+		`"bootloader":"yes","volumes":[` + osVols() + `]}]}`
+	cfg, err := Parse([]byte(j))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("re-marshal validate: %v", err)
+	}
+	out, _ := json.Marshal(cfg)
+	if !strings.Contains(string(out), `"bootloader":"first"`) {
+		t.Errorf("bootloader dropped or not normalised on re-marshal: %s", out)
+	}
+
+	plain := `{"version":2,"sets":[{"name":"os","role":"os","selection":"discover","raid":"none",` +
+		`"volumes":[` + osVols() + `]}]}`
+	cfg, err = Parse([]byte(plain))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	out, _ = json.Marshal(cfg)
+	if strings.Contains(string(out), "bootloader") {
+		t.Errorf("a layout without the key must not gain one: %s", out)
+	}
+}
+
+// The accepted spellings are exactly the lowercase words the daemon's
+// store-time validator accepts. Case-folding here would make a layout that
+// installs on a node but cannot be saved on the controller, so a capitalised
+// value is rejected on both sides.
+func TestBootloaderIsCaseSensitive(t *testing.T) {
+	for _, bad := range []string{"None", "First", "LAST", "Yes", "TRUE"} {
+		j := `{"version":2,"sets":[{"name":"os","role":"os","selection":"discover","raid":"none",` +
+			`"bootloader":"` + bad + `","volumes":[` + osVols() + `]}]}`
+		cfg, err := Parse([]byte(j))
+		if err != nil {
+			continue // a decode refusal is just as good
+		}
+		if err := cfg.ValidateRaw([]byte(j)); err == nil {
+			t.Errorf("bootloader:%q must be rejected; the daemon rejects it too", bad)
+		}
+	}
+}
+
+// A value of the wrong JSON type is a decode error, not a silent default: a
+// number or an object cannot be a spelling of anything.
+func TestBootloaderWrongTypeRejected(t *testing.T) {
+	for _, bad := range []string{`1`, `{}`, `[]`} {
+		j := `{"version":2,"sets":[{"name":"os","role":"os","selection":"discover","raid":"none",` +
+			`"bootloader":` + bad + `,"volumes":[` + osVols() + `]}]}`
+		if _, err := Parse([]byte(j)); err == nil {
+			t.Errorf("bootloader:%s must not parse", bad)
+		}
+	}
 }
 
 // dataVol renders one generic lvm data volume.

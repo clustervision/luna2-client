@@ -1,0 +1,16 @@
+{
+  "version": 2,
+  "comment": "regression 3.67: single-disk OS with no bootloader at all",
+  "sets": [
+    {
+      "name": "os", "role": "os", "selection": "manual", "raid": "none",
+      "devices": ["/dev/vda"],
+      "bootloader": "none",
+      "volumes": [
+        {"name": "efi", "mountpoint": "/boot/efi", "fs": "vfat", "size": "600M", "provider": "partition"},
+        {"name": "boot", "mountpoint": "/boot", "fs": "xfs", "size": "2G", "provider": "partition"},
+        {"name": "root", "mountpoint": "/", "fs": "xfs", "size": "100%", "provider": "lvm"}
+      ]
+    }
+  ]
+}
