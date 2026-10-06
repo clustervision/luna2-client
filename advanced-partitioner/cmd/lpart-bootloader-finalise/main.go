@@ -10,9 +10,10 @@
 //  4. Write /sysroot/etc/fstab from the filesystem list
 //  5. If clear_uefi_nvram=true on UEFI: bind-mount + ClearUEFINVRAMEntries
 //  6. If boot_method=="none": stop (fstab-only path), after removing any
-//     existing bootloader when the OS set asked for none on UEFI; a non-UEFI
-//     firmware past that point is refused (GRUB is UEFI-only); else: bind
-//     mounts + family.Prepare → RegenerateInitramfs → Install → Validate
+//     existing bootloader when the OS set asked for none on UEFI; past that
+//     point a non-UEFI firmware proceeds only for an OS set that asked for a
+//     bootloader, and only with a BIOS boot partition to install into; else:
+//     bind mounts + family.Prepare → RegenerateInitramfs → Install → Validate
 //  7. Always cleanup bind mounts before returning
 package main
 
@@ -218,14 +219,24 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 
-	// Belt behind lpart-storage-prepare's boot preflight: GRUB is UEFI-only, so
-	// a grub boot method on any other firmware is an upstream bug. Refuse here,
-	// before the bind mounts and dracut run for nothing, with exit 2 so the
-	// wrapper parks instead of retrying a permanent condition.
+	// Belt behind lpart-storage-prepare's boot preflight: outside UEFI, GRUB is
+	// installed only for the os set that asked for it, so any other firmware
+	// here is an upstream bug. Refuse before the bind mounts and dracut run for
+	// nothing, with exit 2 so the wrapper parks instead of retrying a permanent
+	// condition.
 	if bctx.FirmwareMode != "uefi" {
-		return cli.ExitSafetyRefusal(stderr, toolName, "firmware-not-uefi",
-			"boot_method=%s needs UEFI firmware but the node booted %q; lpart-storage-prepare should have refused this -- not running dracut/GRUB",
-			bctx.BootMethod, bctx.FirmwareMode)
+		if !bctx.BIOSGRUBRequested() {
+			return cli.ExitSafetyRefusal(stderr, toolName, "firmware-not-uefi",
+				"boot_method=%s needs UEFI firmware but the node booted %q; lpart-storage-prepare should have refused this -- not running dracut/GRUB",
+				bctx.BootMethod, bctx.FirmwareMode)
+		}
+		// GRUB for BIOS keeps its core image in a BIOS boot partition and
+		// refuses to install without one. Only a layout rebuild creates it, so
+		// say which install mode does that rather than failing mid-install.
+		if bctx.StorageResult.BIOSBootPartition == 0 {
+			return cli.ExitSafetyRefusal(stderr, toolName, "missing-bios-boot-partition",
+				"GRUB for BIOS needs a BIOS boot partition for its core image and this node's layout has none; reinstall the node with install_mode full so the partition is created -- not running dracut/GRUB")
+		}
 	}
 
 	logger.SetStage("bind_mounts")

@@ -312,6 +312,7 @@ func parseLayout(path string) layoutInfo {
 	var methodParts, summaryParts []string
 	nvram := false
 	diskOSNoBootloader := false
+	diskOSBIOSGRUB := false
 	osOnUEFI := false
 	diskFirst := false
 	dataIdx := 0
@@ -341,6 +342,7 @@ func parseLayout(path string) layoutInfo {
 			diskOSNoBootloader = strings.EqualFold(s.BootMethod, "none")
 			osOnUEFI = strings.EqualFold(s.FirmwareMode, "uefi")
 			diskFirst = strings.EqualFold(s.BootOrder, "first")
+			diskOSBIOSGRUB = !diskOSNoBootloader && !osOnUEFI
 		}
 
 		var names []string
@@ -376,6 +378,8 @@ func parseLayout(path string) layoutInfo {
 		boot = "Boot: none (bootloader: none; node PXE-boots every time)"
 	case diskOSNoBootloader:
 		boot = "Boot: none (BIOS firmware: GRUB, shim and boot order skipped; node PXE-boots every time)"
+	case diskOSBIOSGRUB:
+		boot += " (BIOS GRUB on every boot disk; no shim and no boot order)"
 	case strings.EqualFold(firmware, "UEFI") && nvram:
 		boot += " + NVRAM"
 		switch {

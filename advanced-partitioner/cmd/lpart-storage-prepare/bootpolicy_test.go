@@ -46,8 +46,9 @@ func TestPlanBoot(t *testing.T) {
 		{"sanitize os bios", installcontext.ModeSanitize, osCfg(), "bios", bootPlan{}},
 		{"legacy os bios", installcontext.ModeLegacy, osCfg(), "bios", bootPlan{}},
 		{"memboot os uefi", installcontext.ModeMemboot, osCfg(), "uefi", bootPlan{}},
-		// The operator's bootloader key only ever takes GRUB away; it cannot
-		// put it on a firmware that has none.
+		// The operator's bootloader key decides whether a disk OS gets GRUB.
+		// On BIOS only "first" asks for one; "last" has no boot order to
+		// arrange there and keeps the no-bootloader path.
 		{"auto os uefi bootloader last", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderLast), "uefi",
 			bootPlan{DiskOS: true, InstallsGRUB: true}},
 		{"auto os uefi bootloader first", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderFirst), "uefi",
@@ -57,6 +58,8 @@ func TestPlanBoot(t *testing.T) {
 		{"auto os bios bootloader none", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderNone), "bios",
 			bootPlan{DiskOS: true, BootloaderNone: true}},
 		{"auto os bios bootloader first", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderFirst), "bios",
+			bootPlan{DiskOS: true, InstallsGRUB: true}},
+		{"auto os bios bootloader last", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderLast), "bios",
 			bootPlan{DiskOS: true}},
 	}
 	for _, c := range cases {
@@ -82,6 +85,9 @@ func TestPreflightBoot(t *testing.T) {
 		{"disk os uefi, dracut", bootPlan{DiskOS: true, InstallsGRUB: true}, bootEnv{Firmware: "uefi", RamdiskPivots: true}, "", nil},
 		{"disk os uefi, non-dracut", bootPlan{DiskOS: true, InstallsGRUB: true}, bootEnv{Firmware: "uefi"}, "", nil},
 		{"disk os bios, dracut", bootPlan{DiskOS: true}, bootEnv{Firmware: "bios", RamdiskPivots: true}, "", nil},
+		// A BIOS node that does install GRUB has something to boot, so the
+		// refusal that exists for a bootloader-less disk OS must not fire.
+		{"disk os bios grub, non-dracut", bootPlan{DiskOS: true, InstallsGRUB: true}, bootEnv{Firmware: "bios"}, "", nil},
 		// The operator has to be able to act on it, and the message must name
 		// the reason this install has no bootloader -- firmware or choice.
 		{"disk os bios, non-dracut", bootPlan{DiskOS: true}, bootEnv{Firmware: "bios"},

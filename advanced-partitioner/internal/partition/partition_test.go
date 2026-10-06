@@ -135,10 +135,9 @@ func TestBuildLayoutSingleDiskUEFI(t *testing.T) {
 	mustHaveCalls(t, f, expect)
 }
 
-// The partition layout does not depend on the firmware: a BIOS node gets the
-// same GPT with the same ESP as a UEFI one, so switching the node to UEFI
-// later needs no repartition. Only GRUB is UEFI-only, and that is decided in
-// lpart-bootloader-finalise, not here.
+// A BIOS node whose os set does not ask for a bootloader gets the same GPT
+// with the same ESP as a UEFI one, so switching the node to UEFI later needs
+// no repartition.
 func TestBuildLayoutIdenticalOnBIOS(t *testing.T) {
 	disks := []selector.Resolved{{ResolvedPath: "/dev/sda", SizeBytes: 500 * 1024 * 1024 * 1024}}
 
@@ -164,8 +163,8 @@ func TestBuildLayoutIdenticalOnBIOS(t *testing.T) {
 		!equalSlices(bios.StoragePartitions, uefi.StoragePartitions) {
 		t.Fatalf("layout differs on BIOS:\n uefi=%+v\n bios=%+v", uefi, bios)
 	}
-	// The ESP is created with the same type code, not an EF02 BIOS-boot
-	// partition: BIOS GRUB is not supported in any form.
+	// The ESP is created with the same type code, and no BIOS boot partition
+	// appears: nothing asked for a bootloader here.
 	mustHaveCalls(t, fb, []string{"sgdisk -n 1:0:+600M -t 1:EF00 -c 1:EFI /dev/sda"})
 	for _, c := range fb.Calls() {
 		if strings.Contains(strings.Join(c.Args, " "), "EF02") {
@@ -391,6 +390,124 @@ func TestMirrorBootForAllRedundantModes(t *testing.T) {
 	} {
 		if got := raidIsRedundant(mode); got != want {
 			t.Errorf("raidIsRedundant(%s) = %v, want %v", mode, got, want)
+		}
+	}
+}
+
+// buildSetBIOSFirst is buildSetSingleDiskUEFI with the os set asking for a
+// bootloader, the one value that means "install one" on BIOS.
+func buildSetBIOSFirst() *v2.Set {
+	set := buildSetSingleDiskUEFI()
+	set.Bootloader = v2.BootloaderFirst
+	return set
+}
+
+// A BIOS GRUB install needs a BIOS boot partition for its core image and
+// refuses without one, so the set that asks for a bootloader on BIOS gets one
+// as partition 1 and everything after it shifts up.
+func TestBuildLayoutBIOSFirstCreatesBIOSBootPartition(t *testing.T) {
+	f := fakeRunnerWithCleanDisk("/dev/sda")
+
+	layout, err := New(Options{Runner: f, Sleep: noSleep}).BuildLayout(
+		context.Background(), buildSetBIOSFirst(),
+		[]selector.Resolved{{ResolvedPath: "/dev/sda", SizeBytes: 500 * 1024 * 1024 * 1024}},
+		"bios")
+	if err != nil {
+		t.Fatalf("BuildLayout: %v", err)
+	}
+	if !equalSlices(layout.BIOSBootPartitions, []string{"/dev/sda1"}) {
+		t.Fatalf("BIOSBootPartitions = %v, want [/dev/sda1]", layout.BIOSBootPartitions)
+	}
+	if !equalSlices(layout.EFIPartitions, []string{"/dev/sda2"}) {
+		t.Fatalf("EFIPartitions = %v, want [/dev/sda2]", layout.EFIPartitions)
+	}
+	if !equalSlices(layout.BootPartitions, []string{"/dev/sda3"}) {
+		t.Fatalf("BootPartitions = %v, want [/dev/sda3]", layout.BootPartitions)
+	}
+	if !equalSlices(layout.StoragePartitions, []string{"/dev/sda4"}) {
+		t.Fatalf("StoragePartitions = %v, want [/dev/sda4]", layout.StoragePartitions)
+	}
+	mustHaveCalls(t, f, []string{
+		"sgdisk -n 1:0:+1M -t 1:EF02 -c 1:BIOSBOOT /dev/sda",
+		"sgdisk -n 2:0:+600M -t 2:EF00 -c 2:EFI /dev/sda",
+		"sgdisk -n 3:0:+1G -t 3:8300 -c 3:BOOT /dev/sda",
+		"sgdisk -n 4:0:0 -t 4:8E00 -c 4:STORAGE /dev/sda",
+	})
+}
+
+// Every disk of the set gets one, so GRUB can be written to either member of
+// a mirrored boot chain. It is never an md member: it holds a raw core image,
+// not a filesystem.
+func TestBuildLayoutBIOSFirstOnEveryDisk(t *testing.T) {
+	f := fakeRunnerWithCleanDisk("/dev/sda", "/dev/sdb")
+	set := buildSetBIOSFirst()
+	set.Raid = "raid1"
+	set.Devices = []string{"/dev/sda", "/dev/sdb"}
+
+	layout, err := New(Options{Runner: f, Sleep: noSleep}).BuildLayout(
+		context.Background(), set, []selector.Resolved{
+			{ResolvedPath: "/dev/sda", SizeBytes: 500 * 1024 * 1024 * 1024},
+			{ResolvedPath: "/dev/sdb", SizeBytes: 500 * 1024 * 1024 * 1024},
+		}, "bios")
+	if err != nil {
+		t.Fatalf("BuildLayout: %v", err)
+	}
+	if !equalSlices(layout.BIOSBootPartitions, []string{"/dev/sda1", "/dev/sdb1"}) {
+		t.Fatalf("BIOSBootPartitions = %v, want both disks", layout.BIOSBootPartitions)
+	}
+	mustHaveCalls(t, f, []string{
+		"sgdisk -n 1:0:+1M -t 1:EF02 -c 1:BIOSBOOT /dev/sda",
+		"sgdisk -n 1:0:+1M -t 1:EF02 -c 1:BIOSBOOT /dev/sdb",
+	})
+}
+
+// The class, not the instance: only the BIOS set that asks for a bootloader
+// gains a partition. Every other combination of firmware and bootloader key
+// keeps exactly the partitions and the numbering it has today.
+func TestBuildLayoutBIOSBootPartitionOnlyWhenBIOSAsksForOne(t *testing.T) {
+	today := []string{
+		"sgdisk --zap-all /dev/sda",
+		"sgdisk -o /dev/sda",
+		"sgdisk -n 1:0:+600M -t 1:EF00 -c 1:EFI /dev/sda",
+		"sgdisk -n 2:0:+1G -t 2:8300 -c 2:BOOT /dev/sda",
+		"sgdisk -n 3:0:0 -t 3:8E00 -c 3:STORAGE /dev/sda",
+		"udevadm settle",
+	}
+	for _, tc := range []struct {
+		firmware   string
+		bootloader v2.Bootloader
+	}{
+		{"uefi", ""},
+		{"uefi", v2.BootloaderFirst},
+		{"uefi", v2.BootloaderLast},
+		{"uefi", v2.BootloaderNone},
+		{"bios", ""},
+		{"bios", v2.BootloaderLast},
+		{"bios", v2.BootloaderNone},
+	} {
+		name := tc.firmware + "/" + string(tc.bootloader)
+		f := fakeRunnerWithCleanDisk("/dev/sda")
+		set := buildSetSingleDiskUEFI()
+		set.Bootloader = tc.bootloader
+		layout, err := New(Options{Runner: f, Sleep: noSleep}).BuildLayout(
+			context.Background(), set,
+			[]selector.Resolved{{ResolvedPath: "/dev/sda", SizeBytes: 500 * 1024 * 1024 * 1024}},
+			tc.firmware)
+		if err != nil {
+			t.Fatalf("%s: BuildLayout: %v", name, err)
+		}
+		if layout.BIOSBootPartitions != nil {
+			t.Errorf("%s: BIOSBootPartitions = %v, want none", name, layout.BIOSBootPartitions)
+		}
+		got := make([]string, 0, len(f.Calls()))
+		for _, c := range f.Calls() {
+			if c.Path != "sgdisk" && c.Path != "udevadm" {
+				continue
+			}
+			got = append(got, c.Path+" "+strings.Join(c.Args, " "))
+		}
+		if !equalSlices(got, today) {
+			t.Errorf("%s: commands changed:\n got=%v\nwant=%v", name, got, today)
 		}
 	}
 }

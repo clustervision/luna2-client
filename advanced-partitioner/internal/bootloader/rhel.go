@@ -108,17 +108,40 @@ func isDebugKernelDir(name string) bool {
 	return strings.HasSuffix(name, "+debug")
 }
 
-// Install writes /etc/default/grub, then runs the UEFI install. BIOS/legacy
-// boot is unsupported (see the firmware gate in lpart-storage-prepare):
-// refuse any non-UEFI firmware rather than attempt a degraded BIOS install.
+// Install writes /etc/default/grub, then runs the UEFI install -- or the BIOS
+// one when the os set asked for a bootloader on non-uefi firmware. Any other
+// non-UEFI firmware is refused (see the boot preflight in
+// lpart-storage-prepare) rather than given a degraded install.
 func (a *rhelAdapter) Install(ctx context.Context) error {
 	if err := a.writeGrubDefault(); err != nil {
 		return err
 	}
 	if a.deps.BootContext.FirmwareMode != "uefi" {
-		return fmt.Errorf("unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
+		if !a.deps.BootContext.BIOSGRUBRequested() {
+			return fmt.Errorf("unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
+		}
+		return a.installBIOS(ctx)
 	}
 	return a.installUEFI(ctx)
+}
+
+// installBIOS writes the GRUB core image into every boot disk's BIOS boot
+// partition, so a mirrored set boots from either member. There is no shim for
+// firmware to verify and no NVRAM to register an entry in outside UEFI, so the
+// install is grub2-install plus the same configuration generation.
+func (a *rhelAdapter) installBIOS(ctx context.Context) error {
+	sysroot := a.deps.BootContext.Sysroot
+	for _, disk := range a.deps.BootContext.StorageResult.BootDevices {
+		if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
+			Path: "/usr/bin/env", Chroot: sysroot,
+			Args: []string{"grub2-install", "--target=i386-pc",
+				"--boot-directory=/boot", disk},
+			CaptureStdout: true, CaptureStderr: true,
+		}); err != nil {
+			return fmt.Errorf("grub2-install %s: %w", disk, err)
+		}
+	}
+	return a.generateGrubConfig(ctx)
 }
 
 // writeGrubDefault writes /etc/default/grub. Mirrors
@@ -174,9 +197,16 @@ func (a *rhelAdapter) installUEFI(ctx context.Context) error {
 		return err
 	}
 
+	return a.generateGrubConfig(ctx)
+}
+
+// generateGrubConfig repairs the image's BLS entries and regenerates
+// grub.cfg. Shared by the UEFI and BIOS installs: what firmware loads differs,
+// what GRUB then reads does not.
+func (a *rhelAdapter) generateGrubConfig(ctx context.Context) error {
 	a.normalizeBLSEntries()
 	if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
-		Path: "/usr/bin/env", Chroot: sysroot,
+		Path: "/usr/bin/env", Chroot: a.deps.BootContext.Sysroot,
 		Args:          []string{"grub2-mkconfig", "-o", "/boot/grub2/grub.cfg"},
 		CaptureStdout: true, CaptureStderr: true,
 	}); err != nil {

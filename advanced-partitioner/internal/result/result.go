@@ -72,7 +72,11 @@ type StorageResult struct {
 	// every member). The bootloader's efibootmgr --create uses this instead
 	// of a hardcoded 1 (FTA D11). 0 means "unknown" (older results) and
 	// callers default to 1.
-	ESPPartition      int          `json:"esp_partition,omitempty"`
+	ESPPartition int `json:"esp_partition,omitempty"`
+	// BIOSBootPartition is the GPT partition NUMBER of the BIOS boot partition
+	// holding the BIOS GRUB core image. 0 means the layout built none, and
+	// lpart-bootloader-finalise refuses a BIOS GRUB install on that.
+	BIOSBootPartition int          `json:"bios_boot_partition,omitempty"`
 	RootDevice        string       `json:"root_device"`
 	Filesystems       []Filesystem `json:"filesystems"`
 	LVM               LVMInfo      `json:"lvm"`
@@ -148,10 +152,12 @@ type AssembleInput struct {
 //
 // Mirrors lib/output_json.sh::assemble_storage_result.
 func Assemble(in AssembleInput) StorageResult {
-	// GRUB, shim and the UEFI boot order are UEFI-only, so a disk set on any
-	// other firmware gets no bootloader and the node PXE-boots every time.
+	// The shim and the UEFI boot order are UEFI-only, but GRUB itself is not:
+	// a disk set on any other firmware gets one when it asks for "first", and
+	// otherwise no bootloader at all, so the node PXE-boots every time.
+	// "last" is a boot-order request, and there is no BIOS boot order.
 	bootMethod := in.Set.BootMethodOrNone()
-	if in.FirmwareMode != "uefi" {
+	if in.FirmwareMode != "uefi" && in.Set.Bootloader != v2.BootloaderFirst {
 		bootMethod = "none"
 	}
 	res := StorageResult{
@@ -176,6 +182,9 @@ func Assemble(in AssembleInput) StorageResult {
 	}
 	if len(in.Layout.EFIPartitions) > 0 {
 		res.ESPPartition = partitionNumberOf(in.Layout.EFIPartitions[0])
+	}
+	if len(in.Layout.BIOSBootPartitions) > 0 {
+		res.BIOSBootPartition = partitionNumberOf(in.Layout.BIOSBootPartitions[0])
 	}
 	for _, f := range in.Filesystems.Filesystems {
 		if f.Mount == "/" {

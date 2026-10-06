@@ -59,8 +59,10 @@ func (a *suseAdapter) RegenerateInitramfs(ctx context.Context) error {
 	return a.rhel.RegenerateInitramfs(ctx)
 }
 
-// Install writes /etc/default/grub then runs the shared UEFI flow
-// (StageSignedShim + efibootmgr + grub2-mkconfig). SUSE's only deviation —
+// Install writes /etc/default/grub then runs the shared RHEL flow: the UEFI
+// one (StageSignedShim + efibootmgr + grub2-mkconfig), or the BIOS one
+// (grub2-install per disk) when the os set asked for a bootloader there.
+// SUSE's only deviation —
 // the image keeps the signed shim+grub under /usr/lib64/efi and leaves the
 // ESP's EFI/ ABSENT on a fresh disk install — is data, not code: the shared
 // StageSignedShim pre-stages the pair from the FamilySUSE row of

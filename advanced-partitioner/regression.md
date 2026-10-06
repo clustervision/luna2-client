@@ -1056,6 +1056,32 @@ needs a legacy-BIOS node. 25 of 36 are destructive. Lab helpers: `/root/lpart-ue
   the message names the `bootloader` key, not the firmware.
 - **Recover.** Remove the key and reinstall → GRUB, shim and the NVRAM entry are back.
 
+### 3.68  `bootloader: first` on legacy BIOS: GRUB, and the controller is optional  [DESTRUCTIVE]
+- **FTA.** `first` is the only value that asks for a bootloader on BIOS, and the property it
+  buys is that the node comes up with the controller's boot service stopped. The install is
+  refused outright if the layout carries no BIOS boot partition, so that leg matters too.
+- **Setup.** A legacy BIOS/CSM node (OVMF off, CSM on), `dl-bootloader-first.json` on the os
+  set, `--install-mode full`.
+- **Expect.** The part phase warns that GRUB is installed but the shim and the UEFI boot order
+  are skipped. `storage-result.json` has `boot_method: grub`, `boot_order: first` and
+  `bios_boot_partition: 1`; `sgdisk -p` on every boot disk shows partition 1 as a 1MiB `EF02`
+  with no filesystem, and the ESP and /boot shifted up by one. Finalise runs
+  `grub2-install --target=i386-pc` (or `grub-install` on Debian/Ubuntu) once per boot disk and
+  then `grub2-mkconfig` / `update-grub`; no `efibootmgr` call of any kind, and the ESP gains no
+  `EFI/BOOT/BOOTX64.EFI`. The summary Boot line reads
+  `Boot: BIOS/GRUB (BIOS GRUB on every boot disk; no shim and no boot order)`.
+- **The property being bought.** Stop the controller's boot service (`systemctl stop luna2-daemon`
+  / block the node's PXE), then power-cycle the node: it boots the installed OS off its own disk
+  unattended. Start the service again afterwards.
+- **Mirrored leg.** On a raid1 os set, pull either disk and power-cycle: the node still boots,
+  because each disk carries its own BIOS boot partition and core image.
+- **Refusal leg (`[SAFE]`).** Reinstall the same node with `--install-mode sync` against the
+  existing layout but no BIOS boot partition on disk (a layout built before the key was set):
+  `safety_refusal=missing-bios-boot-partition` → exit 2, before dracut, and the message names
+  `install_mode full`.
+- **Recover.** Remove the key and reinstall → no bootloader, the node PXE-boots again (3.67's
+  BIOS equivalent).
+
 ---
 
 ## 4. osimage content edge cases

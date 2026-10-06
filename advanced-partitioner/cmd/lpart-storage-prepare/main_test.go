@@ -220,7 +220,10 @@ func TestBIOSAutoNoLayoutAllowed(t *testing.T) {
 }
 
 // A data-only disklayout declares no OS set, so nothing boots from disk and
-// the ramdisk rule must not fire on BIOS either.
+// the ramdisk rule must not fire on BIOS either. Asserted on that reason
+// specifically: a data set with no reachable devices is classified broken, and
+// the data fence then refuses on its own account, which says nothing about the
+// boot policy this test is pinning.
 func TestBIOSDataOnlyAllowed(t *testing.T) {
 	cfg := writeConfig(t, `{
 	"version": 2,
@@ -233,8 +236,8 @@ func TestBIOSDataOnlyAllowed(t *testing.T) {
 	]
 }`)
 	_, stderr, rc := runWithBootEnv(t, "bios", false, "--config", cfg, "--dry-run")
-	if strings.Contains(stderr, "safety_refusal=") {
-		t.Fatalf("a data-only layout on BIOS must not refuse (rc=%d); stderr=%s", rc, stderr)
+	if strings.Contains(stderr, "safety_refusal=bootloader-none-needs-dracut-ramdisk") {
+		t.Fatalf("a data-only layout on BIOS must not hit the boot preflight (rc=%d); stderr=%s", rc, stderr)
 	}
 }
 
