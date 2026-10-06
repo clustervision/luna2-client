@@ -249,3 +249,16 @@ func TestParseLayoutBootOrderFirstNotHonoured(t *testing.T) {
 		t.Errorf("summary = %q, want it to contain %q", info.Summary, want)
 	}
 }
+
+// A BIOS node that does install GRUB must say so, and must not claim the shim
+// or a boot order it never writes.
+func TestParseLayoutDiskOSWithBIOSGRUB(t *testing.T) {
+	pinBootMode(t, "BIOS")
+	info := parseLayout(writeResult(t, `{"role":"os","raid_mode":"none","firmware_mode":"bios",
+	  "boot_method":"grub","boot_order":"first",
+	  "selected_disks":[{"resolved_path":"/dev/sda","serial":"S1"}]}`))
+	want := "Boot: BIOS/GRUB (BIOS GRUB on every boot disk; no shim and no boot order)"
+	if !strings.Contains(info.Summary, want) {
+		t.Errorf("summary = %q, want it to contain %q", info.Summary, want)
+	}
+}

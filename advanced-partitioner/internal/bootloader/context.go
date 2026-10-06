@@ -72,6 +72,14 @@ type BootContext struct {
 	StorageResult  result.StorageResult `json:"storage_result"`
 }
 
+// BIOSGRUBRequested reports whether this node asked for a BIOS GRUB install:
+// non-uefi firmware and an os set whose bootloader key says "first". "last"
+// asks for a place in the UEFI boot order, which a BIOS node does not have,
+// so it keeps the no-bootloader path.
+func (c BootContext) BIOSGRUBRequested() bool {
+	return c.FirmwareMode != "uefi" && c.BootOrder == bootOrderFirst
+}
+
 // BuildBootContext assembles a BootContext from a StorageResult plus a
 // runtime architecture override (defaults to runtime.GOARCH-ish via
 // uname -m; tests pin it). osReleasePath defaults to "<sysroot>/etc/os-release";

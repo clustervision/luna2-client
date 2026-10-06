@@ -12,10 +12,10 @@ import (
 type bootPlan struct {
 	// DiskOS: an OS set is laid down / mounted on local disk this run.
 	DiskOS bool
-	// InstallsGRUB: a disk OS on UEFI firmware whose set wants a bootloader.
-	// GRUB, shim and the NVRAM boot order are UEFI-only (BIOS has no
-	// boot-entry management and no mirrored boot chain), so a disk OS on BIOS
-	// gets no bootloader at all.
+	// InstallsGRUB: a disk OS whose set wants a bootloader, on firmware that
+	// has one to install. The shim and the NVRAM boot order are UEFI-only, so
+	// a disk OS on BIOS gets GRUB alone, and only when the set asks for
+	// "first" -- "last" is a boot-order request BIOS cannot honour.
 	InstallsGRUB bool
 	// BootloaderNone: the OS set asked for no bootloader. Separate from
 	// InstallsGRUB because the two reasons for having none need different
@@ -43,9 +43,10 @@ func planBoot(mode installcontext.Mode, cfg *v2.Config, env bootEnv) bootPlan {
 		return bootPlan{}
 	}
 	none := cfg.OSSet().Bootloader == v2.BootloaderNone
+	first := cfg.OSSet().Bootloader == v2.BootloaderFirst
 	return bootPlan{
 		DiskOS:         true,
-		InstallsGRUB:   env.Firmware == "uefi" && !none,
+		InstallsGRUB:   !none && (env.Firmware == "uefi" || first),
 		BootloaderNone: none,
 	}
 }

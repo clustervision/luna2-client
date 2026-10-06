@@ -433,3 +433,67 @@ func TestDiskRootBootloaderNoneOnBIOSRemovesNothing(t *testing.T) {
 		t.Errorf("a BIOS node has no UEFI boot path to strip: %v", err)
 	}
 }
+
+// biosGRUBResult is what lpart-storage-prepare writes for a BIOS node whose os
+// set asks for a bootloader. biosBootPartition 0 means the layout built none.
+func biosGRUBResult(t *testing.T, biosBootPartition int) string {
+	t.Helper()
+	tmp := t.TempDir()
+	sysroot := filepath.Join(tmp, "sysroot")
+	if err := os.MkdirAll(filepath.Join(sysroot, "etc"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysroot, "etc", "os-release"),
+		[]byte("ID=rocky\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(result.StorageResult{
+		Version: 2, Name: "os", Role: "os",
+		FirmwareMode: "bios", StorageType: "lvm",
+		BootMethod: "grub", BootOrder: "first", BootFirmware: "uefi", RegisterNVRAM: "auto",
+		RAIDMode: "none", MountedTargetRoot: sysroot,
+		BootDevices:       []string{"/dev/sda"},
+		BIOSBootPartition: biosBootPartition,
+		Filesystems: []result.Filesystem{
+			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", Options: "defaults", UUID: "root-uuid"},
+			{Mount: "/boot/efi", Device: "/dev/sda2", FS: "vfat", Options: "defaults", UUID: "esp-uuid"},
+		},
+	})
+	resPath := filepath.Join(tmp, "storage-result.json")
+	if err := os.WriteFile(resPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return resPath
+}
+
+// GRUB for BIOS refuses outright without a BIOS boot partition to hold its
+// core image, so the refusal has to come before the bind mounts and dracut,
+// with exit 2 (park) and the fix named: only a full install repartitions.
+func TestBIOSGRUBWithoutBootPartitionRefused(t *testing.T) {
+	stderr, rc := runEnv(t, "--result", biosGRUBResult(t, 0))
+	if rc != 2 {
+		t.Fatalf("missing BIOS boot partition must exit 2 before dracut; got rc=%d stderr=%s", rc, stderr)
+	}
+	if !strings.Contains(stderr, "safety_refusal=missing-bios-boot-partition") {
+		t.Fatalf("expected the missing-bios-boot-partition refusal; stderr=%s", stderr)
+	}
+	for _, want := range []string{"install_mode", "full"} {
+		if !strings.Contains(stderr, want) {
+			t.Fatalf("refusal must name the fix (%q); stderr=%s", want, stderr)
+		}
+	}
+}
+
+// With the partition present the firmware gate lets the run through: it gets
+// as far as the adapter rather than parking on either refusal.
+func TestBIOSGRUBWithBootPartitionPassesTheGate(t *testing.T) {
+	stderr, rc := runEnv(t, "--result", biosGRUBResult(t, 1))
+	if rc == 2 {
+		t.Fatalf("a BIOS GRUB install with its boot partition must not park; stderr=%s", stderr)
+	}
+	for _, unwanted := range []string{"safety_refusal=firmware-not-uefi", "safety_refusal=missing-bios-boot-partition"} {
+		if strings.Contains(stderr, unwanted) {
+			t.Fatalf("unexpected refusal %q; stderr=%s", unwanted, stderr)
+		}
+	}
+}

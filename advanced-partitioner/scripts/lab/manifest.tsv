@@ -61,3 +61,4 @@
 3.61	3B	safe	3	dl-single.json	auto	TODO	all	1500
 3.66	3B	destructive	3	dl-bootloader-first.json	auto	TODO	all	1800
 3.67	3B	destructive	3	dl-bootloader-none.json	auto	TODO	all	1800
+3.68	3B	destructive	3	dl-bootloader-first.json	full	TODO	all	1800

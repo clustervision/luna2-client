@@ -92,17 +92,17 @@ flowchart LR
 
 A **volume** is one mountpoint + filesystem within a set, backed by a `provider` (`partition` or `lvm`). A DATA set can be marked **`persistent: true`** — a firm promise that the installer never partitions, formats or overwrites it; it is only mounted.
 
-The OS set declares a vfat `/boot/efi` volume on **both** firmware modes, and the layout is identical on both. Firmware is not a field: it is whichever mode the node PXE-booted in. On UEFI the installer writes GRUB, the signed shim and the NVRAM boot entry; on legacy BIOS/CSM it writes none of those and the node PXE-boots every time. A BIOS node is refused in one case only — an install ramdisk that is not dracut-based, which would reboot into a disk with no bootloader and loop back into PXE for ever (`luna osimage pack` an image carrying dracut).
+The OS set declares a vfat `/boot/efi` volume on **both** firmware modes, and the layout is identical on both. Firmware is not a field: it is whichever mode the node PXE-booted in. On UEFI the installer writes GRUB, the signed shim and the NVRAM boot entry; on legacy BIOS/CSM it writes the shim and the boot entry never, and GRUB only when the OS set asks for it, so by default the node PXE-boots every time. A BIOS node is refused in one case only — an install ramdisk that is not dracut-based, which would reboot into a disk with no bootloader and loop back into PXE for ever (`luna osimage pack` an image carrying dracut).
 
 The OS set may carry **`bootloader`**, the only boot field in the grammar:
 
 | value | meaning |
 |---|---|
 | absent, `last` | the default: GRUB, the shim and the NVRAM entry are installed, with the network entry ahead of the disk in the boot order |
-| `first` (also `grub`, `yes`, `true`) | the same, but the TrinityX entries go to the head of the boot order, so the node boots its own disk when the network does not answer. Firmware that re-applies its Setup priorities at POST can undo it; the install warns and the summary says so rather than claiming the disk is first |
+| `first` (also `grub`, `yes`, `true`) | the same, but the TrinityX entries go to the head of the boot order, so the node boots its own disk when the network does not answer. Firmware that re-applies its Setup priorities at POST can undo it; the install warns and the summary says so rather than claiming the disk is first. On legacy BIOS this is the only value that asks for a bootloader at all: the layout leads each boot disk with a one-mebibyte `EF02` BIOS boot partition and GRUB is written to every boot disk, with no shim and no boot order |
 | `none` (also `no`, `false`) | no bootloader at all — no initramfs rebuild, no shim, no NVRAM entry — and an existing GRUB setup is removed, so the node cannot still be firmware-booted from the old install. The node PXE-boots every time; the dracut-ramdisk refusal above applies here too |
 
-It is valid on the `os` set only, the ESP is still declared and formatted either way, and the same refusal rules apply on BIOS, where there is no boot order to arrange and the key is ignored with one info line.
+It is valid on the `os` set only, the ESP is still declared and formatted either way, and the same refusal rules apply on BIOS — where there is no boot order to arrange, so `last` installs nothing and says so in one info line. Because `first` is the only BIOS spelling for "install a bootloader", a group spanning both firmwares also moves its UEFI nodes to the head of the boot order; a per-group or per-node layout is the way around that. A BIOS GRUB install is refused with `safety_refusal=missing-bios-boot-partition` when the layout carries no BIOS boot partition, which only a rebuild creates — reinstall with `install_mode full`.
 
 ### The data fence (what each mode may wipe)
 

@@ -12,10 +12,10 @@
 //   - sgdisk ships with gdisk on RHEL/Fedora/Rocky/Alma and Debian/Ubuntu.
 //     The same flags work identically on arm64 (sgdisk has been
 //     architecture-neutral for as long as it has had a GPT mode).
-//   - Partition type codes (EF00 for ESP, FD00 for
-//     Linux RAID member, 8E00 for Linux LVM, 8200 for Linux swap) are
-//     defined by the gdisk specification and apply identically on every
-//     architecture.
+//   - Partition type codes (EF00 for ESP, EF02 for the BIOS boot
+//     partition, FD00 for Linux RAID member, 8E00 for Linux LVM,
+//     8200 for Linux swap) are defined by the gdisk specification and
+//     apply identically on every architecture.
 //   - The "p<N>" partition-naming difference between SATA/SCSI and
 //     NVMe/MMC/md/loop is handled by devices.PartitionPath, which is
 //     used consistently throughout this package.
@@ -59,6 +59,11 @@ type Layout struct {
 	BootPartitions    []string          `json:"boot_partitions"`
 	StoragePartitions []string          `json:"storage_partitions"`
 	PartitionVolumes  []PartitionVolume `json:"partition_volumes"`
+	// BIOSBootPartitions is the EF02 partition on each boot disk that holds
+	// the BIOS GRUB core image. Empty unless the set asked for a bootloader
+	// on non-uefi firmware; it carries no filesystem and no mountpoint, so it
+	// is never one of the set's volumes.
+	BIOSBootPartitions []string `json:"bios_boot_partitions,omitempty"`
 }
 
 // Options configures a Builder.
@@ -139,6 +144,10 @@ func ValidateRAID(raidMode string, diskCount int) error {
 	return nil
 }
 
+// biosBootPartitionSize is the BIOS boot partition's size. GRUB's core image
+// fits several times over in one mebibyte, which is the conventional allowance.
+const biosBootPartitionSize = "1M"
+
 // raidIsRedundant reports whether the mode survives a member loss (and so
 // warrants a mirrored boot chain).
 func raidIsRedundant(raidMode string) bool {
@@ -168,9 +177,11 @@ func raidIsRedundant(raidMode string) bool {
 //     RAID) consumes the rest of the disk.
 //  2. Wait for the partition table to settle (lsblk poll, partprobe).
 //
-// firmwareMode is recorded on the layout only: the layout is the same on UEFI
-// and BIOS -- GPT with an ESP (EF00, or FD00 when mirrored) -- so a node
-// switched to UEFI later needs no repartition.
+// firmwareMode decides one partition and nothing else: a BIOS node whose os
+// set asks for a bootloader leads with a BIOS boot partition, because GRUB for
+// BIOS has nowhere else to put its core image. Every other layout is the same
+// on UEFI and BIOS -- GPT with an ESP (EF00, or FD00 when mirrored) -- so a
+// node switched to UEFI later needs no repartition.
 //
 // easy side-by-side diffing.
 //
@@ -200,6 +211,11 @@ func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selec
 	if set.Role == "os" && raidIsRedundant(layout.RAIDMode) {
 		layout.MirrorBoot = true
 	}
+	// GRUB for BIOS refuses to install without a BIOS boot partition for its
+	// core image. Only "first" asks for a bootloader on BIOS: "last" is a UEFI
+	// boot-order idea, and on UEFI GRUB is loaded from the ESP instead.
+	needBIOSBoot := set.Role == "os" && firmwareMode != "uefi" &&
+		set.Bootloader == v2.BootloaderFirst
 
 	// Classify volumes once.
 	var (
@@ -228,7 +244,7 @@ func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selec
 	// fixed-size partitions before any sgdisk runs. Without this a
 	// too-small disk surfaces only as the generic 30s "timed out waiting
 	// for partitions" after the table has already been zapped.
-	need := requiredDiskBytes(set, hasPartitionEFI, hasPartitionBoot,
+	need := requiredDiskBytes(set, needBIOSBoot, hasPartitionEFI, hasPartitionBoot,
 		lvmCount > 0 || (set.Role == "data" && genericPartCount == 0))
 	for _, d := range resolved {
 		// SizeBytes == 0 means discovery didn't capture a size (test
@@ -247,6 +263,15 @@ func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selec
 		partIndex := 1
 
 		if set.Role == "os" {
+			// First on the disk: EF02, no filesystem. It is never an md
+			// member -- GRUB writes a raw core image to each disk's own copy,
+			// so a mirrored set boots from either member.
+			if needBIOSBoot {
+				b.sgdiskNewSized(ctx, disk, partIndex, biosBootPartitionSize, "EF02", "BIOSBOOT")
+				layout.BIOSBootPartitions = append(layout.BIOSBootPartitions,
+					devices.PartitionPath(disk, partIndex))
+				partIndex++
+			}
 			if hasPartitionEFI {
 				efiSize := set.BootEFISize()
 				efiType := "EF00"
@@ -327,7 +352,7 @@ func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selec
 // itself. Rest-of-disk partitions (100% volumes, the STORAGE partition)
 // contribute only their slack. A size string ParseSize cannot read
 // contributes nothing — sgdisk rejects it later with its own error.
-func requiredDiskBytes(set *v2.Set, hasPartitionEFI, hasPartitionBoot, hasStorage bool) int64 {
+func requiredDiskBytes(set *v2.Set, hasBIOSBoot, hasPartitionEFI, hasPartitionBoot, hasStorage bool) int64 {
 	const (
 		gptOverhead    = 1 << 20 // primary + backup GPT headers/tables
 		alignmentSlack = 4 << 20 // per-partition 1MiB alignment + sgdisk rounding
@@ -344,6 +369,9 @@ func requiredDiskBytes(set *v2.Set, hasPartitionEFI, hasPartitionBoot, hasStorag
 		}
 	}
 	if set.Role == "os" {
+		if hasBIOSBoot {
+			add(biosBootPartitionSize)
+		}
 		if hasPartitionEFI {
 			add(set.BootEFISize())
 		}

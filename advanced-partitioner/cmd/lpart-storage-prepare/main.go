@@ -202,13 +202,14 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.KV("detected_firmware", detectedFirmware)
 
 	// Boot-path preflight. A BIOS/legacy-CSM node is partitioned and installed
-	// exactly like a UEFI one; only GRUB, shim and the UEFI boot order are
-	// skipped, because BIOS has no NVRAM boot-entry management and no mirrored
-	// boot chain. Nothing is lost by that: Luna PXE-loads the kernel on every
-	// boot anyway. The one case that must stop is a bootloader-less disk OS
-	// behind an install ramdisk that reboots instead of pivoting -- refuse
-	// before any destructive action, via the safety_refusal contract so the
-	// wrapper parks for operator review instead of retrying for ever.
+	// much like a UEFI one; the shim and the UEFI boot order are always
+	// skipped, and GRUB too unless the os set asks for it, because BIOS has no
+	// NVRAM boot-entry management. Little is lost by that: Luna PXE-loads the
+	// kernel on every boot anyway. The one case that must stop is a
+	// bootloader-less disk OS behind an install ramdisk that reboots instead of
+	// pivoting -- refuse before any destructive action, via the safety_refusal
+	// contract so the wrapper parks for operator review instead of retrying for
+	// ever.
 	env := bootEnv{Firmware: detectedFirmware, RamdiskPivots: detectRamdiskPivots()}
 	plan := planBoot(ic.InstallMode, cfg, env)
 	logger.KV("boot_plan_disk_os", plan.DiskOS)
@@ -224,15 +225,24 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	switch {
+	case detectedFirmware != "uefi" && plan.InstallsGRUB:
+		logger.Warn(fmt.Sprintf("firmware is %q: GRUB is installed on every boot disk, but the shim and the UEFI boot order are skipped (UEFI-only) -- the node boots its own disk, so the controller no longer decides", detectedFirmware))
 	case detectedFirmware != "uefi" && plan.DiskOS:
 		logger.Warn(fmt.Sprintf("firmware is %q: GRUB, shim and the UEFI boot order are skipped (UEFI-only) -- the OS is installed to disk but the node PXE-boots every time", detectedFirmware))
-		if plan.BootloaderNone || (cfg != nil && cfg.OSSet() != nil && cfg.OSSet().BootOrderOrLast() == "first") {
-			logger.UserInfo("the OS set's bootloader key is ignored on %q firmware: there is no UEFI boot order to arrange", detectedFirmware)
+		if !plan.BootloaderNone {
+			logger.UserInfo(`set the OS set's bootloader key to "first" for a bootloader on %q firmware: there is no UEFI boot order to arrange, so "last" installs nothing`, detectedFirmware)
 		}
 	case detectedFirmware != "uefi":
 		logger.UserInfo("firmware is %q: allowed -- this run installs no bootloader (the node boots via PXE)", detectedFirmware)
 	case plan.BootloaderNone:
 		logger.Warn(`the OS set asks for bootloader "none": no GRUB, no shim and no UEFI boot entry, and any existing bootloader on the disk is removed -- the node PXE-boots every time`)
+	}
+
+	// Every os set declares an ESP, because the schema requires one, so a BIOS
+	// node builds one it will never read. Say so: it is deliberate, and a node
+	// that was meant to boot UEFI looks exactly like this.
+	if detectedFirmware != "uefi" && plan.DiskOS {
+		logger.UserInfo("the layout's ESP at /boot/efi is created and formatted on %q firmware as well, so a node switched to UEFI later needs no repartition; nothing reads it meanwhile -- if this node was meant to boot UEFI, its firmware is in legacy/CSM mode", detectedFirmware)
 	}
 
 	// Stop udev from auto-assembling stale md arrays from surviving superblocks

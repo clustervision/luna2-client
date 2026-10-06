@@ -19,7 +19,7 @@ import (
 //	            shim+grub from /EFI/<distro>/ instead).
 //	Initramfs:  update-initramfs -u -k all
 //	Install:    write /etc/default/grub (Debian-flavoured keys);
-//	            BIOS path runs grub-install --no-floppy per disk
+//	            BIOS path runs grub-install --target=i386-pc per disk
 //	            then update-grub; UEFI path calls StageSignedShim
 //	            (with GrubDirName="grub"), then RegisterUEFIEntries,
 //	            then update-grub; normalises grub.cfg when /boot is
@@ -96,17 +96,40 @@ func (a *debianAdapter) RegenerateInitramfs(ctx context.Context) error {
 	return nil
 }
 
-// Install writes /etc/default/grub, then runs the UEFI install. BIOS/legacy
-// boot is unsupported (see the firmware gate in lpart-storage-prepare):
-// refuse any non-UEFI firmware rather than attempt a degraded BIOS install.
+// Install writes /etc/default/grub, then runs the UEFI install -- or the BIOS
+// one when the os set asked for a bootloader on non-uefi firmware. Any other
+// non-UEFI firmware is refused (see the boot preflight in
+// lpart-storage-prepare) rather than given a degraded install.
 func (a *debianAdapter) Install(ctx context.Context) error {
 	if err := a.writeGrubDefault(); err != nil {
 		return err
 	}
 	if a.deps.BootContext.FirmwareMode != "uefi" {
-		return fmt.Errorf("unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
+		if !a.deps.BootContext.BIOSGRUBRequested() {
+			return fmt.Errorf("unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
+		}
+		return a.installBIOS(ctx)
 	}
 	return a.installUEFI(ctx)
+}
+
+// installBIOS writes the GRUB core image into every boot disk's BIOS boot
+// partition, so a mirrored set boots from either member. There is no shim for
+// firmware to verify and no NVRAM to register an entry in outside UEFI, so the
+// install is grub-install plus the same configuration generation.
+func (a *debianAdapter) installBIOS(ctx context.Context) error {
+	sysroot := a.deps.BootContext.Sysroot
+	for _, disk := range a.deps.BootContext.StorageResult.BootDevices {
+		if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
+			Path: "/usr/bin/env", Chroot: sysroot,
+			Args: []string{"grub-install", "--target=i386-pc",
+				"--boot-directory=/boot", disk},
+			CaptureStdout: true, CaptureStderr: true,
+		}); err != nil {
+			return fmt.Errorf("grub-install %s: %w", disk, err)
+		}
+	}
+	return a.generateGrubConfig(ctx)
 }
 
 // writeGrubDefault mirrors bootloader_debian_write_grub_default. The
@@ -162,6 +185,14 @@ func (a *debianAdapter) installUEFI(ctx context.Context) error {
 		return err
 	}
 
+	return a.generateGrubConfig(ctx)
+}
+
+// generateGrubConfig regenerates grub.cfg and normalises it. Shared by the
+// UEFI and BIOS installs: what firmware loads differs, what GRUB then reads
+// does not.
+func (a *debianAdapter) generateGrubConfig(ctx context.Context) error {
+	sysroot := a.deps.BootContext.Sysroot
 	if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
 		Path: "/usr/bin/env", Chroot: sysroot,
 		Args:          []string{"update-grub"},

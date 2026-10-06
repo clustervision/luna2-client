@@ -326,3 +326,73 @@ func TestAssembleAlwaysWritesBootOrder(t *testing.T) {
 		t.Fatalf("boot_order missing from the result JSON: %s", body)
 	}
 }
+
+func assembleBIOS(set *v2.Set, layout partition.Layout) StorageResult {
+	return Assemble(AssembleInput{
+		Set:          set,
+		FirmwareMode: "bios",
+		Selected:     []selector.Resolved{{ConfiguredPath: "/dev/sda", ResolvedPath: "/dev/sda"}},
+		Layout:       layout,
+		Filesystems: fsmod.Filesystems{
+			Role: "os", FirmwareMode: "bios", RAIDMode: "none",
+			Filesystems: []fsmod.Filesystem{
+				{Mount: "/boot/efi", Device: "/dev/sda2", FS: "vfat"},
+				{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs"},
+			},
+		},
+		Mount: mount.Result{MountedTargetRoot: "/sysroot", RootDevice: "/dev/mapper/os-root"},
+	})
+}
+
+// boot_method is decided here, and on BIOS only "first" asks for a bootloader:
+// "last" is a UEFI boot-order idea, and there is no BIOS boot order to arrange.
+func TestAssembleBootMethodOnBIOS(t *testing.T) {
+	for _, c := range []struct {
+		bl   v2.Bootloader
+		want string
+	}{
+		{"", "none"},
+		{v2.BootloaderLast, "none"},
+		{v2.BootloaderNone, "none"},
+		{v2.BootloaderFirst, "grub"},
+	} {
+		t.Run(string(c.bl), func(t *testing.T) {
+			if got := assembleBIOS(osSetForBoot(c.bl), partition.Layout{}).BootMethod; got != c.want {
+				t.Errorf("BootMethod = %q, want %q", got, c.want)
+			}
+		})
+	}
+}
+
+// A memory set never gets a bootloader, whatever the key says.
+func TestAssembleMemorySetIgnoresBootloaderFirst(t *testing.T) {
+	set := &v2.Set{Name: "os", Role: "os", Bootloader: v2.BootloaderFirst, Volumes: []v2.Volume{
+		{Name: "root", Mountpoint: "/", FS: "tmpfs", Provider: "memory"},
+	}}
+	for _, firmware := range []string{"uefi", "bios"} {
+		got := Assemble(AssembleInput{
+			Set: set, FirmwareMode: firmware,
+			Filesystems: fsmod.MemoryFilesystems(set),
+			Mount:       mount.Result{MountedTargetRoot: "/sysroot"},
+		})
+		if got.BootMethod != "none" {
+			t.Errorf("%s: BootMethod = %q, want none for a memory root", firmware, got.BootMethod)
+		}
+	}
+}
+
+// The finalise refuses a BIOS GRUB install without a BIOS boot partition, so
+// the result has to say whether the layout built one.
+func TestAssembleRecordsBIOSBootPartition(t *testing.T) {
+	got := assembleBIOS(osSetForBoot(v2.BootloaderFirst), partition.Layout{
+		BIOSBootPartitions: []string{"/dev/sda1", "/dev/sdb1"},
+	})
+	if got.BIOSBootPartition != 1 {
+		t.Fatalf("BIOSBootPartition = %d, want 1", got.BIOSBootPartition)
+	}
+	// A layout with none at all -- the mount-existing path, which rebuilds no
+	// partition table -- reports 0 so the finalise can refuse.
+	if n := assembleBIOS(osSetForBoot(v2.BootloaderFirst), partition.Layout{}).BIOSBootPartition; n != 0 {
+		t.Fatalf("BIOSBootPartition = %d, want 0 when the layout built none", n)
+	}
+}
