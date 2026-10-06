@@ -51,18 +51,22 @@ type LVMInfo struct {
 // multi-set variant wraps these in {"version":2,"sets":[...]} — see
 // WriteAuto for the dispatch rule.
 type StorageResult struct {
-	Version        int                 `json:"version"`
-	Name           string              `json:"name"`
-	Role           string              `json:"role"`
-	FirmwareMode   string              `json:"firmware_mode"`
-	SelectedDisks  []selector.Resolved `json:"selected_disks"`
-	StorageType    string              `json:"storage_type"`
-	BootMethod     string              `json:"boot_method"`
-	BootFirmware   string              `json:"boot_firmware"`
-	RegisterNVRAM  string              `json:"register_nvram"`
-	ClearUEFINVRAM bool                `json:"clear_uefi_nvram"`
-	RAIDMode       string              `json:"raid_mode"`
-	BootDevices    []string            `json:"boot_devices"`
+	Version       int                 `json:"version"`
+	Name          string              `json:"name"`
+	Role          string              `json:"role"`
+	FirmwareMode  string              `json:"firmware_mode"`
+	SelectedDisks []selector.Resolved `json:"selected_disks"`
+	StorageType   string              `json:"storage_type"`
+	BootMethod    string              `json:"boot_method"`
+	// BootOrder is where the node's own disk sits in the UEFI boot order,
+	// "first" or "last", from the os set's bootloader key. Always written so a
+	// consumer never has to assume the default.
+	BootOrder      string   `json:"boot_order"`
+	BootFirmware   string   `json:"boot_firmware"`
+	RegisterNVRAM  string   `json:"register_nvram"`
+	ClearUEFINVRAM bool     `json:"clear_uefi_nvram"`
+	RAIDMode       string   `json:"raid_mode"`
+	BootDevices    []string `json:"boot_devices"`
 	// ESPPartition is the GPT partition NUMBER of the EFI System Partition
 	// on each boot disk (the layout builder creates it at the same index on
 	// every member). The bootloader's efibootmgr --create uses this instead
@@ -158,6 +162,7 @@ func Assemble(in AssembleInput) StorageResult {
 		SelectedDisks:     in.Selected,
 		StorageType:       string(in.Set.StorageType()),
 		BootMethod:        bootMethod,
+		BootOrder:         in.Set.BootOrderOrLast(),
 		BootFirmware:      "uefi",
 		RegisterNVRAM:     "auto",
 		ClearUEFINVRAM:    in.Set.ClearUEFINVRAM(),

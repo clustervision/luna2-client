@@ -80,6 +80,7 @@ func buildPinnableConfig(orig *v2.Config, resolved []result.ResolvedSet, origin 
 			Raid:       src.Raid,
 			Devices:    devices,
 			Persistent: src.Persistent,
+			Bootloader: src.Bootloader,
 			Volumes:    src.Volumes,
 		}
 		// Stamp provenance only on sets the installer actually discovered;

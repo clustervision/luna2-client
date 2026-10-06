@@ -157,6 +157,7 @@ func (a *debianAdapter) installUEFI(ctx context.Context) error {
 		RegisterNVRAM: a.deps.BootContext.RegisterNVRAM,
 		ESPPartition:  a.deps.BootContext.StorageResult.ESPPartition,
 		SnapshotDir:   a.deps.SnapshotDir,
+		BootOrder:     a.deps.BootContext.BootOrder,
 	}); err != nil {
 		return err
 	}

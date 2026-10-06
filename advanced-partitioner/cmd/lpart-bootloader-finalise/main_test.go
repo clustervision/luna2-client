@@ -312,3 +312,124 @@ func TestDiskRootBootloaderNoneOnBIOS(t *testing.T) {
 		t.Fatalf("boot-context family wrong:\n%s", bctx)
 	}
 }
+
+// readLog returns the tool's log file: UserInfo lines are mirrored there, so
+// an operator-facing message is asserted from the log rather than from the
+// error writer the test harness captures.
+func readLog(t *testing.T, path string) string {
+	t.Helper()
+	body, err := os.ReadFile(path) //nolint:gosec // test artefact
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(body)
+}
+
+// stageESPLoaders puts the loaders StageSignedShim writes onto a sysroot's ESP,
+// so a none finalise has something to remove.
+func stageESPLoaders(t *testing.T, sysroot string) {
+	t.Helper()
+	efi := filepath.Join(sysroot, "boot", "efi", "EFI")
+	for dir, names := range map[string][]string{
+		"rocky": {"shimx64.efi", "grubx64.efi", "grub.cfg", "grubenv"},
+		"BOOT":  {"BOOTX64.EFI", "grubx64.efi"},
+	} {
+		if err := os.MkdirAll(filepath.Join(efi, dir), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		for _, n := range names {
+			if err := os.WriteFile(filepath.Join(efi, dir, n), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+}
+
+// stageNoneResult writes a UEFI disk-OS storage result with boot_method=none —
+// what lpart-storage-prepare emits for an OS set with bootloader: none.
+func stageNoneResult(t *testing.T, tmp, sysroot string) string {
+	t.Helper()
+	res := result.StorageResult{
+		Version: 2, Name: "os", Role: "os",
+		FirmwareMode: "uefi", StorageType: "lvm",
+		BootMethod: "none", BootOrder: "last", BootFirmware: "uefi", RegisterNVRAM: "auto",
+		RAIDMode: "none", MountedTargetRoot: sysroot,
+		BootDevices: []string{"/dev/sda"},
+		Filesystems: []result.Filesystem{
+			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", Options: "defaults", UUID: "root-uuid"},
+			{Mount: "/boot/efi", Device: "/dev/sda1", FS: "vfat", Options: "defaults", UUID: "esp-uuid"},
+		},
+	}
+	body, _ := json.Marshal(res)
+	p := filepath.Join(tmp, "storage-result.json")
+	if err := os.WriteFile(p, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// A UEFI disk OS with bootloader: none writes fstab, installs nothing, and
+// goes on to strip an existing bootloader -- otherwise a node switched from
+// grub to none can still be firmware-booted from the stale install when PXE
+// fails. Dry-run keeps the orchestrator test off the bind mounts and
+// efibootmgr, so what it pins is the message and that the removal step is
+// reached; internal/bootloader/remove_test.go pins what the step removes.
+func TestDiskRootBootloaderNoneRemovesExistingSetup(t *testing.T) {
+	tmp := t.TempDir()
+	sysroot := filepath.Join(tmp, "sysroot")
+	if err := os.MkdirAll(sysroot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	stageESPLoaders(t, sysroot)
+	resPath := stageNoneResult(t, tmp, sysroot)
+	logPath := filepath.Join(tmp, "finalise.log")
+	stderr, rc := runEnv(t, "--result", resPath, "--dry-run", "--log-file", logPath)
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+	log := readLog(t, logPath)
+	if !strings.Contains(log, `bootloader "none"`) {
+		t.Fatalf("the skip message must name the operator's choice, not the firmware:\n%s", log)
+	}
+	if !strings.Contains(log, "bootloader to remove") && !strings.Contains(log, "bootloader removed") {
+		t.Fatalf("the none path must go on to remove an existing bootloader:\n%s", log)
+	}
+}
+
+// On BIOS the none message names the firmware, and there is no UEFI boot path
+// to strip: nothing on the ESP is touched and no efibootmgr runs.
+func TestDiskRootBootloaderNoneOnBIOSRemovesNothing(t *testing.T) {
+	tmp := t.TempDir()
+	sysroot := filepath.Join(tmp, "sysroot")
+	if err := os.MkdirAll(sysroot, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	stageESPLoaders(t, sysroot)
+	res := result.StorageResult{
+		Version: 2, Name: "os", Role: "os",
+		FirmwareMode: "bios", StorageType: "lvm",
+		BootMethod: "none", BootOrder: "last", BootFirmware: "uefi", RegisterNVRAM: "auto",
+		RAIDMode: "none", MountedTargetRoot: sysroot,
+		BootDevices: []string{"/dev/sda"},
+		Filesystems: []result.Filesystem{
+			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", Options: "defaults", UUID: "root-uuid"},
+		},
+	}
+	body, _ := json.Marshal(res)
+	resPath := filepath.Join(tmp, "storage-result.json")
+	if err := os.WriteFile(resPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(tmp, "finalise.log")
+	stderr, rc := runEnv(t, "--result", resPath, "--log-file", logPath)
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+	log := readLog(t, logPath)
+	if !strings.Contains(log, `firmware is "bios"`) {
+		t.Fatalf("the BIOS message must name the firmware as the reason:\n%s", log)
+	}
+	if _, err := os.Stat(filepath.Join(sysroot, "boot", "efi", "EFI", "BOOT", "BOOTX64.EFI")); err != nil {
+		t.Errorf("a BIOS node has no UEFI boot path to strip: %v", err)
+	}
+}

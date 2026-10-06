@@ -9,9 +9,10 @@
 //     OS family
 //  4. Write /sysroot/etc/fstab from the filesystem list
 //  5. If clear_uefi_nvram=true on UEFI: bind-mount + ClearUEFINVRAMEntries
-//  6. If boot_method=="none": stop (fstab-only path); a non-UEFI firmware past
-//     that point is refused (GRUB is UEFI-only); else: bind mounts
-//     + family.Prepare → RegenerateInitramfs → Install → Validate
+//  6. If boot_method=="none": stop (fstab-only path), after removing any
+//     existing bootloader when the OS set asked for none on UEFI; a non-UEFI
+//     firmware past that point is refused (GRUB is UEFI-only); else: bind
+//     mounts + family.Prepare → RegenerateInitramfs → Install → Validate
 //  7. Always cleanup bind mounts before returning
 package main
 
@@ -189,7 +190,31 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	}
 
 	if bctx.BootMethod == "none" {
-		logger.UserInfo("No bootloader installed (boot_method=none, firmware %s): fstab written; the node PXE-boots every time", bctx.FirmwareMode)
+		// Three ways to get here, and the operator has to be told which: a RAM
+		// root with no disk, a firmware with no UEFI boot path, or the OS set
+		// asking for none. Only the last leaves a previous install behind to
+		// remove.
+		switch {
+		case bctx.StorageResult.StorageType == "memory":
+			logger.UserInfo("No bootloader installed (memory root): fstab written; the node PXE-boots every time")
+		case bctx.FirmwareMode != "uefi":
+			logger.UserInfo("No bootloader installed (firmware is %q: GRUB, shim and the UEFI boot order are UEFI-only): fstab written; the node PXE-boots every time", bctx.FirmwareMode)
+		default:
+			logger.UserInfo(`No bootloader installed (the OS set asks for bootloader "none"): fstab written; the node PXE-boots every time`)
+			logger.SetStage("bind_mounts")
+			if err := bootloader.BindMountSysroot(context.Background(), runner, bctx.Sysroot, nil); err != nil {
+				errln(stderr, "bind mount: %v", err)
+				return 1
+			}
+			logger.SetStage("remove_bootloader")
+			if err := bootloader.RemoveExistingBootloader(context.Background(), bootloader.RemoveExistingBootloaderOptions{
+				Runner: runner, Logger: logger, FS: nativeFS,
+				Sysroot: bctx.Sysroot, Arch: bctx.Architecture,
+			}); err != nil {
+				errln(stderr, "%v", err)
+				return 1
+			}
+		}
 		return 0
 	}
 

@@ -94,6 +94,16 @@ A **volume** is one mountpoint + filesystem within a set, backed by a `provider`
 
 The OS set declares a vfat `/boot/efi` volume on **both** firmware modes, and the layout is identical on both. Firmware is not a field: it is whichever mode the node PXE-booted in. On UEFI the installer writes GRUB, the signed shim and the NVRAM boot entry; on legacy BIOS/CSM it writes none of those and the node PXE-boots every time. A BIOS node is refused in one case only — an install ramdisk that is not dracut-based, which would reboot into a disk with no bootloader and loop back into PXE for ever (`luna osimage pack` an image carrying dracut).
 
+The OS set may carry **`bootloader`**, the only boot field in the grammar:
+
+| value | meaning |
+|---|---|
+| absent, `last` | the default: GRUB, the shim and the NVRAM entry are installed, with the network entry ahead of the disk in the boot order |
+| `first` (also `grub`, `yes`, `true`) | the same, but the TrinityX entries go to the head of the boot order, so the node boots its own disk when the network does not answer. Firmware that re-applies its Setup priorities at POST can undo it; the install warns and the summary says so rather than claiming the disk is first |
+| `none` (also `no`, `false`) | no bootloader at all — no initramfs rebuild, no shim, no NVRAM entry — and an existing GRUB setup is removed, so the node cannot still be firmware-booted from the old install. The node PXE-boots every time; the dracut-ramdisk refusal above applies here too |
+
+It is valid on the `os` set only, the ESP is still declared and formatted either way, and the same refusal rules apply on BIOS, where there is no boot order to arrange and the key is ignored with one info line.
+
 ### The data fence (what each mode may wipe)
 
 The per-set apply logic, the heart of the data-safety guarantee:

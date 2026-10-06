@@ -16,7 +16,8 @@ import (
 // ESP loaders, and the grub config — so a finalise on a new distro/arch shows
 // exactly what landed instead of a silent "ok". It returns an error listing
 // every missing artefact. boot_method=none (FamilyNone) has no bootloader and is
-// reported as such -- a RAM/tmpfs root, or a disk OS on BIOS firmware.
+// reported as such -- a RAM/tmpfs root, a disk OS on BIOS firmware, or an OS set
+// asking for bootloader "none".
 //
 // This is the proof step the operator relies on: when we touch NVRAM and grub,
 // we re-read them at the end and show that the boot entry is really registered.

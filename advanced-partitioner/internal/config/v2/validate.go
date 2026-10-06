@@ -210,6 +210,21 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 			pfx)
 	}
 
+	// bootloader is a property of the system that boots, so it belongs to the
+	// os set; on a data set it would silently do nothing.
+	if _, ok := setRaw["bootloader"]; ok {
+		switch s.Bootloader {
+		case BootloaderFirst, BootloaderLast, BootloaderNone:
+		default:
+			return fmt.Errorf(
+				"config_validation: %s.bootloader unsupported: '%s' (allowed: first (or grub, yes, true), last (the default), none (or no, false))",
+				pfx, s.Bootloader)
+		}
+		if s.Role != "os" {
+			return fmt.Errorf("config_validation: %s: bootloader is valid on the os set only", pfx)
+		}
+	}
+
 	if s.Raid == "" {
 		return fmt.Errorf("config_validation: %s.raid is required (none|0|1|5|6|10)", pfx)
 	}

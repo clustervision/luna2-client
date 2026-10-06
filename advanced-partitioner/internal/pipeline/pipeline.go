@@ -396,6 +396,12 @@ func (p *Pipeline) runPost() error {
 		return err
 	}
 	p.stageDone("bootloader", "")
+	// Whether the firmware kept a requested disk-first boot order is only known
+	// once the finalise has read NVRAM back, so re-render the Boot line with it.
+	if after := parseLayout(result); after.Summary != info.Summary {
+		after.Method = info.Method
+		p.markLayout(after)
+	}
 	return nil
 }
 

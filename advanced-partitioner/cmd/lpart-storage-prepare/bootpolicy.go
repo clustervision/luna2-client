@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"os"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -11,10 +12,15 @@ import (
 type bootPlan struct {
 	// DiskOS: an OS set is laid down / mounted on local disk this run.
 	DiskOS bool
-	// InstallsGRUB: a disk OS on UEFI firmware. GRUB, shim and the NVRAM boot
-	// order are UEFI-only (BIOS has no boot-entry management and no mirrored
-	// boot chain), so a disk OS on BIOS gets no bootloader at all.
+	// InstallsGRUB: a disk OS on UEFI firmware whose set wants a bootloader.
+	// GRUB, shim and the NVRAM boot order are UEFI-only (BIOS has no
+	// boot-entry management and no mirrored boot chain), so a disk OS on BIOS
+	// gets no bootloader at all.
 	InstallsGRUB bool
+	// BootloaderNone: the OS set asked for no bootloader. Separate from
+	// InstallsGRUB because the two reasons for having none need different
+	// words: one is the node's firmware, the other is the operator's choice.
+	BootloaderNone bool
 }
 
 // bootEnv is the node-side facts the boot preflight needs.
@@ -36,7 +42,12 @@ func planBoot(mode installcontext.Mode, cfg *v2.Config, env bootEnv) bootPlan {
 	if cfg == nil || len(cfg.Sets) == 0 || cfg.OSSet() == nil {
 		return bootPlan{}
 	}
-	return bootPlan{DiskOS: true, InstallsGRUB: env.Firmware == "uefi"}
+	none := cfg.OSSet().Bootloader == v2.BootloaderNone
+	return bootPlan{
+		DiskOS:         true,
+		InstallsGRUB:   env.Firmware == "uefi" && !none,
+		BootloaderNone: none,
+	}
 }
 
 // preflightBoot is the boot-handoff gate. A disk OS that gets no bootloader
@@ -44,12 +55,20 @@ func planBoot(mode installcontext.Mode, cfg *v2.Config, env bootEnv) bootPlan {
 // reboots into the disk finds nothing to boot there and loops back into PXE
 // forever. Returns a *safetyError (exit-2 safety_refusal contract) or nil.
 func preflightBoot(p bootPlan, env bootEnv) error {
-	if p.DiskOS && !p.InstallsGRUB && !env.RamdiskPivots {
-		return safetyRefusalf("bootloader-none-needs-dracut-ramdisk",
-			"node firmware is %q, so this install writes no bootloader (GRUB, shim and the UEFI boot order are UEFI-only), but the install ramdisk is not dracut-based -- after the install it would reboot into a disk with nothing to boot and loop back into PXE forever; pack the osimage's Luna ramdisk with dracut and the 95luna module, or enable UEFI boot in the node's firmware and reprovision",
-			env.Firmware)
+	if !p.DiskOS || p.InstallsGRUB || env.RamdiskPivots {
+		return nil
 	}
-	return nil
+	// Name the reason this install has no bootloader: a BIOS node needs a
+	// firmware change, an operator's bootloader=none needs a config change.
+	cause := fmt.Sprintf("node firmware is %q, so this install writes no bootloader (GRUB, shim and the UEFI boot order are UEFI-only)", env.Firmware)
+	alternative := "enable UEFI boot in the node's firmware and reprovision"
+	if env.Firmware == "uefi" {
+		cause = `the OS set asks for bootloader "none", so this install writes no bootloader`
+		alternative = `remove the set's bootloader key (or set it to "last") so GRUB is installed`
+	}
+	return safetyRefusalf("bootloader-none-needs-dracut-ramdisk",
+		"%s, but the install ramdisk is not dracut-based -- after the install it would reboot into a disk with nothing to boot and loop back into PXE forever; pack the osimage's Luna ramdisk with dracut and the 95luna module, or %s",
+		cause, alternative)
 }
 
 // detectRamdiskPivots mirrors luna-installer.sh's post-install test: a dracut

@@ -213,6 +213,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	plan := planBoot(ic.InstallMode, cfg, env)
 	logger.KV("boot_plan_disk_os", plan.DiskOS)
 	logger.KV("boot_plan_installs_grub", plan.InstallsGRUB)
+	logger.KV("boot_plan_bootloader_none", plan.BootloaderNone)
 	logger.KV("ramdisk_pivots", env.RamdiskPivots)
 	if err := preflightBoot(plan, env); err != nil {
 		var se *safetyError
@@ -222,12 +223,16 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		errln(stderr, "%v", err)
 		return 1
 	}
-	if detectedFirmware != "uefi" {
-		if plan.DiskOS {
-			logger.Warn(fmt.Sprintf("firmware is %q: GRUB, shim and the UEFI boot order are skipped (UEFI-only) -- the OS is installed to disk but the node PXE-boots every time", detectedFirmware))
-		} else {
-			logger.UserInfo("firmware is %q: allowed -- this run installs no bootloader (the node boots via PXE)", detectedFirmware)
+	switch {
+	case detectedFirmware != "uefi" && plan.DiskOS:
+		logger.Warn(fmt.Sprintf("firmware is %q: GRUB, shim and the UEFI boot order are skipped (UEFI-only) -- the OS is installed to disk but the node PXE-boots every time", detectedFirmware))
+		if plan.BootloaderNone || (cfg != nil && cfg.OSSet() != nil && cfg.OSSet().BootOrderOrLast() == "first") {
+			logger.UserInfo("the OS set's bootloader key is ignored on %q firmware: there is no UEFI boot order to arrange", detectedFirmware)
 		}
+	case detectedFirmware != "uefi":
+		logger.UserInfo("firmware is %q: allowed -- this run installs no bootloader (the node boots via PXE)", detectedFirmware)
+	case plan.BootloaderNone:
+		logger.Warn(`the OS set asks for bootloader "none": no GRUB, no shim and no UEFI boot entry, and any existing bootloader on the disk is removed -- the node PXE-boots every time`)
 	}
 
 	// Stop udev from auto-assembling stale md arrays from surviving superblocks

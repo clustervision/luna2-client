@@ -8,6 +8,7 @@
 //	bindmount.go    Recursive-bind /dev, /proc, /sys, /run into /sysroot
 //	kernel_args.go  rd.auto / rd.md / rd.lvm / rootfstype assembly
 //	nvram.go        UEFI NVRAM clear + register + validate + snapshot
+//	remove.go       Strip an existing bootloader (bootloader=none)
 //	adapter.go      Adapter interface; family dispatch
 //	rhel.go         RHEL/Rocky/Alma/CentOS/Fedora path (dracut + grub2-*)
 //	uefi_signed.go  Signed shim + grubx64.efi staging shared by every
@@ -64,6 +65,7 @@ type BootContext struct {
 	Architecture   string               `json:"architecture"`
 	KernelArgs     string               `json:"kernel_args"`
 	BootMethod     string               `json:"boot_method"`
+	BootOrder      string               `json:"boot_order"`
 	BootFirmware   string               `json:"boot_firmware"`
 	RegisterNVRAM  string               `json:"register_nvram"`
 	ClearUEFINVRAM bool                 `json:"clear_uefi_nvram"`
@@ -85,6 +87,7 @@ func BuildBootContext(in result.StorageResult, arch, osReleasePath string) (Boot
 		FirmwareMode:   in.FirmwareMode,
 		Architecture:   arch,
 		BootMethod:     in.BootMethod,
+		BootOrder:      in.BootOrder,
 		BootFirmware:   in.BootFirmware,
 		RegisterNVRAM:  in.RegisterNVRAM,
 		ClearUEFINVRAM: in.ClearUEFINVRAM,
@@ -93,6 +96,9 @@ func BuildBootContext(in result.StorageResult, arch, osReleasePath string) (Boot
 	}
 	if ctx.BootMethod == "" {
 		ctx.BootMethod = "grub"
+	}
+	if ctx.BootOrder == "" {
+		ctx.BootOrder = "last"
 	}
 	if ctx.BootFirmware == "" {
 		ctx.BootFirmware = "auto"

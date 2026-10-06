@@ -1016,6 +1016,40 @@ needs a legacy-BIOS node. 25 of 36 are destructive. Lab helpers: `/root/lpart-ue
   arrays on SELECTED disks and purges the stale `os` VG copy before create — no
   `lvcreate` exit 5, install boots. `vgs` afterwards shows exactly one `os` VG.
 
+### 3.66  `bootloader: first` puts the disk ahead of the network  [DESTRUCTIVE]
+- **FTA.** The opt-out from the boot-order policy of 3.61: a cluster whose nodes must
+  come up without the controller asks for the disk first per OS set. Default unchanged.
+- **Setup.** UEFI node, any valid OS layout with `"bootloader": "first"` on the os set,
+  `--install-mode auto`.
+- **Expect.** The install is otherwise identical to 3.2. `storage-result.json` has
+  `boot_order: first`; the summary Boot line reads `+ NVRAM (disk first)`; from the
+  booted OS, `efibootmgr` shows a `TrinityX <disk>` entry FIRST in BootOrder, ahead of
+  every network entry. A plain power cycle (iPXE CD still attached) lands on the disk.
+- **Firmware re-sort leg.** On firmware that re-applies its Setup priorities at POST the
+  read-back finds the network entry first: one WARN naming the cause, the summary says
+  `(disk first requested, firmware kept network first)`, and the install still exits 0.
+  Record which firmware the lab reproduced it on, if any.
+- **Recover.** Remove the key and reinstall → TrinityX last again (3.61 holds).
+
+### 3.67  `bootloader: none` on UEFI: no loader, and the old one goes  [DESTRUCTIVE]
+- **FTA.** A node switched from grub to none must not stay firmware-bootable from the
+  stale install, or a PXE failure boots the old OS instead of the controller's choice.
+- **Setup.** A UEFI node already installed by 3.2 (so the ESP and NVRAM carry a TrinityX
+  boot path). Change the os set to `"bootloader": "none"`, `--install-mode auto`.
+- **Expect.** The part phase warns that no bootloader is installed. No `dracut -f`, no
+  `grub2-mkconfig`, no `efibootmgr --create`; `storage-result.json` has
+  `boot_method: none` and the summary Boot line reads
+  `Boot: none (bootloader: none; node PXE-boots every time)`. Finalise exits 0 and logs
+  `existing bootloader removed (NVRAM entries: N, loaders: M)`:
+  `efibootmgr` shows NO TrinityX entry (the network entries untouched), and the ESP has
+  no `EFI/BOOT/BOOTX64.EFI` and no `EFI/<distro>/shim*.efi` / `grub*.efi` — while
+  `grub.cfg`, the CSV and `grubenv` are still there. A second `auto` boot repeats the
+  removal without error (the extract re-creates the directories).
+- **Refusal leg (`[SAFE]`).** Same layout on an osimage whose Luna ramdisk was packed
+  without dracut: `safety_refusal=bootloader-none-needs-dracut-ramdisk` → exit 2, and
+  the message names the `bootloader` key, not the firmware.
+- **Recover.** Remove the key and reinstall → GRUB, shim and the NVRAM entry are back.
+
 ---
 
 ## 4. osimage content edge cases

@@ -15,6 +15,11 @@ func osCfg() *v2.Config {
 	return &v2.Config{Version: 2, Sets: []v2.Set{{Name: "os", Role: "os"}}}
 }
 
+// osCfgBootloader is an OS-set layout whose operator set the bootloader key.
+func osCfgBootloader(bl v2.Bootloader) *v2.Config {
+	return &v2.Config{Version: 2, Sets: []v2.Set{{Name: "os", Role: "os", Bootloader: bl}}}
+}
+
 func dataCfg() *v2.Config {
 	return &v2.Config{Version: 2, Sets: []v2.Set{{Name: "data", Role: "data"}}}
 }
@@ -41,6 +46,18 @@ func TestPlanBoot(t *testing.T) {
 		{"sanitize os bios", installcontext.ModeSanitize, osCfg(), "bios", bootPlan{}},
 		{"legacy os bios", installcontext.ModeLegacy, osCfg(), "bios", bootPlan{}},
 		{"memboot os uefi", installcontext.ModeMemboot, osCfg(), "uefi", bootPlan{}},
+		// The operator's bootloader key only ever takes GRUB away; it cannot
+		// put it on a firmware that has none.
+		{"auto os uefi bootloader last", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderLast), "uefi",
+			bootPlan{DiskOS: true, InstallsGRUB: true}},
+		{"auto os uefi bootloader first", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderFirst), "uefi",
+			bootPlan{DiskOS: true, InstallsGRUB: true}},
+		{"auto os uefi bootloader none", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderNone), "uefi",
+			bootPlan{DiskOS: true, BootloaderNone: true}},
+		{"auto os bios bootloader none", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderNone), "bios",
+			bootPlan{DiskOS: true, BootloaderNone: true}},
+		{"auto os bios bootloader first", installcontext.ModeAuto, osCfgBootloader(v2.BootloaderFirst), "bios",
+			bootPlan{DiskOS: true}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -59,14 +76,21 @@ func TestPreflightBoot(t *testing.T) {
 		name   string
 		plan   bootPlan
 		env    bootEnv
-		reason string // "" = must proceed
+		reason string   // "" = must proceed
+		says   []string // substrings the refusal must carry
 	}{
-		{"disk os uefi, dracut", bootPlan{DiskOS: true, InstallsGRUB: true}, bootEnv{Firmware: "uefi", RamdiskPivots: true}, ""},
-		{"disk os uefi, non-dracut", bootPlan{DiskOS: true, InstallsGRUB: true}, bootEnv{Firmware: "uefi"}, ""},
-		{"disk os bios, dracut", bootPlan{DiskOS: true}, bootEnv{Firmware: "bios", RamdiskPivots: true}, ""},
-		{"disk os bios, non-dracut", bootPlan{DiskOS: true}, bootEnv{Firmware: "bios"}, "bootloader-none-needs-dracut-ramdisk"},
-		{"no disk os bios, non-dracut", bootPlan{}, bootEnv{Firmware: "bios"}, ""},
-		{"no disk os uefi, non-dracut", bootPlan{}, bootEnv{Firmware: "uefi"}, ""},
+		{"disk os uefi, dracut", bootPlan{DiskOS: true, InstallsGRUB: true}, bootEnv{Firmware: "uefi", RamdiskPivots: true}, "", nil},
+		{"disk os uefi, non-dracut", bootPlan{DiskOS: true, InstallsGRUB: true}, bootEnv{Firmware: "uefi"}, "", nil},
+		{"disk os bios, dracut", bootPlan{DiskOS: true}, bootEnv{Firmware: "bios", RamdiskPivots: true}, "", nil},
+		// The operator has to be able to act on it, and the message must name
+		// the reason this install has no bootloader -- firmware or choice.
+		{"disk os bios, non-dracut", bootPlan{DiskOS: true}, bootEnv{Firmware: "bios"},
+			"bootloader-none-needs-dracut-ramdisk", []string{"dracut", "95luna", "firmware is \"bios\"", "UEFI"}},
+		{"disk os uefi bootloader none, dracut", bootPlan{DiskOS: true, BootloaderNone: true}, bootEnv{Firmware: "uefi", RamdiskPivots: true}, "", nil},
+		{"disk os uefi bootloader none, non-dracut", bootPlan{DiskOS: true, BootloaderNone: true}, bootEnv{Firmware: "uefi"},
+			"bootloader-none-needs-dracut-ramdisk", []string{"dracut", "95luna", "bootloader", "none"}},
+		{"no disk os bios, non-dracut", bootPlan{}, bootEnv{Firmware: "bios"}, "", nil},
+		{"no disk os uefi, non-dracut", bootPlan{}, bootEnv{Firmware: "uefi"}, "", nil},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -84,14 +108,25 @@ func TestPreflightBoot(t *testing.T) {
 			if se.reason != c.reason {
 				t.Fatalf("reason = %q, want %q", se.reason, c.reason)
 			}
-			// The operator has to be able to act on it: the message names
-			// both the ramdisk fix and the firmware alternative.
-			for _, want := range []string{"dracut", "95luna", "UEFI"} {
+			for _, want := range c.says {
 				if !strings.Contains(se.msg, want) {
 					t.Fatalf("refusal message missing %q: %s", want, se.msg)
 				}
 			}
 		})
+	}
+}
+
+// A bootloader=none refusal must not blame the firmware: the node is on UEFI
+// and the remedy is the operator's own key, not a BIOS setting.
+func TestPreflightBootNoneDoesNotBlameFirmware(t *testing.T) {
+	err := preflightBoot(bootPlan{DiskOS: true, BootloaderNone: true}, bootEnv{Firmware: "uefi"})
+	var se *safetyError
+	if !errors.As(err, &se) {
+		t.Fatalf("expected a safety refusal; got %v", err)
+	}
+	if strings.Contains(se.msg, "firmware is") {
+		t.Fatalf("the firmware is not the reason here: %s", se.msg)
 	}
 }
 
