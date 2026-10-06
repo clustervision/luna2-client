@@ -98,3 +98,35 @@ func stripANSI(s string) string {
 	}
 	return b.String()
 }
+
+// A failure is the one line worth breaking the panel layout for: an error-class
+// line soft-wraps over as many rows as it needs, so the whole reason is on the
+// console. The node reboots into the next attempt seconds later — there is no
+// second look, and a cut "stderr=...~" says nothing.
+func TestOutputPanelWrapsErrorLines(t *testing.T) {
+	m := newTestModel()
+	m.Width, m.Height = 100, 30
+	const reason = `run_cmd failed path=tar exit_code=2 stderr="tar: /mnt/sysimage/usr/lib64/libfoo.so: Cannot write: No space left on device"`
+	m.appendOutput(reason, "stderr", "")
+	out := stripANSI(m.View())
+	for _, tok := range strings.Fields(reason) {
+		if !strings.Contains(out, tok) {
+			t.Fatalf("error line lost %q from the output panel:\n%s", tok, out)
+		}
+	}
+}
+
+// Every other class keeps the cut: the panel would otherwise scroll its own
+// history away under ordinary command chatter.
+func TestOutputPanelStillTruncatesOtherClasses(t *testing.T) {
+	m := newTestModel()
+	m.Width, m.Height = 100, 30
+	m.appendOutput("$ /usr/bin/lpart-osimage-install --install-context /tmp/install_files/runtime/install-context.json --storage-result /tmp/install_files/runtime/storage-result.json --details", "stdout", "")
+	out := stripANSI(m.View())
+	if strings.Contains(out, "--details") {
+		t.Fatalf("a long command line must still be cut, not wrapped:\n%s", out)
+	}
+	if !strings.Contains(out, "~") {
+		t.Fatalf("the cut line must keep the ~ marker:\n%s", out)
+	}
+}

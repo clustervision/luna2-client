@@ -353,6 +353,38 @@ function fetch_token {
     fi
 }
 
+# The install pipeline writes the stage, the reason and the failing step's
+# stderr here. Printing it on the console is the only chance an operator gets:
+# the node reboots into the next attempt before anyone can open a log.
+LUNA_FAILURE_FILE=/tmp/install_files/logs/last-failure.txt
+function print_failure_reason () {
+    [ -s "$LUNA_FAILURE_FILE" ] || return 0
+    echo "Luna2: Reason:"
+    awk -v pfx="Luna2:   " -v w=67 -v cap=15 '
+        {
+            line = $0
+            do {
+                if (n >= cap) { cut = 1; exit }
+                if (length(line) <= w) { print pfx line; n++; break }
+                # Break at the last space in the row, so a word is not split
+                # across two lines; a row holding one long token is cut.
+                brk = 0
+                for (i = w; i > 1; i--) {
+                    if (substr(line, i, 1) == " ") { brk = i; break }
+                }
+                if (brk > 1 && substr(line, 1, brk - 1) ~ /[^ ]/) {
+                    print pfx substr(line, 1, brk - 1)
+                    line = substr(line, brk + 1)
+                } else {
+                    print pfx substr(line, 1, w)
+                    line = substr(line, w + 1)
+                }
+                n++
+            } while (length(line) > 0)
+        }
+        END { if (cut) print pfx "... (see log)" }' "$LUNA_FAILURE_FILE"
+}
+
 # Visible, interruptible pause between failed install attempts. Replaces a
 # silent `sleep 10` so the operator can see that the installer FAILED (rather
 # than the screen just churning through another bmcsetup/ipmi reload) and can
@@ -361,10 +393,13 @@ function fetch_token {
 # not readable so it never busy-spins.
 function retry_countdown () {
     local secs="${1:-30}"
+    local rc="${2:-1}"
     local ctty="${luna_ctty:-/dev/tty1}"
     echo ""
     echo "Luna2: ============================================================"
     echo "Luna2: INSTALLER FAILED -- retrying in ${secs}s."
+    print_failure_reason
+    echo "Luna2: Exit ${rc}: a retryable failure; the reason is above. Retrying."
     echo "Luna2: Press any key to drop to a shell (exit to resume, poweroff to stop)."
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: ============================================================"
@@ -406,8 +441,22 @@ function fatal_park () {
     echo ""
     echo "Luna2: ============================================================"
     echo "Luna2: INSTALL FAILED FATALLY (exit ${rc}) -- NOT retrying."
-    echo "Luna2: This error recurs on every attempt; it needs operator or daemon"
-    echo "Luna2: attention (e.g. install_mode=legacy reaching the lpart client)."
+    print_failure_reason
+    case "$rc" in
+        "$LUNA_SAFETY_RC")
+            echo "Luna2: Exit ${rc} is a safety refusal: lpart declined to touch the disk;"
+            echo "Luna2: the reason is above. Fix the layout or the node's data, then boot."
+            ;;
+        "$LUNA_FATAL_RC")
+            echo "Luna2: Exit ${rc} is a non-retryable configuration or safety error from an"
+            echo "Luna2: install step; the reason is above. It would recur on every attempt,"
+            echo "Luna2: so the node is parked instead of reinstalling in a loop."
+            ;;
+        *)
+            echo "Luna2: This error recurs on every attempt; it needs operator or daemon"
+            echo "Luna2: attention (e.g. install_mode=legacy reaching the lpart client)."
+            ;;
+    esac
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
     echo "Luna2: ============================================================"
@@ -548,7 +597,7 @@ if [ "x$root" = "xluna" ]; then
                 if [ "$rc" = "$LUNA_FATAL_RC" ] || [ "$rc" = "$LUNA_SAFETY_RC" ]; then
                     fatal_park "$rc"   # never returns
                 fi
-                retry_countdown 30
+                retry_countdown 30 "$rc"
             fi
         done
     fi

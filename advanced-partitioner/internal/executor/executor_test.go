@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -232,5 +234,74 @@ func TestRedactArgsMasksToken(t *testing.T) {
 	// Non-sensitive args unchanged.
 	if out[0] != "--interface" || out[1] != "eth0" || out[5] != "https://host/x" {
 		t.Fatalf("non-sensitive args mutated: %v", out)
+	}
+}
+
+// A failed command's log entry must carry the HEAD of stderr as well as the
+// tail. The first error is normally the cause and the tail the cascade: a tar
+// that runs out of space prints hundreds of ENOSPC lines and then a handful of
+// deferred-ACL warnings, and a tail-only excerpt sent every reader to the ACLs.
+func TestRunCmdFailedLogsStderrHeadAndTail(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "executor.log")
+	l, err := txlog.Init(txlog.Options{LogFile: logPath, Stderr: false})
+	if err != nil {
+		t.Fatalf("Init logger: %v", err)
+	}
+	r := New(Options{Logger: l})
+	script := `echo FIRST-ENOSPC >&2
+i=0
+while [ $i -lt 400 ]; do echo "tar: /mnt/sysimage/f$i: Cannot write: No space left on device" >&2; i=$((i+1)); done
+echo LAST-ACL >&2
+exit 2`
+	if _, err := r.Run(context.Background(), CommandSpec{
+		Path:          "/bin/sh",
+		Args:          []string{"-c", script},
+		CaptureStderr: true,
+	}); err == nil {
+		t.Fatal("expected the script's exit 2 to be an error")
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close logger: %v", err)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	got := string(b)
+	for _, want := range []string{"FIRST-ENOSPC", "LAST-ACL", "bytes omitted"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("log entry lost %q; got:\n%s", want, got)
+		}
+	}
+}
+
+// A short stderr is logged whole, with no omission marker.
+func TestRunCmdFailedLogsShortStderrWhole(t *testing.T) {
+	logPath := filepath.Join(t.TempDir(), "executor.log")
+	l, err := txlog.Init(txlog.Options{LogFile: logPath, Stderr: false})
+	if err != nil {
+		t.Fatalf("Init logger: %v", err)
+	}
+	r := New(Options{Logger: l})
+	if _, err := r.Run(context.Background(), CommandSpec{
+		Path:          "/bin/sh",
+		Args:          []string{"-c", "echo pvcreate: device is busy >&2; exit 5"},
+		CaptureStderr: true,
+	}); err == nil {
+		t.Fatal("expected the script's exit 5 to be an error")
+	}
+	if err := l.Close(); err != nil {
+		t.Fatalf("Close logger: %v", err)
+	}
+	b, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("read log: %v", err)
+	}
+	got := string(b)
+	if !strings.Contains(got, "pvcreate: device is busy") {
+		t.Fatalf("short stderr missing from the log entry:\n%s", got)
+	}
+	if strings.Contains(got, "bytes omitted") {
+		t.Fatalf("short stderr must not be abridged:\n%s", got)
 	}
 }

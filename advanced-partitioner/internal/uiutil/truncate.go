@@ -28,3 +28,47 @@ func Truncate(s string, width int) string {
 	}
 	return string(out) + "~"
 }
+
+// Wrap soft-wraps s to width visible cells, breaking at the last space in a
+// row rather than mid-word unless the row holds a single long token. Used for
+// the lines a reader must see whole; everything else goes through Truncate.
+// Always returns at least one row.
+func Wrap(s string, width int) []string {
+	if width <= 0 {
+		return []string{""}
+	}
+	runes := []rune(s)
+	var rows []string
+	for len(runes) > 0 {
+		w, cut, space := 0, 0, -1
+		for cut < len(runes) {
+			rw := lipgloss.Width(string(runes[cut]))
+			if w+rw > width {
+				break
+			}
+			if runes[cut] == ' ' {
+				space = cut
+			}
+			w += rw
+			cut++
+		}
+		if cut == len(runes) {
+			rows = append(rows, string(runes))
+			break
+		}
+		if cut == 0 {
+			cut = 1 // a rune wider than the whole row; never loop
+		} else if space > 0 {
+			cut = space
+		}
+		rows = append(rows, string(runes[:cut]))
+		runes = runes[cut:]
+		for len(runes) > 0 && runes[0] == ' ' {
+			runes = runes[1:]
+		}
+	}
+	if len(rows) == 0 {
+		rows = append(rows, "")
+	}
+	return rows
+}
