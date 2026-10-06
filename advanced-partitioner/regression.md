@@ -324,6 +324,12 @@ the node.
   - then `luna2-start.sh`'s failure handling: a dmesg snapshot + the retry
     **countdown** (giving ~30 s), then a fresh attempt — i.e. the node loops,
     it does NOT silently hang or proceed.
+- **Expect on the console:** under the `INSTALLER FAILED` banner a
+  `Luna2: Reason:` block — the stage, the reason and the failing step's stderr,
+  read from `/tmp/install_files/logs/last-failure.txt` (written by the phase that
+  failed, cleared at the start of every phase so a stale one is never shown),
+  folded to 76 columns and capped at 15 lines. A park (exit 2 or 3) prints the
+  same block plus a line saying what that exit code means.
 - **Recover.** It will loop forever on a permanent error, so once you've
   captured the error + countdown, push a good config (`--install-mode memboot`);
   the next attempt re-reads the daemon and succeeds. (Confirms the loop also

@@ -53,6 +53,17 @@ type Options struct {
 	StepTimeout time.Duration
 }
 
+// failureFile is the one-shot failure summary written into Options.LogDir on a
+// stage failure: the stage, the untruncated reason and the failing step's
+// stderr. The per-tool logs and the loghost keep everything, but the node
+// reboots into the next attempt ~30 s later, so the boot wrapper prints this
+// file on the console — there is no second look.
+const failureFile = "last-failure.txt"
+
+// stepStderrLines bounds the stderr kept for the failure file. A step logs the
+// cause just before it exits, so the tail is the useful end here.
+const stepStderrLines = 40
+
 // FailureClass classifies a phase failure for the retry-vs-park decision
 // in the boot wrapper (see luna2-start.sh LUNA_FATAL_RC).
 type FailureClass int
@@ -96,6 +107,7 @@ type Pipeline struct {
 	disks        []string      // physical disk names from emitStorage
 	storageState model.Storage // last emitted storage, for re-emit with InUse/Method
 	methodLine   string        // config-derived Method (selection + counts), shown from resolve onward
+	stepStderr   []string      // tail of the current step's stderr, for the failure file
 
 	resultMu sync.Mutex
 	result   Result
@@ -175,6 +187,11 @@ func (p *Pipeline) Start() error {
 
 func (p *Pipeline) run() {
 	defer close(p.events)
+	// Clear the previous attempt's failure file: the boot wrapper prints
+	// whatever is there, so a stale one would be read as this attempt's reason.
+	if err := os.Remove(p.failurePath()); err != nil && !os.IsNotExist(err) {
+		p.info("could not clear " + p.failurePath() + ": " + err.Error())
+	}
 	var err error
 	switch p.opts.Phase {
 	case PhasePre:
@@ -413,7 +430,28 @@ func (p *Pipeline) runStep(stage, path string, args ...string) error {
 func (p *Pipeline) runStepArgv(stage string, argv []string) error {
 	ctx, cancel := context.WithTimeout(p.ctx, p.opts.StepTimeout)
 	defer cancel()
-	code, err := engine.RunCommand(ctx, engine.Command{Stage: stage, Argv: argv}, p.events)
+	// Mirror the step's stderr on its way to the renderers so a failure can
+	// name the cause in the failure file. The forward stays blocking, so the
+	// bus behaves exactly as it does when RunCommand writes to it directly.
+	p.stepStderr = nil
+	mirror := make(chan engine.InstallerEvent, 64)
+	var mirrored sync.WaitGroup
+	mirrored.Add(1)
+	go func() {
+		defer mirrored.Done()
+		for ev := range mirror {
+			if ev.Type == engine.EvCommandStderr {
+				p.stepStderr = append(p.stepStderr, ev.Message)
+				if len(p.stepStderr) > stepStderrLines {
+					p.stepStderr = p.stepStderr[len(p.stepStderr)-stepStderrLines:]
+				}
+			}
+			p.events <- ev
+		}
+	}()
+	code, err := engine.RunCommand(ctx, engine.Command{Stage: stage, Argv: argv}, mirror)
+	close(mirror)
+	mirrored.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
 		return fmt.Errorf("%s: step exceeded the %s timeout and was killed", filepath.Base(argv[0]), p.opts.StepTimeout)
 	}
@@ -469,6 +507,27 @@ func (p *Pipeline) stageDone(id, note string) {
 
 func (p *Pipeline) stageFail(id, note string) {
 	p.emit(engine.InstallerEvent{Time: time.Now(), Type: engine.EvStageFailed, Stage: id, Message: note})
+	p.writeFailure(id, note)
+}
+
+func (p *Pipeline) failurePath() string { return filepath.Join(p.opts.LogDir, failureFile) }
+
+// writeFailure records the stage, the reason and the failing step's stderr for
+// the boot wrapper to print. Best-effort: a failure to write is reported into
+// the install log rather than masking the failure that is being reported.
+func (p *Pipeline) writeFailure(stage, reason string) {
+	var b strings.Builder
+	fmt.Fprintf(&b, "stage: %s\n", stage)
+	fmt.Fprintf(&b, "reason: %s\n", reason)
+	if len(p.stepStderr) > 0 {
+		b.WriteString("stderr:\n")
+		for _, line := range p.stepStderr {
+			b.WriteString("  " + line + "\n")
+		}
+	}
+	if err := os.WriteFile(p.failurePath(), []byte(b.String()), 0o640); err != nil {
+		p.info("could not write " + p.failurePath() + ": " + err.Error())
+	}
 }
 
 func (p *Pipeline) bin(name string) string { return filepath.Join(p.opts.BinDir, name) }

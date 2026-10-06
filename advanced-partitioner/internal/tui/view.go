@@ -436,29 +436,45 @@ func (m Model) renderProgress(w, h int) string {
 
 // renderOutput draws the bottom-right run-output panel. Lines are
 // rendered via uiutil.StyleFor - raw text untouched, render-only colour.
+// An error line is soft-wrapped so the whole reason reaches the console (a
+// failed install reboots in ~30 s: "stderr=...~" is the one thing a reader
+// cannot do without); every other class keeps the cut, or ordinary command
+// chatter would scroll the panel's history away.
 func (m Model) renderOutput(w, h int) string {
 	inner := h - 2 // panel border eats two rows
 	if inner < 1 {
 		inner = 1
 	}
 	lines := m.State.Output.Lines
-	// Window of `inner` lines ending OutputScroll lines back from the tail.
-	start := 0
-	if len(lines) > inner {
-		start = len(lines) - inner - m.OutputScroll
-		if start < 0 {
-			start = 0
-		}
+	// Newest visible line, OutputScroll lines back from the tail; the window
+	// always fills the panel when there is that much history.
+	end := len(lines) - m.OutputScroll
+	if end < inner {
+		end = inner
 	}
-	end := start + inner
 	if end > len(lines) {
 		end = len(lines)
 	}
+	// Fill from the bottom: a wrapped line occupies several rows, so how many
+	// lines fit is only known as they are rendered.
 	var rendered []string
-	for _, line := range lines[start:end] {
-		text := uiutil.Truncate(line.Raw, w-4)
+	for i := end - 1; i >= 0 && len(rendered) < inner; i-- {
+		line := lines[i]
+		var rows []string
+		if line.Class == model.ClassError {
+			rows = uiutil.Wrap(line.Raw, w-4)
+		} else {
+			rows = []string{uiutil.Truncate(line.Raw, w-4)}
+		}
+		// The topmost line is scrolling off: keep the rows that still fit.
+		if room := inner - len(rendered); len(rows) > room {
+			rows = rows[len(rows)-room:]
+		}
 		style := uiutil.StyleFor(line.Class)
-		rendered = append(rendered, style.Render(text))
+		for j := range rows {
+			rows[j] = style.Render(rows[j])
+		}
+		rendered = append(rows, rendered...)
 	}
 	// Pad to fill the panel so the bottom border lands consistently.
 	for len(rendered) < inner {
