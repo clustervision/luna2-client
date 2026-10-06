@@ -106,7 +106,8 @@ redhat/{x86,arm}/      luna2-client.spec + src/
 opensuse/{x86,arm}/    luna2-client.spec + src/
 ubuntu/{x86,arm}/      src/DEBIAN/control + src/
 advanced-partitioner/  the lpart Go source
-VERSION                the only place the version is stated
+VERSION                the only place the version is stated - e.g. 2.2-2 builds
+                       packages for 2.2-2
 ```
 
 ## Packages are built by the pipeline, not by hand
