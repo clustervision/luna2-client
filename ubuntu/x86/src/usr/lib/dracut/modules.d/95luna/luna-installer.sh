@@ -365,9 +365,21 @@ function print_failure_reason () {
             line = $0
             do {
                 if (n >= cap) { cut = 1; exit }
-                print pfx substr(line, 1, w)
+                if (length(line) <= w) { print pfx line; n++; break }
+                # Break at the last space in the row, so a word is not split
+                # across two lines; a row holding one long token is cut.
+                brk = 0
+                for (i = w; i > 1; i--) {
+                    if (substr(line, i, 1) == " ") { brk = i; break }
+                }
+                if (brk > 1 && substr(line, 1, brk - 1) ~ /[^ ]/) {
+                    print pfx substr(line, 1, brk - 1)
+                    line = substr(line, brk + 1)
+                } else {
+                    print pfx substr(line, 1, w)
+                    line = substr(line, w + 1)
+                }
                 n++
-                line = substr(line, w + 1)
             } while (length(line) > 0)
         }
         END { if (cut) print pfx "... (see log)" }' "$LUNA_FAILURE_FILE"
