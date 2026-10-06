@@ -105,6 +105,30 @@ func TestParseLayoutMemOS(t *testing.T) {
 	}
 }
 
+// A disk OS with boot_method=none (BIOS firmware) must not claim GRUB in the
+// summary: the node PXE-boots every time. bootMode() reads the host's /sys, so
+// only the boot segment is asserted.
+func TestParseLayoutDiskOSWithoutBootloader(t *testing.T) {
+	info := parseLayout(writeResult(t, `{"role":"os","raid_mode":"none","boot_method":"none",
+	  "selected_disks":[{"resolved_path":"/dev/sda","serial":"S1"}]}`))
+	want := "Boot: none (BIOS firmware: GRUB, shim and boot order skipped; node PXE-boots every time)"
+	if !strings.Contains(info.Summary, want) {
+		t.Errorf("summary = %q, want it to contain %q", info.Summary, want)
+	}
+	if strings.Contains(info.Summary, "/GRUB") {
+		t.Errorf("summary must not claim GRUB: %q", info.Summary)
+	}
+}
+
+// A disk OS with a bootloader still reports GRUB.
+func TestParseLayoutDiskOSWithGRUB(t *testing.T) {
+	info := parseLayout(writeResult(t, `{"role":"os","raid_mode":"none","boot_method":"grub",
+	  "selected_disks":[{"resolved_path":"/dev/sda","serial":"S1"}]}`))
+	if !strings.Contains(info.Summary, "/GRUB") {
+		t.Errorf("summary = %q, want it to contain /GRUB", info.Summary)
+	}
+}
+
 func TestHostFromURL(t *testing.T) {
 	cases := map[string]string{
 		"https://10.141.255.252:7050": "10.141.255.252:7050",

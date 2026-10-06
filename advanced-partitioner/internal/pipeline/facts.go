@@ -270,6 +270,7 @@ type setProbe struct {
 	Role          string `json:"role"`
 	RaidMode      string `json:"raid_mode"`
 	RegisterNVRAM string `json:"register_nvram"`
+	BootMethod    string `json:"boot_method"`
 	SelectedDisks []struct {
 		ResolvedPath   string `json:"resolved_path"`
 		ConfiguredPath string `json:"configured_path"`
@@ -307,6 +308,7 @@ func parseLayout(path string) layoutInfo {
 	firmware := bootMode()
 	var methodParts, summaryParts []string
 	nvram := false
+	diskOSNoBootloader := false
 	dataIdx := 0
 	for _, s := range sets {
 		isData := strings.EqualFold(s.Role, "data")
@@ -328,6 +330,10 @@ func parseLayout(path string) layoutInfo {
 				summaryParts = append(summaryParts, "OS -> tmpfs (RAM)")
 			}
 			continue
+		}
+
+		if !isData && strings.EqualFold(s.BootMethod, "none") {
+			diskOSNoBootloader = true
 		}
 
 		var names []string
@@ -358,6 +364,8 @@ func parseLayout(path string) layoutInfo {
 	boot := "Boot: " + firmware + "/GRUB"
 	if info.MemOS && len(info.Disks) == 0 {
 		boot = "Boot: none (memory-root)"
+	} else if diskOSNoBootloader {
+		boot = "Boot: none (BIOS firmware: GRUB, shim and boot order skipped; node PXE-boots every time)"
 	} else if strings.EqualFold(firmware, "UEFI") && nvram {
 		boot += " + NVRAM"
 	}

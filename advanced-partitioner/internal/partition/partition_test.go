@@ -135,26 +135,41 @@ func TestBuildLayoutSingleDiskUEFI(t *testing.T) {
 	mustHaveCalls(t, f, expect)
 }
 
-// BIOS/legacy boot is unsupported: BuildLayout must refuse a non-UEFI
-// firmware mode outright (no BIOS-GRUB partition is ever produced). The
-// installer gate in lpart-storage-prepare refuses BIOS nodes before this
-// point; this is the layout-builder belt.
-func TestBuildLayoutRefusesBIOS(t *testing.T) {
-	f := fakeRunnerWithCleanDisk("/dev/sda")
-	b := New(Options{Runner: f, Sleep: noSleep})
-	_, err := b.BuildLayout(context.Background(), buildSetSingleDiskUEFI(),
-		[]selector.Resolved{{ResolvedPath: "/dev/sda", SizeBytes: 500 * 1024 * 1024 * 1024}},
-		"bios")
-	if err == nil {
-		t.Fatal("BuildLayout must refuse BIOS firmware; got nil error")
+// The partition layout does not depend on the firmware: a BIOS node gets the
+// same GPT with the same ESP as a UEFI one, so switching the node to UEFI
+// later needs no repartition. Only GRUB is UEFI-only, and that is decided in
+// lpart-bootloader-finalise, not here.
+func TestBuildLayoutIdenticalOnBIOS(t *testing.T) {
+	disks := []selector.Resolved{{ResolvedPath: "/dev/sda", SizeBytes: 500 * 1024 * 1024 * 1024}}
+
+	fu := fakeRunnerWithCleanDisk("/dev/sda")
+	uefi, err := New(Options{Runner: fu, Sleep: noSleep}).BuildLayout(
+		context.Background(), buildSetSingleDiskUEFI(), disks, "uefi")
+	if err != nil {
+		t.Fatalf("BuildLayout(uefi): %v", err)
 	}
-	if !strings.Contains(err.Error(), "requires UEFI") {
-		t.Fatalf("error should name the UEFI requirement; got: %v", err)
+
+	fb := fakeRunnerWithCleanDisk("/dev/sda")
+	bios, err := New(Options{Runner: fb, Sleep: noSleep}).BuildLayout(
+		context.Background(), buildSetSingleDiskUEFI(), disks, "bios")
+	if err != nil {
+		t.Fatalf("BuildLayout(bios): %v", err)
 	}
-	// It must not have touched the disk (no partitioning on refusal).
-	for _, c := range f.Calls() {
-		if strings.Contains(strings.Join(c.Args, " "), "sgdisk") {
-			t.Fatalf("BIOS refusal must not run sgdisk; saw: %+v", c.Args)
+
+	if bios.FirmwareMode != "bios" {
+		t.Fatalf("FirmwareMode = %q, want bios (the detected mode is recorded)", bios.FirmwareMode)
+	}
+	if !equalSlices(bios.EFIPartitions, uefi.EFIPartitions) ||
+		!equalSlices(bios.BootPartitions, uefi.BootPartitions) ||
+		!equalSlices(bios.StoragePartitions, uefi.StoragePartitions) {
+		t.Fatalf("layout differs on BIOS:\n uefi=%+v\n bios=%+v", uefi, bios)
+	}
+	// The ESP is created with the same type code, not an EF02 BIOS-boot
+	// partition: BIOS GRUB is not supported in any form.
+	mustHaveCalls(t, fb, []string{"sgdisk -n 1:0:+600M -t 1:EF00 -c 1:EFI /dev/sda"})
+	for _, c := range fb.Calls() {
+		if strings.Contains(strings.Join(c.Args, " "), "EF02") {
+			t.Fatalf("no BIOS-boot partition may be produced; saw: %+v", c.Args)
 		}
 	}
 }

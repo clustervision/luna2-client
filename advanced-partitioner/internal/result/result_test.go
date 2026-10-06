@@ -215,3 +215,42 @@ func TestWriteResolved(t *testing.T) {
 		t.Fatalf("wrong shape: %+v", got)
 	}
 }
+
+// GRUB, shim and the UEFI boot order are UEFI-only, so a disk set on BIOS
+// firmware installs no bootloader: boot_method is "none" and
+// lpart-bootloader-finalise stops after writing fstab.
+func TestAssembleDiskSetOnBIOSHasNoBootMethod(t *testing.T) {
+	set := &v2.Set{
+		Name: "os", Role: "os", Selection: "manual", Raid: "none",
+		Devices: []string{"/dev/sda"},
+		Volumes: []v2.Volume{
+			{Name: "uefi", Mountpoint: "/boot/efi", FS: "vfat", Size: "600M", Provider: "partition"},
+			{Name: "root", Mountpoint: "/", FS: "xfs", Size: "100%", Provider: "lvm"},
+		},
+	}
+	in := AssembleInput{
+		Set:          set,
+		FirmwareMode: "bios",
+		Selected:     []selector.Resolved{{ConfiguredPath: "/dev/sda", ResolvedPath: "/dev/sda"}},
+		Filesystems: fsmod.Filesystems{
+			Role: "os", FirmwareMode: "bios", RAIDMode: "none",
+			Filesystems: []fsmod.Filesystem{
+				{Mount: "/boot/efi", Device: "/dev/sda1", FS: "vfat"},
+				{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs"},
+			},
+		},
+		Mount: mount.Result{MountedTargetRoot: "/sysroot", RootDevice: "/dev/mapper/os-root"},
+	}
+	got := Assemble(in)
+	if got.BootMethod != "none" {
+		t.Fatalf("BootMethod = %q, want none on BIOS firmware", got.BootMethod)
+	}
+	if got.FirmwareMode != "bios" {
+		t.Fatalf("FirmwareMode = %q, want bios", got.FirmwareMode)
+	}
+	// The ESP is still laid down and formatted, so a later switch to UEFI
+	// needs no repartition.
+	if got.Filesystems[0].Mount != "/boot/efi" || got.Filesystems[0].FS != "vfat" {
+		t.Fatalf("the ESP must still be present on BIOS: %+v", got.Filesystems)
+	}
+}

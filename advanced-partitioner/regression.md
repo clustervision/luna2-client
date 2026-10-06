@@ -568,22 +568,34 @@ CCF-7/8), the NB-1..NB-8 barrier round, and the seven live-found 2026-07-11/12 b
 test names the FTA event it exercises so a failure maps straight back to the tree. Tags:
 **[DESTRUCTIVE]** wipes disks / kills legs / yanks power — sacrificial node only;
 **[SAFE]** no disk mutation (refusals, parks, observability). UEFI/OVMF node required
-(q35 + `firmware='efi'`; conversion recipe in `/root/lpart-uefi-work/`). 24 of 36 are
-destructive. Lab helpers: `/root/lpart-uefi-work/reg-helpers.sh` (`fresh_boot`, `blank`,
+(q35 + `firmware='efi'`; conversion recipe in `/root/lpart-uefi-work/`), except 3.26 which
+needs a legacy-BIOS node. 25 of 36 are destructive. Lab helpers: `/root/lpart-uefi-work/reg-helpers.sh` (`fresh_boot`, `blank`,
 `setcfg`, `pushdl`, `shot`, `wait_write`).
 
-### 3.26  firmware gate: BIOS node refused, parked, ZERO writes  [SAFE]
-- **FTA.** Firmware gate (TE-C/TE-E guard); the UEFI-required design decision.
+### 3.26  BIOS node: installs, no bootloader, PXE-boots every time  [DESTRUCTIVE]
+- **FTA.** Firmware gate (TE-C/TE-E guard): GRUB, the shim and the UEFI boot order are
+  UEFI-only; everything else in the install is firmware-independent.
 - **Setup.** A BIOS VM: redefine the node with `machine='pc-i440fx-*'`, no
   `<os firmware='efi'>` (keep the old XML backup), same MAC/disks. Any valid disklayout,
   `--install-mode auto`. PXE via the BIOS `ipxe-luna-direct.iso`.
-- **Expect.** part phase logs `detected_firmware=bios` →
-  `safety_refusal=firmware-not-uefi` → exit 2 → node-installer 3 → **fatal park, NOT
-  retrying**; message names the fix ("enable UEFI boot … reprovision"). `virsh domblkstat`
-  wr_bytes on every disk = **0**. No mdadm.conf/lvmlocal.conf writes either (the gate
-  precedes EnsureNoAutoAssemble).
-- **Recover.** Redefine with the OVMF XML → the *same* config installs cleanly. This pair
-  (refuse-on-BIOS, install-on-UEFI) is the whole gate contract.
+- **Expect.** part phase logs `detected_firmware=bios`, `boot_plan_disk_os=true`,
+  `boot_plan_installs_grub=false` and one warning naming GRUB/shim/boot order and
+  PXE-every-boot. The install completes: `/boot/efi` is vfat and mounted, fstab carries
+  `/` and `/boot/efi`, `storage-result.json` has `boot_method: none`, and finalise returns
+  0 without running dracut, `grub2-install` or `efibootmgr`. The summary Boot line reads
+  `Boot: none (BIOS firmware: …)`. The ramdisk pivots to `/sysroot` and the node reaches
+  multi-user.
+- **Second boot (`auto`).** Health verdict **healthy** → mount-only, no rebuild. The ESP is
+  formatted on BIOS precisely so the health probe does not classify the set as broken and
+  rebuild the OS on every boot.
+- **Refusal leg (`[SAFE]`).** Same node, an osimage whose Luna ramdisk was packed without
+  dracut (`mkinitramfs`): `safety_refusal=bootloader-none-needs-dracut-ramdisk` → exit 2 →
+  node-installer 3 → **fatal park, NOT retrying**; `virsh domblkstat` wr_bytes on every
+  disk = **0** (the preflight precedes EnsureNoAutoAssemble). Without it the node would
+  reboot into a disk with nothing to boot and loop back into PXE for ever. If such a
+  ramdisk cannot be produced in the lab, record that and rely on the unit test.
+- **Recover.** Redefine with the OVMF XML → the *same* config installs with GRUB, the shim
+  and the NVRAM entry, TrinityX last in the boot order.
 
 ### 3.27  NVRAM cleared → removable-fallback boot  [DESTRUCTIVE: NVRAM]
 - **FTA.** BE-W3/BE-W4 mitigation: the ESP `EFI/BOOT/BOOT{X64,AA64}.EFI` + shim-CSV path

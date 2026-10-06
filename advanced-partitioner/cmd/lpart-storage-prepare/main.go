@@ -196,24 +196,38 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
 
-	// Detect firmware mode once up-front; per-set firmware is taken
-	// from this unless the config overrides via install.boot.firmware.
+	// Detect firmware mode once up-front: it is recorded on every set and it
+	// decides whether this run installs GRUB.
 	detectedFirmware := detectFirmware()
 	logger.KV("detected_firmware", detectedFirmware)
 
-	// UEFI is required. lpart refuses to touch a BIOS/legacy-CSM node: BIOS
-	// has no NVRAM boot-entry management (efibootmgr is UEFI-only) and cannot
-	// provide a disk-fault-tolerant mirrored boot chain, so a BIOS install
-	// would be a silently degraded one. Every current server target boots
-	// UEFI (x86 UEFI; NVIDIA Grace/GH200/GB200 and other Arm SystemReady SR
-	// machines; BlueField), so a BIOS result means legacy/CSM boot is enabled
-	// in firmware. Refuse up front -- before any destructive action -- via the
-	// safety_refusal contract so the wrapper parks for operator review instead
-	// of retrying a permanent condition.
+	// Boot-path preflight. A BIOS/legacy-CSM node is partitioned and installed
+	// exactly like a UEFI one; only GRUB, shim and the UEFI boot order are
+	// skipped, because BIOS has no NVRAM boot-entry management and no mirrored
+	// boot chain. Nothing is lost by that: Luna PXE-loads the kernel on every
+	// boot anyway. The one case that must stop is a bootloader-less disk OS
+	// behind an install ramdisk that reboots instead of pivoting -- refuse
+	// before any destructive action, via the safety_refusal contract so the
+	// wrapper parks for operator review instead of retrying for ever.
+	env := bootEnv{Firmware: detectedFirmware, RamdiskPivots: detectRamdiskPivots()}
+	plan := planBoot(ic.InstallMode, cfg, env)
+	logger.KV("boot_plan_disk_os", plan.DiskOS)
+	logger.KV("boot_plan_installs_grub", plan.InstallsGRUB)
+	logger.KV("ramdisk_pivots", env.RamdiskPivots)
+	if err := preflightBoot(plan, env); err != nil {
+		var se *safetyError
+		if errors.As(err, &se) {
+			return cli.ExitSafetyRefusal(stderr, toolName, se.reason, "%s", se.msg)
+		}
+		errln(stderr, "%v", err)
+		return 1
+	}
 	if detectedFirmware != "uefi" {
-		return cli.ExitSafetyRefusal(stderr, toolName, "firmware-not-uefi",
-			"node firmware is %q, not UEFI -- lpart requires UEFI boot and will not partition a BIOS/legacy-CSM node; enable UEFI boot in the node's firmware and reprovision",
-			detectedFirmware)
+		if plan.DiskOS {
+			logger.Warn(fmt.Sprintf("firmware is %q: GRUB, shim and the UEFI boot order are skipped (UEFI-only) -- the OS is installed to disk but the node PXE-boots every time", detectedFirmware))
+		} else {
+			logger.UserInfo("firmware is %q: allowed -- this run installs no bootloader (the node boots via PXE)", detectedFirmware)
+		}
 	}
 
 	// Stop udev from auto-assembling stale md arrays from surviving superblocks
@@ -418,7 +432,8 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		}
 	}
 
-	// Boot firmware is UEFI only under v1.4; the detected mode is recorded.
+	// The detected firmware mode is recorded on the set; whether it installs a
+	// bootloader was decided up front by preflightBoot (GRUB is UEFI-only).
 	firmwareMode := detectedFirmware
 
 	resolvedRecord := result.ResolvedSet{

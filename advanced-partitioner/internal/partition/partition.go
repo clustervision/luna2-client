@@ -168,7 +168,9 @@ func raidIsRedundant(raidMode string) bool {
 //     RAID) consumes the rest of the disk.
 //  2. Wait for the partition table to settle (lsblk poll, partprobe).
 //
-// firmwareMode must be "uefi" (BIOS/legacy boot is unsupported and rejected).
+// firmwareMode is recorded on the layout only: the layout is the same on UEFI
+// and BIOS -- GPT with an ESP (EF00, or FD00 when mirrored) -- so a node
+// switched to UEFI later needs no repartition.
 //
 // easy side-by-side diffing.
 //
@@ -183,14 +185,6 @@ func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selec
 	if len(resolved) == 0 {
 		return Layout{}, fmt.Errorf("partition.BuildLayout: no resolved disks")
 	}
-	// UEFI only. The installer gate in lpart-storage-prepare already refuses
-	// non-UEFI nodes before we get here; guard again so a stray firmware
-	// string can never produce a BIOS-GRUB layout. (BIOS support removed:
-	// no NVRAM, no mirrored boot chain -- see the storage-prepare gate.)
-	if firmwareMode != "uefi" {
-		return Layout{}, fmt.Errorf("partition.BuildLayout: unsupported firmware mode %q: lpart requires UEFI", firmwareMode)
-	}
-
 	layout := Layout{
 		Role:         set.Role,
 		FirmwareMode: firmwareMode,

@@ -144,6 +144,12 @@ type AssembleInput struct {
 //
 // Mirrors lib/output_json.sh::assemble_storage_result.
 func Assemble(in AssembleInput) StorageResult {
+	// GRUB, shim and the UEFI boot order are UEFI-only, so a disk set on any
+	// other firmware gets no bootloader and the node PXE-boots every time.
+	bootMethod := in.Set.BootMethodOrNone()
+	if in.FirmwareMode != "uefi" {
+		bootMethod = "none"
+	}
 	res := StorageResult{
 		Version:           v2.SchemaVersion,
 		Name:              in.Set.Name,
@@ -151,7 +157,7 @@ func Assemble(in AssembleInput) StorageResult {
 		FirmwareMode:      in.FirmwareMode,
 		SelectedDisks:     in.Selected,
 		StorageType:       string(in.Set.StorageType()),
-		BootMethod:        in.Set.BootMethodOrNone(),
+		BootMethod:        bootMethod,
 		BootFirmware:      "uefi",
 		RegisterNVRAM:     "auto",
 		ClearUEFINVRAM:    in.Set.ClearUEFINVRAM(),

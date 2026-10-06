@@ -15,15 +15,15 @@ import (
 // the evidence — the UEFI NVRAM boot entry (efibootmgr -v output), the staged
 // ESP loaders, and the grub config — so a finalise on a new distro/arch shows
 // exactly what landed instead of a silent "ok". It returns an error listing
-// every missing artefact. A RAM/tmpfs root (FamilyNone) has no bootloader and
-// is reported as such; BIOS skips the NVRAM check.
+// every missing artefact. boot_method=none (FamilyNone) has no bootloader and is
+// reported as such -- a RAM/tmpfs root, or a disk OS on BIOS firmware.
 //
 // This is the proof step the operator relies on: when we touch NVRAM and grub,
 // we re-read them at the end and show that the boot entry is really registered.
 func VerifyAndReport(ctx context.Context, runner executor.Runner, logger *txlog.Logger, bc BootContext) error {
 	if bc.Family == FamilyNone {
 		if logger != nil {
-			logger.UserInfo("verify: boot_method=none (RAM/tmpfs root) — no bootloader to verify")
+			logger.UserInfo("verify: boot_method=none — no bootloader to verify")
 		}
 		return nil
 	}

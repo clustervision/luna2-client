@@ -191,7 +191,9 @@ auto:
              YES -> for each set: apply_set(auto, set)
 ```
 
-Boot firmware is always UEFI. On the modes that install a bootloader (`auto`, `sync`, `full`, `local`) the installer writes GRUB in UEFI mode and registers the NVRAM boot entry, choosing the x86_64 or aarch64 EFI binary from the node's architecture. There is no BIOS path and nothing to configure for it. Legacy BIOS and CSM are not supported, which is also what the Secure Boot and measured boot work in section 9 builds on. ARM server platforms boot UEFI by the SBBR standard, so they follow the same path with no special handling.
+The firmware mode is detected, never configured: it is whichever mode the node PXE-booted in. On UEFI, the modes that install a bootloader (`auto`, `sync`, `full`, `local`) write GRUB, stage the signed shim and register the NVRAM boot entry, choosing the x86_64 or aarch64 EFI binary from the node's architecture. ARM server platforms boot UEFI by the SBBR standard, so they follow the same path with no special handling.
+
+A legacy BIOS or CSM node partitions, extracts and mounts exactly as a UEFI node does, down to the vfat ESP at `/boot/efi` — so a node moved to UEFI later needs no repartition. Only GRUB, the shim and the boot order are skipped, because lpart supports no BIOS equivalent of them: the storage result records `boot_method: none`, the install logs one warning, and the node PXE-boots on every boot, which is how the model works on UEFI as well. One case is refused before any disk is touched: a disk OS whose install ramdisk is not dracut-based reboots into the disk instead of pivoting to it, and with no bootloader there it would loop back into PXE for ever. Secure Boot and measured boot, in section 9, build on the UEFI path.
 
 <div style="break-before: page;"></div>
 

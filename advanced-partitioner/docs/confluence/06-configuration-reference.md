@@ -92,6 +92,8 @@ flowchart LR
 
 A **volume** is one mountpoint + filesystem within a set, backed by a `provider` (`partition` or `lvm`). A DATA set can be marked **`persistent: true`** — a firm promise that the installer never partitions, formats or overwrites it; it is only mounted.
 
+The OS set declares a vfat `/boot/efi` volume on **both** firmware modes, and the layout is identical on both. Firmware is not a field: it is whichever mode the node PXE-booted in. On UEFI the installer writes GRUB, the signed shim and the NVRAM boot entry; on legacy BIOS/CSM it writes none of those and the node PXE-boots every time. A BIOS node is refused in one case only — an install ramdisk that is not dracut-based, which would reboot into a disk with no bootloader and loop back into PXE for ever (`luna osimage pack` an image carrying dracut).
+
 ### The data fence (what each mode may wipe)
 
 The per-set apply logic, the heart of the data-safety guarantee:

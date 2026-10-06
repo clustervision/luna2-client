@@ -8,8 +8,9 @@
 //  3. Build BootContext from the storage result + detected firmware /
 //     OS family
 //  4. Write /sysroot/etc/fstab from the filesystem list
-//  5. If clear_uefi_nvram=true: bind-mount + ClearUEFINVRAMEntries
-//  6. If boot_method=="none": stop (fstab-only path); else: bind mounts
+//  5. If clear_uefi_nvram=true on UEFI: bind-mount + ClearUEFINVRAMEntries
+//  6. If boot_method=="none": stop (fstab-only path); a non-UEFI firmware past
+//     that point is refused (GRUB is UEFI-only); else: bind mounts
 //     + family.Prepare → RegenerateInitramfs → Install → Validate
 //  7. Always cleanup bind mounts before returning
 package main
@@ -169,21 +170,37 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	defer cleanup()
 
 	if bctx.ClearUEFINVRAM {
-		logger.SetStage("bind_mounts")
-		if err := bootloader.BindMountSysroot(context.Background(), runner, bctx.Sysroot, nil); err != nil {
-			errln(stderr, "bind mount: %v", err)
-			return 1
-		}
-		logger.SetStage("clear_uefi_nvram")
-		if err := bootloader.ClearUEFINVRAMEntries(context.Background(), runner, bctx.Sysroot, bctx.FirmwareMode); err != nil {
-			errln(stderr, "%v", err)
-			return 1
+		// There is no NVRAM to clear outside UEFI, so skip the bind mount too
+		// rather than mounting for a no-op.
+		if bctx.FirmwareMode != "uefi" {
+			logger.UserInfo("clear_uefi_nvram requested but firmware is %q: no UEFI NVRAM to clear", bctx.FirmwareMode)
+		} else {
+			logger.SetStage("bind_mounts")
+			if err := bootloader.BindMountSysroot(context.Background(), runner, bctx.Sysroot, nil); err != nil {
+				errln(stderr, "bind mount: %v", err)
+				return 1
+			}
+			logger.SetStage("clear_uefi_nvram")
+			if err := bootloader.ClearUEFINVRAMEntries(context.Background(), runner, bctx.Sysroot, bctx.FirmwareMode); err != nil {
+				errln(stderr, "%v", err)
+				return 1
+			}
 		}
 	}
 
 	if bctx.BootMethod == "none" {
-		logger.UserInfo("Bootloader finalisation skipped because boot_method=none; fstab was written")
+		logger.UserInfo("No bootloader installed (boot_method=none, firmware %s): fstab written; the node PXE-boots every time", bctx.FirmwareMode)
 		return 0
+	}
+
+	// Belt behind lpart-storage-prepare's boot preflight: GRUB is UEFI-only, so
+	// a grub boot method on any other firmware is an upstream bug. Refuse here,
+	// before the bind mounts and dracut run for nothing, with exit 2 so the
+	// wrapper parks instead of retrying a permanent condition.
+	if bctx.FirmwareMode != "uefi" {
+		return cli.ExitSafetyRefusal(stderr, toolName, "firmware-not-uefi",
+			"boot_method=%s needs UEFI firmware but the node booted %q; lpart-storage-prepare should have refused this -- not running dracut/GRUB",
+			bctx.BootMethod, bctx.FirmwareMode)
 	}
 
 	logger.SetStage("bind_mounts")
