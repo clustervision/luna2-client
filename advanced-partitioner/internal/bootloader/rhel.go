@@ -58,6 +58,9 @@ func (a *rhelAdapter) RegenerateInitramfs(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("dracut -f --omit luna --kver %s: %w", kver, err)
 	}
+	if msg := kernelNotNewestWarning(sysroot, kver); msg != "" && a.deps.Logger != nil {
+		a.deps.Logger.Warn(msg)
+	}
 	return nil
 }
 
@@ -216,6 +219,38 @@ func versionNumbers(s string) []string {
 		i = j
 	}
 	return out
+}
+
+// kernelNotNewestWarning returns the text to warn with when the initramfs was built
+// for a kernel that is not the newest installed one, or "" when there is nothing to
+// say. Pure so it can be tested without a logger.
+//
+// The boot loader orders its entries by version, so when these differ it may start a
+// different kernel from the one just rebuilt -- and that one's initramfs still carries
+// the luna module, which is how a node ends up back in the installer. Pinning an older
+// kernel on the osimage is a legitimate thing to do, so this reports rather than
+// refuses. Comparison is within the same debug flavour, matching how the target was
+// chosen, so an el10 debug tree does not make every install warn.
+func kernelNotNewestWarning(sysroot, kver string) string {
+	entries, err := os.ReadDir(filepath.Join(sysroot, "lib", "modules"))
+	if err != nil {
+		return ""
+	}
+	var installed []string
+	for _, e := range entries {
+		if e.IsDir() && hasKernelImage(sysroot, e.Name()) {
+			installed = append(installed, e.Name())
+		}
+	}
+	newest := newestKernel(installed, isDebugKernelDir(kver))
+	if newest == "" || newest == kver {
+		return ""
+	}
+	return fmt.Sprintf(
+		"the initramfs was built for kernel %s, but %s is also installed and is newer. "+
+			"The boot loader orders entries by version, so this node may start %s instead, "+
+			"whose initramfs was not rebuilt and still contains the luna module",
+		kver, newest, newest)
 }
 
 // isDebugKernelDir reports whether a /lib/modules entry is a debug kernel variant.

@@ -3,6 +3,7 @@ package bootloader
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -275,4 +276,82 @@ func TestDetectKernelVersionRunningKernelNeedsBothHalves(t *testing.T) {
 	if got != good {
 		t.Errorf("picked %q, want %q", got, good)
 	}
+}
+
+// TestKernelNotNewestWarning pins when the operator gets told that the boot loader
+// may start a different kernel from the one the initramfs was built for.
+//
+// The case that matters is a pinned kernel: setting an older kernelversion on the
+// osimage is a supported thing to do, and the node then netboots that kernel and the
+// initramfs is rebuilt for it -- but the boot loader orders its entries by version and
+// may start a newer one, whose initramfs still carries the luna module. Silence is
+// just as important: warning on every ordinary multi-kernel image would train people
+// to ignore it.
+func TestKernelNotNewestWarning(t *testing.T) {
+	const older = "4.18.0-553.97.1.el8_10.x86_64"
+	const newer = "4.18.0-553.123.1.el8_10.x86_64"
+
+	// build makes a sysroot where every name in bootable has a kernel image and
+	// every name in modulesOnly has a module directory but no kernel.
+	build := func(t *testing.T, bootable, modulesOnly []string) string {
+		t.Helper()
+		sysroot := t.TempDir()
+		if err := os.MkdirAll(filepath.Join(sysroot, "boot"), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		for _, k := range append(append([]string{}, bootable...), modulesOnly...) {
+			if err := os.MkdirAll(filepath.Join(sysroot, "lib", "modules", k), 0o750); err != nil {
+				t.Fatal(err)
+			}
+		}
+		for _, k := range bootable {
+			if err := os.WriteFile(filepath.Join(sysroot, "boot", "vmlinuz-"+k), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return sysroot
+	}
+
+	t.Run("pinned to an older kernel -> warn, naming both", func(t *testing.T) {
+		got := kernelNotNewestWarning(build(t, []string{older, newer}, nil), older)
+		if got == "" {
+			t.Fatal("expected a warning when the target is not the newest installed kernel")
+		}
+		for _, want := range []string{older, newer} {
+			if !strings.Contains(got, want) {
+				t.Errorf("warning does not name %q: %s", want, got)
+			}
+		}
+	})
+
+	t.Run("target is the newest -> silent", func(t *testing.T) {
+		if got := kernelNotNewestWarning(build(t, []string{older, newer}, nil), newer); got != "" {
+			t.Errorf("expected silence, got: %s", got)
+		}
+	})
+
+	t.Run("single kernel -> silent", func(t *testing.T) {
+		if got := kernelNotNewestWarning(build(t, []string{newer}, nil), newer); got != "" {
+			t.Errorf("expected silence, got: %s", got)
+		}
+	})
+
+	// The field image: eleven leftovers and one real kernel. Leftovers are not
+	// installed kernels, so they must not provoke a warning.
+	t.Run("leftover directories are not installed kernels -> silent", func(t *testing.T) {
+		leftovers := []string{older, "4.18.0-553.8.1.el8_10.x86_64", "4.18.0-477.10.1.el8_8.x86_64"}
+		if got := kernelNotNewestWarning(build(t, []string{newer}, leftovers), newer); got != "" {
+			t.Errorf("expected silence, got: %s", got)
+		}
+	})
+
+	// el10 ships a debug tree beside the real kernel; comparing within the same
+	// flavour keeps that ordinary case quiet.
+	t.Run("debug kernel alongside the real one -> silent", func(t *testing.T) {
+		const real = "6.12.0-211.34.1.el10_2.x86_64"
+		sysroot := build(t, []string{real, real + "+debug"}, nil)
+		if got := kernelNotNewestWarning(sysroot, real); got != "" {
+			t.Errorf("expected silence, got: %s", got)
+		}
+	})
 }
