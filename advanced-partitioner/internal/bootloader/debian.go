@@ -93,6 +93,9 @@ func (a *debianAdapter) RegenerateInitramfs(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("dracut -f --omit luna --kver %s: %w", kver, err)
 	}
+	if msg := kernelNotNewestWarning(sysroot, kver); msg != "" && a.deps.Logger != nil {
+		a.deps.Logger.Warn(msg)
+	}
 	return nil
 }
 
