@@ -64,41 +64,158 @@ func (a *rhelAdapter) RegenerateInitramfs(ctx context.Context) error {
 // detectKernelVersion walks /sysroot/lib/modules/* and returns the version
 // directory to build the initramfs for.
 //
-// "last wins" is NOT safe on its own: el10 installs kernel-debug-core and
-// kernel-debug-modules* alongside the real kernel, so the installed rootfs holds
-// TWO trees --
+// A directory under lib/modules does NOT mean that kernel is installed. Removing a
+// kernel package takes back only what the package owns; the depmod output
+// (modules.dep and friends) and the extra/ directories of out-of-tree drivers belong
+// to nobody and survive. A converted image can therefore carry a dozen of these
+// leftovers, and dracut, handed one, fails packing drivers that went with the
+// package. So a candidate has to carry a kernel image, not merely a directory.
 //
-//	6.12.0-211.34.1.el10_2.x86_64
-//	6.12.0-211.34.1.el10_2.x86_64+debug
+// Ordering matters too, because these are version strings: a plain sort puts
+// 553.97.1 after 553.123.1, since "9" follows "1". That is how a leftover came to be
+// selected ahead of the real kernel in the field.
 //
-// os.ReadDir returns them sorted, so the debug tree came last and won; the install
-// then died at postscript with `dracut -f --omit luna --kver <...+debug>: exit 1`.
-// rocky8/rocky9 ship a single kernel, which is why this only surfaced on el10.
-// Prefer a non-debug tree; fall back to a debug-only one rather than failing outright
-// (an image that genuinely ships ONLY a debug kernel should still install).
+// Debug kernels keep their existing treatment: el10 installs kernel-debug-core
+// alongside the real kernel, so the rootfs holds both <ver>.x86_64 and
+// <ver>.x86_64+debug. Prefer a non-debug tree; fall back to a debug-only one rather
+// than failing (an image that genuinely ships ONLY a debug kernel should install).
+//
+// When nothing carries a kernel image the whole set is considered anyway, so this can
+// only ever choose better than before, never refuse an image that installs today.
+//
+// The kernel the installer itself booted is preferred over all of this, because Luna
+// builds the node's boot kernel from the osimage: in every mode that extracts the
+// image, the running version IS that image's kernel, which is the answer the rest of
+// this function is trying to infer. It is checked against the target root rather than
+// trusted, for "local" -- that mode installs a bootloader over an on-disk OS it did
+// not lay down, so the booted kernel need not be the one on the disk.
 func detectKernelVersion(sysroot string) (string, error) {
+	if k := runningKernelVersion(); k != "" && isInstalledKernel(sysroot, k) {
+		return k, nil
+	}
 	entries, err := os.ReadDir(filepath.Join(sysroot, "lib", "modules"))
 	if err != nil {
 		return "", fmt.Errorf("read %s/lib/modules: %w", sysroot, err)
 	}
-	var picked, debugOnly string
+	var installed, all []string
 	for _, e := range entries {
 		if !e.IsDir() {
 			continue
 		}
-		if isDebugKernelDir(e.Name()) {
-			debugOnly = e.Name()
+		all = append(all, e.Name())
+		if hasKernelImage(sysroot, e.Name()) {
+			installed = append(installed, e.Name())
+		}
+	}
+	pool := installed
+	if len(pool) == 0 {
+		pool = all
+	}
+	if picked := newestKernel(pool, false); picked != "" {
+		return picked, nil
+	}
+	if picked := newestKernel(pool, true); picked != "" {
+		return picked, nil
+	}
+	return "", fmt.Errorf("unable to determine target kernel version in %s/lib/modules", sysroot)
+}
+
+// runningKernelVersion is the version the installer itself is running. Package var
+// (not a plain func) so tests can pin it independently of the host the suite runs on.
+var runningKernelVersion = func() string {
+	b, err := os.ReadFile("/proc/sys/kernel/osrelease")
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+// isInstalledKernel reports whether this version is usable as a dracut target in the
+// given root: a module tree to build from, and a kernel image to boot afterwards.
+func isInstalledKernel(sysroot, kver string) bool {
+	fi, err := os.Stat(filepath.Join(sysroot, "lib", "modules", kver))
+	if err != nil || !fi.IsDir() {
+		return false
+	}
+	return hasKernelImage(sysroot, kver)
+}
+
+// hasKernelImage reports whether a kernel of this version is really installed.
+// Both markers are owned by the kernel package, so an erased kernel takes them with
+// it and leaves the unowned depmod output behind -- which is precisely the leftover
+// this distinguishes. /boot is also where GRUB has to find the kernel, so a version
+// failing this test could not have been booted either.
+func hasKernelImage(sysroot, kver string) bool {
+	return anyExist(sysroot,
+		filepath.Join("boot", "vmlinuz-"+kver),
+		filepath.Join("lib", "modules", kver, "vmlinuz"),
+	)
+}
+
+// newestKernel returns the highest-versioned name of the requested debug flavour,
+// or "" when the pool holds none of it.
+func newestKernel(names []string, debug bool) string {
+	best := ""
+	for _, n := range names {
+		if isDebugKernelDir(n) != debug {
 			continue
 		}
-		picked = e.Name() // last non-debug wins
+		if best == "" || compareKernelVersions(n, best) > 0 {
+			best = n
+		}
 	}
-	if picked == "" {
-		picked = debugOnly
+	return best
+}
+
+// compareKernelVersions orders two kernel version strings the way a human reads
+// them: each run of digits compares as a number, so 553.123.1 is newer than
+// 553.97.1 where a byte comparison puts 97 last. Identical digit sequences fall back
+// to a byte comparison so the ordering stays total.
+func compareKernelVersions(a, b string) int {
+	na, nb := versionNumbers(a), versionNumbers(b)
+	for i := 0; i < len(na) && i < len(nb); i++ {
+		// Longer means larger once leading zeros are gone, so no conversion to int
+		// is needed and no run length can overflow.
+		if len(na[i]) != len(nb[i]) {
+			if len(na[i]) < len(nb[i]) {
+				return -1
+			}
+			return 1
+		}
+		if c := strings.Compare(na[i], nb[i]); c != 0 {
+			return c
+		}
 	}
-	if picked == "" {
-		return "", fmt.Errorf("unable to determine target kernel version in %s/lib/modules", sysroot)
+	if len(na) != len(nb) {
+		if len(na) < len(nb) {
+			return -1
+		}
+		return 1
 	}
-	return picked, nil
+	return strings.Compare(a, b)
+}
+
+// versionNumbers returns every run of digits in order, each stripped of leading
+// zeros so that two runs can be compared by length and then bytewise.
+func versionNumbers(s string) []string {
+	var out []string
+	for i := 0; i < len(s); {
+		if s[i] < '0' || s[i] > '9' {
+			i++
+			continue
+		}
+		j := i
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+		}
+		run := strings.TrimLeft(s[i:j], "0")
+		if run == "" {
+			run = "0"
+		}
+		out = append(out, run)
+		i = j
+	}
+	return out
 }
 
 // isDebugKernelDir reports whether a /lib/modules entry is a debug kernel variant.
