@@ -212,18 +212,34 @@ _get_luna_ctty() {
 LUNA_FAILURE_FILE=/tmp/install_files/logs/last-failure.txt
 LUNA_SANITIZE_MARKER=/tmp/install_files/runtime/sanitize.done
 
+# luna_report <file>: print a final report on the console (and into the install
+# log through tee) and send the install log plus the report to the loghost.
+# The report is sent ON ITS OWN as well: the install log reaches the loghost only
+# through the file tee writes, and on a slow console (serial, 115200 baud) tee
+# lags behind by up to two pipe buffers, so the lines printed just before the
+# forward -- the reason a node parks or what sanitize erased -- were missing.
+luna_report() {
+    cat "$1"
+    if [ "$luna_loghost" ]; then
+        logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log   # as far as tee got
+        logger -d -n "$luna_loghost" -P 514 < "$1"
+    fi
+}
+
 # install_mode=sanitize finished: report what lpart-storage-prepare reported
 # (the marker content) and power off -- a retry would only erase again.
 luna_sanitize_stop() {
-    local _line
-    echo "Luna2: SANITIZE FINISHED -- lpart-storage-prepare reported:"
-    if [ -s "$LUNA_SANITIZE_MARKER" ]; then
-        while IFS= read -r _line || [ -n "$_line" ]; do echo "Luna2:   ${_line}"; done < "$LUNA_SANITIZE_MARKER"
-    else
-        echo "Luna2:   (no report was written -- check the install log)"
-    fi
-    echo "Luna2: install_mode=sanitize stops the node: powering off in 10 s (install.sh rc=$1)."
-    [ "$luna_loghost" ] && logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
+    local _line _r=/lunatmp/luna-report.txt
+    {
+        echo "Luna2: SANITIZE FINISHED -- lpart-storage-prepare reported:"
+        if [ -s "$LUNA_SANITIZE_MARKER" ]; then
+            while IFS= read -r _line || [ -n "$_line" ]; do echo "Luna2:   ${_line}"; done < "$LUNA_SANITIZE_MARKER"
+        else
+            echo "Luna2:   (no report was written -- check the install log)"
+        fi
+        echo "Luna2: install_mode=sanitize stops the node: powering off in 10 s (install.sh rc=$1)."
+    } > "$_r"
+    luna_report "$_r"
     sync
     sleep 10
     poweroff -f 2>/dev/null
@@ -235,17 +251,19 @@ luna_sanitize_stop() {
 # install.sh exit 2 (safety refusal) or 3 (non-retryable config error) recurs
 # on every attempt: show the reason, park in a shell, never retry.
 fatal_park() {
-    local _line
-    echo "Luna2: INSTALL FAILED (exit $1) -- NOT retrying."
-    if [ -s "$LUNA_FAILURE_FILE" ]; then
-        echo "Luna2: Reason (reported by lpart):"
-        while IFS= read -r _line || [ -n "$_line" ]; do echo "Luna2:   ${_line}"; done < "$LUNA_FAILURE_FILE"
-    else
-        echo "Luna2: The install script exited $1 (operator script or install step); see the log."
-    fi
-    echo "Luna2: Exit 2 and 3 are non-retryable: the node is parked. 'poweroff' stops it;"
-    echo "Luna2: exiting the shell re-opens it (no retry)."
-    [ "$luna_loghost" ] && logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
+    local _line _r=/lunatmp/luna-report.txt
+    {
+        echo "Luna2: INSTALL FAILED (exit $1) -- NOT retrying."
+        if [ -s "$LUNA_FAILURE_FILE" ]; then
+            echo "Luna2: Reason (reported by lpart):"
+            while IFS= read -r _line || [ -n "$_line" ]; do echo "Luna2:   ${_line}"; done < "$LUNA_FAILURE_FILE"
+        else
+            echo "Luna2: The install script exited $1 (operator script or install step); see the log."
+        fi
+        echo "Luna2: Exit 2 and 3 are non-retryable: the node is parked. 'poweroff' stops it;"
+        echo "Luna2: exiting the shell re-opens it (no retry)."
+    } > "$_r"
+    luna_report "$_r"
     while true; do
         if { exec 9<>"$luna_ctty"; } 2>/dev/null; then
             exec 9<&-
