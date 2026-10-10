@@ -65,6 +65,18 @@ install() {
     inst_multiple -o dhclient dhclient-script-luna ipmitool nslookup dig wget \
                      mkfs.ext2 mkfs.ext3 mkdosfs top lspci lsscsi efibootmgr script
 
+    # Filesystem checkers for lpart's health probe (internal/fscheck), named
+    # here instead of relying on dracut's fsck module: without them
+    # lpart-storage-check refuses to run (sysenv.StorageCheckCommands) and the
+    # sync/auto probe in lpart-storage-prepare cannot judge a set. e2fsck and
+    # xfs_repair are required; the FAT checker is fsck.vfat or fsck.fat
+    # (either will do), fsck.ext4 is e2fsck's alias.
+    dracut_install e2fsck xfs_repair
+    inst_multiple -o fsck.ext4 fsck.fat fsck.vfat
+    if ! type -P fsck.fat >/dev/null 2>&1 && ! type -P fsck.vfat >/dev/null 2>&1; then
+        derror "95luna: neither fsck.fat nor fsck.vfat found (dosfstools): lpart-storage-check cannot run"
+    fi
+
     # TPM TCTI + sqlite are needed for the token; the NSS/softokn set is a
     # redhat NSS-curl concern -- pull whatever the platform actually ships.
     inst_libdir_file -o libtss2-tcti-device.so.0 libsqlite3.so \
