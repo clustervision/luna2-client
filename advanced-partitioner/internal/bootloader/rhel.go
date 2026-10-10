@@ -170,55 +170,28 @@ func newestKernel(names []string, debug bool) string {
 	return best
 }
 
-// compareKernelVersions orders two kernel version strings the way a human reads
-// them: each run of digits compares as a number, so 553.123.1 is newer than
-// 553.97.1 where a byte comparison puts 97 last. Identical digit sequences fall back
-// to a byte comparison so the ordering stays total.
+// compareKernelVersions orders two kernel release strings (the names of the
+// /lib/modules directories, `uname -r` form) the way the package manager
+// does: the part before the first "-" is the version, the rest the release
+// (with arch and flavour, e.g. "553.5.1.el8_10.x86_64" or "91-generic"), and
+// each is compared with rpm's rpmvercmp -- version first, release only on a
+// tie. So 553.123.1 is newer than 553.97.1 (numeric runs compare by value),
+// and 553.5.1.el8_10 is newer than 553.el8_10 (a numeric run beats an
+// alphabetic one), which a digits-only comparison gets backwards.
+//
+// rpmvercmp calls two strings that differ only in separators or leading zeros
+// equal; those fall back to a byte comparison so the ordering stays total and
+// the choice never depends on readdir order.
 func compareKernelVersions(a, b string) int {
-	na, nb := versionNumbers(a), versionNumbers(b)
-	for i := 0; i < len(na) && i < len(nb); i++ {
-		// Longer means larger once leading zeros are gone, so no conversion to int
-		// is needed and no run length can overflow.
-		if len(na[i]) != len(nb[i]) {
-			if len(na[i]) < len(nb[i]) {
-				return -1
-			}
-			return 1
-		}
-		if c := strings.Compare(na[i], nb[i]); c != 0 {
-			return c
-		}
+	verA, relA, _ := strings.Cut(a, "-")
+	verB, relB, _ := strings.Cut(b, "-")
+	if c := rpmvercmp(verA, verB); c != 0 {
+		return c
 	}
-	if len(na) != len(nb) {
-		if len(na) < len(nb) {
-			return -1
-		}
-		return 1
+	if c := rpmvercmp(relA, relB); c != 0 {
+		return c
 	}
 	return strings.Compare(a, b)
-}
-
-// versionNumbers returns every run of digits in order, each stripped of leading
-// zeros so that two runs can be compared by length and then bytewise.
-func versionNumbers(s string) []string {
-	var out []string
-	for i := 0; i < len(s); {
-		if s[i] < '0' || s[i] > '9' {
-			i++
-			continue
-		}
-		j := i
-		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
-			j++
-		}
-		run := strings.TrimLeft(s[i:j], "0")
-		if run == "" {
-			run = "0"
-		}
-		out = append(out, run)
-		i = j
-	}
-	return out
 }
 
 // kernelNotNewestWarning returns the text to warn with when the initramfs was built

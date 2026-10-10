@@ -179,6 +179,21 @@ func TestCompareKernelVersions(t *testing.T) {
 		// two names with identical numbers still order, so the choice is never
 		// left to map or readdir order
 		{"4.18.0-553.007.1.el8_10.x86_64", "4.18.0-553.7.1.el8_10.x86_64", -1},
+		// the review finding: a z-stream respin adds a numeric run where the
+		// GA build has "el"; rpm (numeric beats alpha) calls the respin newer
+		{"4.18.0-553.el8_10.x86_64", "4.18.0-553.5.1.el8_10.x86_64", -1},
+		{"4.18.0-553.5.1.el8_10.x86_64", "4.18.0-553.el8_10.x86_64", 1},
+		{"5.14.0-503.el9.x86_64", "5.14.0-503.11.1.el9_5.x86_64", -1},
+		{"5.14.0-427.13.1.el9_4.x86_64", "5.14.0-503.11.1.el9_5.x86_64", -1},
+		{"5.14.0-70.13.1.el9_0.x86_64", "5.14.0-70.13.1.el9_0.x86_64+debug", -1},
+		{"6.12.0-55.el10.x86_64", "6.12.0-55.9.1.el10_0.x86_64", -1},
+		// the version decides before the release is looked at
+		{"5.14.0-1.el9.x86_64", "4.18.0-553.123.1.el8_10.x86_64", 1},
+		// Ubuntu: <version>-<abi>-<flavour>
+		{"5.15.0-91-generic", "5.15.0-101-generic", -1},
+		{"6.8.0-48-generic", "6.8.0-45-generic", 1},
+		{"6.8.0-1015-aws", "6.8.0-1009-aws", 1},
+		{"6.8.0-45-generic", "6.8.0-45-generic", 0},
 	}
 	for _, tc := range cases {
 		if got := compareKernelVersions(tc.a, tc.b); got != tc.want {
@@ -354,4 +369,89 @@ func TestKernelNotNewestWarning(t *testing.T) {
 			t.Errorf("expected silence, got: %s", got)
 		}
 	})
+}
+
+// TestRPMVerCmp pins the port against rpm's own test vectors
+// (tests/rpmvercmp.at), including the tilde and caret markers.
+func TestRPMVerCmp(t *testing.T) {
+	cases := []struct {
+		a, b string
+		want int
+	}{
+		{"1.0", "1.0", 0}, {"1.0", "2.0", -1}, {"2.0", "1.0", 1},
+		{"2.0.1", "2.0.1", 0}, {"2.0", "2.0.1", -1}, {"2.0.1", "2.0", 1},
+		{"2.0.1a", "2.0.1a", 0}, {"2.0.1a", "2.0.1", 1}, {"2.0.1", "2.0.1a", -1},
+		{"5.5p1", "5.5p1", 0}, {"5.5p1", "5.5p2", -1}, {"5.5p2", "5.5p1", 1},
+		{"5.5p10", "5.5p10", 0}, {"5.5p1", "5.5p10", -1}, {"5.5p10", "5.5p1", 1},
+		{"10xyz", "10.1xyz", -1}, {"10.1xyz", "10xyz", 1},
+		{"xyz10", "xyz10", 0}, {"xyz10", "xyz10.1", -1}, {"xyz10.1", "xyz10", 1},
+		{"xyz.4", "xyz.4", 0}, {"xyz.4", "8", -1}, {"8", "xyz.4", 1},
+		{"xyz.4", "2", -1}, {"2", "xyz.4", 1},
+		{"5.5p2", "5.6p1", -1}, {"5.6p1", "5.5p2", 1},
+		{"5.6p1", "6.5p1", -1}, {"6.5p1", "5.6p1", 1},
+		{"6.0.rc1", "6.0", 1}, {"6.0", "6.0.rc1", -1},
+		{"10b2", "10a1", 1}, {"10a2", "10b2", -1},
+		{"1.0aa", "1.0aa", 0}, {"1.0a", "1.0aa", -1}, {"1.0aa", "1.0a", 1},
+		{"10.0001", "10.0001", 0}, {"10.0001", "10.1", 0}, {"10.1", "10.0001", 0},
+		{"10.0001", "10.0039", -1}, {"10.0039", "10.0001", 1},
+		{"4.999.9", "5.0", -1}, {"5.0", "4.999.9", 1},
+		{"20101121", "20101121", 0}, {"20101121", "20101122", -1}, {"20101122", "20101121", 1},
+		{"2_0", "2_0", 0}, {"2.0", "2_0", 0}, {"2_0", "2.0", 0},
+		{"a", "a", 0}, {"a+", "a+", 0}, {"a+", "a_", 0}, {"a_", "a+", 0},
+		{"+a", "+a", 0}, {"+a", "_a", 0}, {"_a", "+a", 0},
+		{"+_", "+_", 0}, {"_+", "+_", 0}, {"_+", "_+", 0}, {"+", "_", 0}, {"_", "+", 0},
+		{"1b.fc17", "1b.fc17", 0}, {"1b.fc17", "1.fc17", -1}, {"1.fc17", "1b.fc17", 1},
+		{"1g.fc17", "1g.fc17", 0}, {"1g.fc17", "1.fc17", 1}, {"1.fc17", "1g.fc17", -1},
+		{"1.0~rc1", "1.0~rc1", 0}, {"1.0~rc1", "1.0", -1}, {"1.0", "1.0~rc1", 1},
+		{"1.0~rc1", "1.0~rc2", -1}, {"1.0~rc2", "1.0~rc1", 1},
+		{"1.0~rc1~git123", "1.0~rc1~git123", 0}, {"1.0~rc1~git123", "1.0~rc1", -1},
+		{"1.0~rc1", "1.0~rc1~git123", 1},
+		{"1.0^", "1.0^", 0}, {"1.0^", "1.0", 1}, {"1.0", "1.0^", -1},
+		{"1.0^git1", "1.0^git1", 0}, {"1.0^git1", "1.0", 1}, {"1.0", "1.0^git1", -1},
+		{"1.0^git1", "1.0^git2", -1}, {"1.0^git2", "1.0^git1", 1},
+		{"1.0^git1", "1.01", -1}, {"1.01", "1.0^git1", 1},
+		{"1.0^20160101", "1.0^20160101", 0}, {"1.0^20160101", "1.0.1", -1}, {"1.0.1", "1.0^20160101", 1},
+		{"1.0^20160101^git1", "1.0^20160101^git1", 0},
+		{"1.0^20160102", "1.0^20160101^git1", 1}, {"1.0^20160101^git1", "1.0^20160102", -1},
+		{"1.0~rc1^git1", "1.0~rc1^git1", 0}, {"1.0~rc1^git1", "1.0~rc1", 1}, {"1.0~rc1", "1.0~rc1^git1", -1},
+		{"1.0^git1~pre", "1.0^git1~pre", 0}, {"1.0^git1", "1.0^git1~pre", 1}, {"1.0^git1~pre", "1.0^git1", -1},
+	}
+	for _, tc := range cases {
+		if got := rpmvercmp(tc.a, tc.b); got != tc.want {
+			t.Errorf("rpmvercmp(%q, %q) = %d, want %d", tc.a, tc.b, got, tc.want)
+		}
+	}
+}
+
+// The GA kernel and its z-stream respin side by side, both installed: the
+// respin is the newer one, so it is the one picked and the one the warning
+// compares against.
+func TestDetectKernelVersionPrefersZStreamOverGA(t *testing.T) {
+	pinRunningKernel(t, "")
+	const ga, respin = "4.18.0-553.el8_10.x86_64", "4.18.0-553.5.1.el8_10.x86_64"
+	sysroot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(sysroot, "boot"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{ga, respin} {
+		if err := os.MkdirAll(filepath.Join(sysroot, "lib", "modules", k), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sysroot, "boot", "vmlinuz-"+k), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := detectKernelVersion(sysroot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != respin {
+		t.Errorf("picked %q, want the z-stream respin %q", got, respin)
+	}
+	if msg := kernelNotNewestWarning(sysroot, ga); !strings.Contains(msg, respin) {
+		t.Errorf("GA target must warn about the newer respin; got %q", msg)
+	}
+	if msg := kernelNotNewestWarning(sysroot, respin); msg != "" {
+		t.Errorf("respin is the newest; expected silence, got %q", msg)
+	}
 }
