@@ -383,8 +383,8 @@ func TestEnsureSignedPairStagedDebianFromUsrLib(t *testing.T) {
 			t.Fatalf("%s = %q, want %q", name, b, want)
 		}
 	}
-	if _, _, _, err := findSignedShimDir(filepath.Join(sysroot, "boot", "efi"), "x86_64"); err != nil {
-		t.Fatalf("findSignedShimDir after staging: %v", err)
+	if _, err := findSignedShim(sysroot, "x86_64"); err != nil {
+		t.Fatalf("findSignedShim after staging: %v", err)
 	}
 }
 
@@ -434,7 +434,7 @@ func TestEnsureSignedPairStagedSkipsWhenAlreadyStaged(t *testing.T) {
 
 // Missing sources -> a clear error naming the needed packages (families
 // with a source row); RHEL has no row so the miss is reported later by
-// findSignedShimDir instead.
+// findSignedShim instead.
 func TestEnsureSignedPairStagedMissingSources(t *testing.T) {
 	for _, fam := range []Family{FamilyDebian, FamilySUSE} {
 		sysroot := stageDebianSysroot(t, true)

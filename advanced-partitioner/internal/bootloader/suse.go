@@ -13,7 +13,7 @@ import (
 // the real config at /boot/grub2/grub.cfg, /etc/default/grub with the
 // same variable names, signed shim + grubx64.efi under
 // /boot/efi/EFI/<distro>/ (opensuse/sles - found by the generic
-// findSignedShimDir scan), and grub2-install for BIOS. The differences
+// findSignedShim scan), and grub2-install for BIOS. The differences
 // SUSE is known for (update-bootloader, perl-bootloader) are wrappers
 // around exactly these tools and are NOT used here - calling the tools
 // directly keeps one code path per action across families.

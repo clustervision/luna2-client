@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"unicode/utf16"
 
@@ -143,20 +144,30 @@ func signedPairSources(family Family, arch string) (signedPairSource, error) {
 			hint: "shim + grub2-x86_64-efi",
 		}, nil
 	default:
-		// FamilyRHEL: the image ships EFI/<distro>/ populated. FamilyNone
-		// never reaches the UEFI flow.
+		// FamilyRHEL: shim-x64 and grub2-efi-x64 install straight into
+		// /boot/efi/EFI/<vendor>/ and keep no copy under /usr, so there is
+		// nothing to stage from. A pair split across two vendor directories
+		// (shim in EFI/redhat, grub in EFI/rocky) is paired up by
+		// findSignedShim + pairSplitShim instead. FamilyNone never reaches
+		// the UEFI flow.
 		return signedPairSource{}, nil
 	}
 }
 
 // ensureSignedPairStaged populates <ESP>/EFI/<distro>/{shim,grub}<arch>.efi
-// from the family's source-table row when the ESP does not already hold a
-// signed pair. No-op when already staged (a pre-populated image, or an
-// earlier run) or when the family has no row (RHEL). One body for every
-// family — the per-family difference is data (signedPairSources), not code.
+// from the family's source-table row when the ESP does not already hold the
+// IMAGE'S signed pair. One body for every family -- the per-family difference
+// is data (signedPairSources), not code.
+//
+// "Already staged" means a same-directory pair in an EFI/<dir> that belongs to
+// the image's distro (os-release ID / ID_LIKE, see preferredESPDirs). A pair
+// left in another vendor's directory by an earlier image does not count: the
+// image's own pair is staged next to it and findSignedShim prefers it. When the
+// image's os-release is unreadable any pair counts, as before. No-op for a
+// family with no row (RHEL: the image ships EFI/<distro>/ populated).
 func ensureSignedPairStaged(opts StageSignedShimOpts) error {
-	espRoot := filepath.Join(opts.Sysroot, "boot", "efi")
-	if _, _, _, err := findSignedShimDir(espRoot, opts.Arch); err == nil {
+	existing, findErr := findSignedShim(opts.Sysroot, opts.Arch)
+	if findErr == nil && !existing.split() && (existing.preferred || len(preferredESPDirs(opts.Sysroot)) == 0) {
 		return nil // already staged
 	}
 	src, err := signedPairSources(opts.Family, opts.Arch)
@@ -165,24 +176,35 @@ func ensureSignedPairStaged(opts StageSignedShimOpts) error {
 	}
 	if len(src.shim) == 0 {
 		// Family expects a pre-populated ESP; StageSignedShim's own
-		// findSignedShimDir will report the miss with a clear error.
+		// findSignedShim will report the miss with a clear error.
 		return nil
 	}
 	shimName, grubName, err := archShimAndGrub(opts.Arch)
 	if err != nil {
 		return err
 	}
-	distro := espDistroDirName(opts.Sysroot)
-	destDir := filepath.Join(espRoot, "EFI", distro)
-	if err := opts.FS.MkdirAll(destDir, 0o755); err != nil {
-		return fmt.Errorf("mkdir %s: %w", destDir, err)
-	}
 	shimSrc := firstExistingAbs(prefixSysroot(opts.Sysroot, src.shim)...)
 	grubSrc := firstExistingAbs(prefixSysroot(opts.Sysroot, src.grub)...)
 	if shimSrc == "" || grubSrc == "" {
-		return fmt.Errorf(
+		if findErr == nil {
+			// The image has no package copy to stage from, but the ESP does
+			// hold a usable pair: use it rather than refuse an image that
+			// installed before this check existed.
+			if opts.Logger != nil {
+				opts.Logger.Warn(fmt.Sprintf(
+					"%s signed shim/grub not found under /usr in the image (need the %s packages); "+
+						"using the pair already on the ESP in %s", opts.Family, src.hint, existing.dir))
+			}
+			return nil
+		}
+		return imageErrorf("image-no-signed-shim",
 			"%s signed shim/grub not found in image (shim=%q grub=%q); need the %s packages",
 			opts.Family, shimSrc, grubSrc, src.hint)
+	}
+	distro := espDistroDirName(opts.Sysroot)
+	destDir := filepath.Join(opts.Sysroot, "boot", "efi", "EFI", distro)
+	if err := opts.FS.MkdirAll(destDir, 0o755); err != nil {
+		return fmt.Errorf("mkdir %s: %w", destDir, err)
 	}
 	if err := copyEFIFile(opts.FS, shimSrc, filepath.Join(destDir, shimName)); err != nil {
 		return fmt.Errorf("stage signed shim: %w", err)
@@ -280,19 +302,34 @@ func StageSignedShim(opts StageSignedShimOpts) error {
 		return fmt.Errorf("StageSignedShim: %w", err)
 	}
 
-	distroDir, shimPath, grubPath, err := findSignedShimDir(espRoot, opts.Arch)
+	sel, err := findSignedShim(opts.Sysroot, opts.Arch)
 	if err != nil {
 		return fmt.Errorf("StageSignedShim: %w", err)
 	}
+	distroDir, shimPath, grubPath := sel.dir, sel.shim, sel.grub
 
 	bootUUID := pickBootFSUUID(opts.StorageResult)
 	if bootUUID == "" {
-		return fmt.Errorf("StageSignedShim: no /boot filesystem UUID in storage-result (signed-shim path requires a separate /boot mount)")
+		return configErrorf("no-separate-boot", "StageSignedShim: no /boot filesystem UUID in storage-result (signed-shim path requires a separate /boot mount)")
+	}
+
+	if sel.split() {
+		if err := pairSplitShim(opts, sel); err != nil {
+			return err
+		}
 	}
 
 	stubPath := filepath.Join(distroDir, "grub.cfg")
 	if err := writeStubGrubCfg(opts.FS, stubPath, bootUUID, opts.GrubDirName); err != nil {
 		return fmt.Errorf("write stub %s: %w", stubPath, err)
+	}
+	if sel.split() {
+		// The signed grub's compiled-in prefix still names the directory it
+		// was packaged for, so give it the same stub there too.
+		stub := filepath.Join(sel.grubDir, "grub.cfg")
+		if err := writeStubGrubCfg(opts.FS, stub, bootUUID, opts.GrubDirName); err != nil {
+			return fmt.Errorf("write stub %s: %w", stub, err)
+		}
 	}
 
 	fallbackName, err := fallbackLoaderBaseName(opts.Arch)
@@ -347,41 +384,226 @@ func archShimAndGrub(arch string) (shim string, grub string, err error) {
 	}
 }
 
-// findSignedShimDir returns the first directory under
-// <espRoot>/EFI/* that contains both the per-arch shim and grub
-// binaries. The /EFI/BOOT/ removable-media directory is skipped
-// because it does not represent the distro-owned signed pair.
-func findSignedShimDir(espRoot, arch string) (distroDir, shimPath, grubPath string, err error) {
+// signedShim is the signed pair findSignedShim chose on the ESP.
+type signedShim struct {
+	dir  string // <ESP>/EFI/<vendor> holding the shim; firmware loads it from here
+	shim string
+	// grub is the signed grub found for this shim: <dir>/grub<arch>.efi for a
+	// same-directory pair, else the copy in grubDir (another vendor dir of the
+	// same image), which pairSplitShim copies next to the shim.
+	grub    string
+	grubDir string
+	// preferred: dir belongs to the image's distro (os-release ID/ID_LIKE).
+	preferred bool
+}
+
+// split reports whether grub lives in a different directory from the shim.
+func (s signedShim) split() bool { return s.grubDir != s.dir }
+
+// findSignedShim picks the signed shim and grub on <sysroot>/boot/efi/EFI/*.
+// EFI/BOOT (the removable path) is skipped; it is not a distro-owned pair.
+//
+// Order of preference:
+//  1. directories that belong to the image's distro (preferredESPDirs, in its
+//     order), so a stale EFI/redhat left by an earlier image does not beat
+//     the EFI/rocky of the one just installed;
+//  2. within that, a directory holding both binaries;
+//  3. then by name -- the previous behaviour, kept for images whose
+//     os-release names no known vendor directory.
+//
+// A shim whose grub is not beside it is still usable when another EFI/<vendor>
+// directory of the same image holds the grub: RHEL 8 images have been seen
+// with shimx64.efi only in EFI/redhat and grubx64.efi only in EFI/rocky (and the
+// other way round). Such a split pair is returned with grubDir set; the caller
+// copies the grub next to the shim, because shim loads its second stage from
+// its own directory.
+func findSignedShim(sysroot, arch string) (signedShim, error) {
 	shimName, grubName, err := archShimAndGrub(arch)
 	if err != nil {
-		return "", "", "", err
+		return signedShim{}, err
 	}
-	efiRoot := filepath.Join(espRoot, "EFI")
+	efiRoot := filepath.Join(sysroot, "boot", "efi", "EFI")
 	entries, err := os.ReadDir(efiRoot)
 	if err != nil {
-		return "", "", "", fmt.Errorf("read %s: %w", efiRoot, err)
+		return signedShim{}, imageErrorf("image-no-signed-shim", "read %s: %v", efiRoot, err)
 	}
+	preferred := preferredESPDirs(sysroot)
+	rank := func(name string) int {
+		for i, p := range preferred {
+			if strings.EqualFold(p, name) {
+				return i
+			}
+		}
+		return len(preferred)
+	}
+	type cand struct {
+		name       string
+		shim, grub bool
+		rank       int
+	}
+	var cands []cand
 	for _, e := range entries {
-		if !e.IsDir() {
+		if !e.IsDir() || strings.EqualFold(e.Name(), "BOOT") {
 			continue
 		}
-		if strings.EqualFold(e.Name(), "BOOT") {
-			continue
+		dir := filepath.Join(efiRoot, e.Name())
+		c := cand{
+			name: e.Name(),
+			shim: fileExists(filepath.Join(dir, shimName)),
+			grub: fileExists(filepath.Join(dir, grubName)),
+			rank: rank(e.Name()),
 		}
-		cand := filepath.Join(efiRoot, e.Name())
-		s := filepath.Join(cand, shimName)
-		g := filepath.Join(cand, grubName)
-		if _, err := os.Stat(s); err != nil {
-			continue
+		if c.shim || c.grub {
+			cands = append(cands, c)
 		}
-		if _, err := os.Stat(g); err != nil {
-			continue
-		}
-		return cand, s, g, nil
 	}
-	return "", "", "", fmt.Errorf(
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, b := cands[i], cands[j]
+		if a.rank != b.rank {
+			return a.rank < b.rank
+		}
+		if (a.shim && a.grub) != (b.shim && b.grub) {
+			return a.shim && a.grub
+		}
+		return a.name < b.name
+	})
+	var grubDir string
+	for _, c := range cands {
+		if c.grub {
+			grubDir = filepath.Join(efiRoot, c.name)
+			break
+		}
+	}
+	for _, c := range cands {
+		if !c.shim {
+			continue
+		}
+		dir := filepath.Join(efiRoot, c.name)
+		sel := signedShim{dir: dir, shim: filepath.Join(dir, shimName), preferred: c.rank < len(preferred)}
+		switch {
+		case c.grub:
+			sel.grubDir = dir
+		case grubDir != "":
+			sel.grubDir = grubDir
+		default:
+			continue
+		}
+		sel.grub = filepath.Join(sel.grubDir, grubName)
+		return sel, nil
+	}
+	return signedShim{}, imageErrorf("image-no-signed-shim",
 		"no signed shim+grub found under %s (need <distro>/{%s,%s} from the shim-* and grub2-efi-* / grub-efi-amd64-signed packages in the OS image)",
 		efiRoot, shimName, grubName)
+}
+
+// pairSplitShim copies a split pair's grub (and MokManager, when only the
+// grub's directory has one) next to the shim. Shim chain-loads grub<arch>.efi
+// from the directory it was itself loaded from, so without the copy the NVRAM
+// entry and the removable fallback both stop at "Failed to open grubx64.efi".
+func pairSplitShim(opts StageSignedShimOpts, sel signedShim) error {
+	if opts.Logger != nil {
+		opts.Logger.Warn(fmt.Sprintf(
+			"the image's signed shim is in %s but its grub only in %s: copying grub next to the shim "+
+				"(with Secure Boot on, both must be signed by the same vendor)", sel.dir, sel.grubDir))
+	}
+	dst := filepath.Join(sel.dir, filepath.Base(sel.grub))
+	if err := copyEFIFile(opts.FS, sel.grub, dst); err != nil {
+		return fmt.Errorf("copy %s -> %s: %w", sel.grub, dst, err)
+	}
+	mm, err := archMokManager(opts.Arch)
+	if err != nil {
+		return err
+	}
+	if src := filepath.Join(sel.grubDir, mm); fileExists(src) && !fileExists(filepath.Join(sel.dir, mm)) {
+		if err := copyEFIFile(opts.FS, src, filepath.Join(sel.dir, mm)); err != nil {
+			return fmt.Errorf("copy %s -> %s: %w", src, sel.dir, err)
+		}
+	}
+	return nil
+}
+
+// archMokManager is shim's MokManager binary name for arch.
+func archMokManager(arch string) (string, error) {
+	switch arch {
+	case "x86_64", "amd64":
+		return "mmx64.efi", nil
+	case "aarch64", "arm64":
+		return "mmaa64.efi", nil
+	default:
+		return "", fmt.Errorf("unsupported UEFI shim architecture: %s", arch)
+	}
+}
+
+func fileExists(p string) bool {
+	fi, err := os.Stat(p)
+	return err == nil && !fi.IsDir()
+}
+
+// espVendorDirs maps an os-release ID / ID_LIKE word to the EFI/<dir> names
+// that distro's shim and grub packages install into.
+var espVendorDirs = map[string][]string{
+	"rocky":               {"rocky"},
+	"rhel":                {"redhat"},
+	"redhat":              {"redhat"},
+	"centos":              {"centos"},
+	"almalinux":           {"almalinux"},
+	"alma":                {"almalinux"},
+	"ol":                  {"ol", "redhat"}, // Oracle Linux ships EFI/redhat
+	"fedora":              {"fedora"},
+	"ubuntu":              {"ubuntu"},
+	"debian":              {"debian"},
+	"opensuse":            {"opensuse"},
+	"opensuse-leap":       {"opensuse"},
+	"opensuse-tumbleweed": {"opensuse"},
+	"sles":                {"sles"},
+	"sled":                {"sles"},
+	"suse":                {"opensuse", "sles"},
+}
+
+// preferredESPDirs returns, in order of preference, the EFI/<dir> names that
+// belong to the image's distro: os-release ID first (as is -- it is also the
+// name ensureSignedPairStaged stages into), then its vendor directories, then
+// the same for every ID_LIKE word. Empty when os-release is unreadable.
+func preferredESPDirs(sysroot string) []string {
+	var out []string
+	seen := map[string]bool{}
+	add := func(d string) {
+		if d != "" && !seen[d] {
+			seen[d] = true
+			out = append(out, d)
+		}
+	}
+	for _, id := range osReleaseIDs(sysroot) {
+		add(id)
+		for _, d := range espVendorDirs[id] {
+			add(d)
+		}
+	}
+	return out
+}
+
+// osReleaseIDs returns the image's os-release ID followed by its ID_LIKE
+// words, lowercased.
+func osReleaseIDs(sysroot string) []string {
+	body, err := os.ReadFile(filepath.Join(sysroot, "etc", "os-release")) //nolint:gosec // sysroot file
+	if err != nil {
+		return nil
+	}
+	var id string
+	var like []string
+	for _, ln := range strings.Split(string(body), "\n") {
+		ln = strings.TrimSpace(ln)
+		switch {
+		case strings.HasPrefix(ln, "ID="):
+			id = strings.ToLower(unquote(strings.TrimPrefix(ln, "ID=")))
+		case strings.HasPrefix(ln, "ID_LIKE="):
+			like = strings.Fields(strings.ToLower(unquote(strings.TrimPrefix(ln, "ID_LIKE="))))
+		}
+	}
+	if id == "" {
+		return like
+	}
+	return append([]string{id}, like...)
 }
 
 // writeStubGrubCfg renders the stub grub.cfg at path. bootFSUUID

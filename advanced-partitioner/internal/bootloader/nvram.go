@@ -545,9 +545,9 @@ func signedShimLoaderPath(sysroot, arch string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	distroDir, _, _, err := findSignedShimDir(filepath.Join(sysroot, "boot", "efi"), arch)
+	sel, err := findSignedShim(sysroot, arch)
 	if err != nil {
 		return "", false
 	}
-	return `\EFI\` + filepath.Base(distroDir) + `\` + shimName, true
+	return `\EFI\` + filepath.Base(sel.dir) + `\` + shimName, true
 }
