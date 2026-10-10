@@ -385,3 +385,58 @@ func TestRulePersistentDataOnly(t *testing.T) {
 			"persistent=true requires selection=manual"},
 	})
 }
+
+// A raid1/raid10 os set without a /boot volume is buildable (its /boot lives
+// on the root LV; the raid builder creates the -boot array only for a declared
+// /boot volume), so it validates, and BootMirrorDevice over the set's volumes
+// never names a -boot array for it: the health probe and the mount predictor
+// must not look for a device that was never created.
+func TestBootMirrorDeviceOnlyForDeclaredBootVolume(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		json string
+	}{
+		{"raid1", lay(set(osManual("os", "1", "/dev/sda", "/dev/sdb"), espVol(), rootLV()))},
+		{"raid10", lay(set(osManual("os-a", "10", "/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd"), espVol(), rootLV()))},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			cfg, err := Parse([]byte(c.json))
+			if err != nil {
+				t.Fatalf("Parse: %v", err)
+			}
+			if err := cfg.ValidateRaw([]byte(c.json)); err != nil {
+				t.Fatalf("a mirrored os set without /boot must validate: %v", err)
+			}
+			s := cfg.OSSet()
+			md := s.MDName()
+			for _, v := range s.Volumes {
+				got := s.BootMirrorDevice(v)
+				want := ""
+				if v.Mountpoint == "/boot/efi" {
+					want = "/dev/md/" + md + "-efi"
+				}
+				if got != want {
+					t.Errorf("BootMirrorDevice(%s) = %q, want %q", v.Name, got, want)
+				}
+			}
+		})
+	}
+
+	// With a /boot volume the -boot array is named; raid0 mirrors nothing.
+	withBoot := Set{Name: "os", Role: "os", Raid: "1", Volumes: []Volume{
+		{Name: "uefi", Mountpoint: "/boot/efi", FS: "vfat", Provider: "partition", Size: "600M"},
+		{Name: "boot", Mountpoint: "/boot", FS: "xfs", Provider: "partition", Size: "1G"},
+		{Name: "root", Mountpoint: "/", FS: "xfs", Provider: "lvm", Size: "100%"},
+	}}
+	if got := withBoot.BootMirrorDevice(withBoot.Volumes[1]); got != "/dev/md/os-boot" {
+		t.Errorf("raid1 /boot = %q, want /dev/md/os-boot", got)
+	}
+	if got := withBoot.BootMirrorDevice(withBoot.Volumes[0]); got != "/dev/md/os-efi" {
+		t.Errorf("raid1 /boot/efi = %q, want /dev/md/os-efi", got)
+	}
+	striped := withBoot
+	striped.Raid = "0"
+	if got := striped.BootMirrorDevice(striped.Volumes[1]); got != "" {
+		t.Errorf("raid0 /boot = %q, want \"\" (raid0 does not mirror the boot chain)", got)
+	}
+}

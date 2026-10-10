@@ -263,6 +263,11 @@ func (s *Set) PartitionNumber(vol Volume, biosBoot bool) int {
 // these md devices; the health probe and the filesystem predictor must agree,
 // or a raid1 set's ESP/boot is checked/mounted at the raw partition (which is a
 // linux_raid_member) and fails. Single source for that rule.
+//
+// It keys on the volume it is handed, never on the raid level alone: callers
+// pass the set's own volumes, so a mirrored os set without a /boot volume
+// (its /boot lives on the root filesystem) never yields the "-boot" array,
+// which the raid builder does not create for it.
 func (s *Set) BootMirrorDevice(vol Volume) string {
 	if !s.MirrorsBoot() || vol.Provider != "partition" {
 		return ""
