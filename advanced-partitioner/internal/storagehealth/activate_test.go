@@ -30,7 +30,8 @@ func TestAssembleExplicitUsesExaminedMembers(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("want 1 assemble call, got %v", got)
 	}
-	want := []string{"mdadm", "--assemble", "/dev/md/data", "/dev/vdb1", "/dev/vdc1"}
+	// --run: a degraded array (a member missing) must still start.
+	want := []string{"mdadm", "--assemble", "--run", "/dev/md/data", "/dev/vdb1", "/dev/vdc1"}
 	if strings.Join(got[0], " ") != strings.Join(want, " ") {
 		t.Fatalf("assemble argv = %v, want %v", got[0], want)
 	}
@@ -62,5 +63,21 @@ func TestMDSuperblockNameParsing(t *testing.T) {
 		if got := mdSuperblockName(context.Background(), fake, "/dev/vdb1"); got != tc.want {
 			t.Fatalf("mdSuperblockName(%q) = %q, want %q", tc.out, got, tc.want)
 		}
+	}
+}
+
+// One mirror disk dead: the surviving member alone is assembled with --run so
+// the degraded array starts (without --run mdadm leaves it inactive).
+func TestAssembleExplicitStartsDegradedArray(t *testing.T) {
+	fake := executor.NewFakeRunner(executor.FakeResponse{})
+	fake.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME,TYPE", "/dev/vdc"},
+		Response: executor.FakeResponse{Stdout: []byte("vdc disk\nvdc1 part\n")}})
+	fake.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine"},
+		Response: executor.FakeResponse{Stdout: []byte("           Name : any:os  (local to host any)\n")}})
+	var got [][]string
+	run := func(path string, args ...string) { got = append(got, append([]string{path}, args...)) }
+	assembleExplicit(context.Background(), fake, "os", []string{"/dev/vdc"}, run, nil)
+	if len(got) != 1 || strings.Join(got[0], " ") != "mdadm --assemble --run /dev/md/os /dev/vdc1" {
+		t.Fatalf("degraded assemble = %v, want mdadm --assemble --run /dev/md/os /dev/vdc1", got)
 	}
 }

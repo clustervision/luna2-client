@@ -85,6 +85,12 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 // assembleExplicit assembles /dev/md/<mdName> from the member partitions it
 // finds on the given disks (mdadm --examine, superblock Name match). No
 // members found is a no-op: the array may already be running.
+//
+// --run starts the array even when a member is missing (degraded): without it
+// mdadm assembles but leaves a degraded array inactive, so a node with one
+// dead mirror disk could never mount its OS again (sync parked, auto recreated
+// on the surviving disk, a persistent raid set parked). mdadm still refuses
+// when too few members remain for the level to run at all.
 func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string, disks []string, run func(string, ...string), logger *txlog.Logger) {
 	var members []string
 	for _, d := range disks {
@@ -100,7 +106,7 @@ func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string
 		}
 		return
 	}
-	run("mdadm", append([]string{"--assemble", "/dev/md/" + mdName}, members...)...)
+	run("mdadm", append([]string{"--assemble", "--run", "/dev/md/" + mdName}, members...)...)
 }
 
 // partitionsOn lists the partition device paths on one disk. KNAME, not PATH:
