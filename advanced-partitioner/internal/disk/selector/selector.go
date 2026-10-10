@@ -42,6 +42,43 @@ type Resolved struct {
 	Serial         string          `json:"serial"`
 }
 
+// ErrorKind classifies a resolution failure for the caller's exit contract.
+type ErrorKind int
+
+const (
+	// KindProbe: a probe command failed (lsblk error): environmental, may
+	// clear on retry.
+	KindProbe ErrorKind = iota
+	// KindNotFound: the configured device does not exist on this node.
+	KindNotFound
+	// KindInvalid: the device exists but cannot be used as configured (not
+	// a whole disk, read-only, malformed path): deterministic.
+	KindInvalid
+	// KindInUse: the disk (or something on it) is mounted or active swap.
+	KindInUse
+)
+
+// ErrNotFound is matched (errors.Is) by a KindNotFound ResolveError.
+var ErrNotFound = errors.New("device not found")
+
+// ResolveError is every failure Resolve returns; Kind tells a missing disk
+// from a deterministic misconfiguration and from a transient probe failure.
+type ResolveError struct {
+	Kind ErrorKind
+	// Device is the configured path the error is about.
+	Device string
+	Msg    string
+}
+
+func (e *ResolveError) Error() string { return e.Msg }
+
+// Is makes errors.Is(err, ErrNotFound) true for a missing device.
+func (e *ResolveError) Is(target error) bool { return target == ErrNotFound && e.Kind == KindNotFound }
+
+func resolveErr(kind ErrorKind, device, format string, args ...any) error {
+	return &ResolveError{Kind: kind, Device: device, Msg: fmt.Sprintf(format, args...)}
+}
+
 // Options configures a Resolver. Tests typically pin every Dir to a
 // t.TempDir() with synthetic symlinks.
 type Options struct {
@@ -132,7 +169,7 @@ func (r *Resolver) ResolveAll(ctx context.Context, paths []string) ([]Resolved, 
 func (r *Resolver) Resolve(ctx context.Context, configured string) (Resolved, error) {
 	selType, err := v2.SelectorTypeOf(configured)
 	if err != nil {
-		return Resolved{}, fmt.Errorf("device_resolution: %w", err)
+		return Resolved{}, resolveErr(KindInvalid, configured, "device_resolution: %v", err)
 	}
 
 	if selType == v2.SelectorDevicePaths && r.o.Logger != nil {
@@ -158,10 +195,10 @@ func (r *Resolver) Resolve(ctx context.Context, configured string) (Resolved, er
 	// Whole-disk check via lsblk -dn -o TYPE.
 	typ, err := r.lsblkScalar(ctx, resolved, "TYPE", false)
 	if err != nil {
-		return Resolved{}, fmt.Errorf("device_resolution: lsblk TYPE %s: %w", resolved, err)
+		return Resolved{}, resolveErr(KindProbe, configured, "device_resolution: lsblk TYPE %s: %v", resolved, err)
 	}
 	if typ != "disk" {
-		return Resolved{}, fmt.Errorf(
+		return Resolved{}, resolveErr(KindInvalid, configured,
 			"device_resolution: selected path is not a whole disk: %s -> %s (type=%q)",
 			configured, resolved, typ)
 	}
@@ -181,7 +218,7 @@ func (r *Resolver) Resolve(ctx context.Context, configured string) (Resolved, er
 		CaptureStdout: true, CaptureStderr: true,
 	})
 	if mountErr != nil {
-		return Resolved{}, fmt.Errorf(
+		return Resolved{}, resolveErr(KindProbe, configured,
 			"device_resolution: cannot determine whether %s is in use (lsblk MOUNTPOINT: %v) - refusing (fail-closed)",
 			resolved, mountErr)
 	}
@@ -191,10 +228,10 @@ func (r *Resolver) Resolve(ctx context.Context, configured string) (Resolved, er
 			continue
 		}
 		if mp == "[SWAP]" {
-			return Resolved{}, fmt.Errorf(
+			return Resolved{}, resolveErr(KindInUse, configured,
 				"device_resolution: selected disk %s (or a partition on it) is active swap - refusing", resolved)
 		}
-		return Resolved{}, fmt.Errorf(
+		return Resolved{}, resolveErr(KindInUse, configured,
 			"device_resolution: selected disk %s (or a partition/volume on it) is mounted at %s - refusing",
 			resolved, mp)
 	}
@@ -202,10 +239,10 @@ func (r *Resolver) Resolve(ctx context.Context, configured string) (Resolved, er
 	// Read-only check.
 	ro, err := r.lsblkScalar(ctx, resolved, "RO", false)
 	if err != nil {
-		return Resolved{}, fmt.Errorf("device_resolution: lsblk RO %s: %w", resolved, err)
+		return Resolved{}, resolveErr(KindProbe, configured, "device_resolution: lsblk RO %s: %v", resolved, err)
 	}
 	if ro != "0" {
-		return Resolved{}, fmt.Errorf("device_resolution: selected disk is read-only: %s", resolved)
+		return Resolved{}, resolveErr(KindInvalid, configured, "device_resolution: selected disk is read-only: %s", resolved)
 	}
 
 	rec := Resolved{
@@ -216,19 +253,19 @@ func (r *Resolver) Resolve(ctx context.Context, configured string) (Resolved, er
 
 	sizeStr, err := r.lsblkScalar(ctx, resolved, "SIZE", true)
 	if err != nil {
-		return Resolved{}, fmt.Errorf("device_resolution: lsblk SIZE %s: %w", resolved, err)
+		return Resolved{}, resolveErr(KindProbe, configured, "device_resolution: lsblk SIZE %s: %v", resolved, err)
 	}
 	if _, err := fmt.Sscanf(sizeStr, "%d", &rec.SizeBytes); err != nil {
-		return Resolved{}, fmt.Errorf(
-			"device_resolution: lsblk SIZE %s: unexpected output %q: %w",
+		return Resolved{}, resolveErr(KindProbe, configured,
+			"device_resolution: lsblk SIZE %s: unexpected output %q: %v",
 			resolved, sizeStr, err)
 	}
 
 	if rec.Model, err = r.lsblkScalar(ctx, resolved, "MODEL", false); err != nil {
-		return Resolved{}, fmt.Errorf("device_resolution: lsblk MODEL %s: %w", resolved, err)
+		return Resolved{}, resolveErr(KindProbe, configured, "device_resolution: lsblk MODEL %s: %v", resolved, err)
 	}
 	if rec.Serial, err = r.lsblkScalar(ctx, resolved, "SERIAL", false); err != nil {
-		return Resolved{}, fmt.Errorf("device_resolution: lsblk SERIAL %s: %w", resolved, err)
+		return Resolved{}, resolveErr(KindProbe, configured, "device_resolution: lsblk SERIAL %s: %v", resolved, err)
 	}
 
 	return rec, nil
@@ -268,7 +305,7 @@ func (r *Resolver) notFoundError(ctx context.Context, requested string, selType 
 		writeCandidates(w, "by-uuid", r.o.ByUUIDDir)
 		r.writeLsblkCandidates(ctx, w)
 	}
-	return fmt.Errorf(
+	return resolveErr(KindNotFound, requested,
 		"device_resolution: device not found: %s (selector=%s, json=%s)",
 		requested, selType, jsonLabel)
 }
