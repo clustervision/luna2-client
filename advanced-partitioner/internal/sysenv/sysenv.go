@@ -19,6 +19,7 @@
 package sysenv
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -96,8 +97,25 @@ func KernelParam(opts Options, key string) (value string, ok bool) {
 	return "", false
 }
 
+// ErrHostMismatch is matched (errors.Is) when the node is not the expected
+// host: a deterministic refusal, unlike a failure to read the hostname.
+var ErrHostMismatch = errors.New("host mismatch")
+
+// shortHost is the `hostname -s` form: up to the first dot, lower-cased
+// (host names are case-insensitive).
+func shortHost(h string) string {
+	h = strings.TrimSpace(h)
+	if dot := strings.IndexByte(h, '.'); dot >= 0 {
+		h = h[:dot]
+	}
+	return strings.ToLower(h)
+}
+
 // RequireExpectedHost ensures the local hostname matches expected when
-// non-empty. Mirrors require_expected_host.
+// non-empty. Mirrors require_expected_host. Both sides are compared as short
+// names: the pipeline passes $_HOSTNAME, which Luna may set to the FQDN
+// ("node001.cluster"), and stripping the domain only from the local name
+// refused every such node as a "mismatch".
 func RequireExpectedHost(expected string, opts Options) error {
 	if expected == "" {
 		return nil
@@ -111,15 +129,11 @@ func RequireExpectedHost(expected string, opts Options) error {
 		return fmt.Errorf("hostname: %w", err)
 	}
 	// os.Hostname returns the FQDN on some kernels; the bash version
-	// uses `hostname -s`. Strip everything after the first dot to
-	// match the short-name semantics.
-	if dot := strings.IndexByte(current, '.'); dot >= 0 {
-		current = current[:dot]
-	}
-	if current != expected {
+	// uses `hostname -s`. Compare short names on BOTH sides.
+	if shortHost(current) != shortHost(expected) {
 		return fmt.Errorf(
-			"refusing destructive execution on host %s; expected %s",
-			current, expected)
+			"%w: refusing destructive execution on host %s; expected %s",
+			ErrHostMismatch, shortHost(current), expected)
 	}
 	return nil
 }

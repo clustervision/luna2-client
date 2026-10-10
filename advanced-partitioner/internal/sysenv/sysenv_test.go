@@ -1,6 +1,7 @@
 package sysenv
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,6 +65,36 @@ func TestRequireExpectedHostMismatch(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "expected node001") {
 		t.Fatalf("expected mismatch error; got %v", err)
+	}
+	if !errors.Is(err, ErrHostMismatch) {
+		t.Fatalf("a mismatch must match ErrHostMismatch: %v", err)
+	}
+}
+
+// $_HOSTNAME may be the FQDN: the expected name is reduced to its short form
+// too (the local name always was), and case does not matter.
+func TestRequireExpectedHostFQDNOnBothSides(t *testing.T) {
+	for _, c := range []struct{ expected, local string }{
+		{"node001.cluster", "node001"},
+		{"node001.cluster", "node001.cluster"},
+		{"node001.cluster", "node001.other"},
+		{"NODE001", "node001.cluster"},
+	} {
+		if err := RequireExpectedHost(c.expected, Options{
+			Hostname: func() (string, error) { return c.local, nil },
+		}); err != nil {
+			t.Errorf("expected %q vs local %q must match: %v", c.expected, c.local, err)
+		}
+	}
+	if err := RequireExpectedHost("node001.cluster", Options{
+		Hostname: func() (string, error) { return "node0012.cluster", nil },
+	}); !errors.Is(err, ErrHostMismatch) {
+		t.Fatalf("a different short name must still mismatch: %v", err)
+	}
+	if err := RequireExpectedHost("node001", Options{
+		Hostname: func() (string, error) { return "", errors.New("uname failed") },
+	}); err == nil || errors.Is(err, ErrHostMismatch) {
+		t.Fatalf("a hostname read failure is not a mismatch: %v", err)
 	}
 }
 
