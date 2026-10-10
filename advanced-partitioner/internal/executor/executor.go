@@ -111,6 +111,13 @@ func New(opts Options) Runner {
 	return real
 }
 
+// IsDryRun reports whether r is the dry-run runner, for callers that also
+// mutate the filesystem directly (mkdir before a stubbed mount).
+func IsDryRun(r Runner) bool {
+	_, ok := r.(*dryRunRunner)
+	return ok
+}
+
 // Options controls Runner construction.
 type Options struct {
 	// DryRun selects the no-op runner.

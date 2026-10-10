@@ -679,8 +679,12 @@ if [ "x$root" = "xluna" ]; then
                 # buffer so ipmi/driver errors survive for the shell + loghost.
                 dmesg > /tmp/luna_install.dmesg.last 2>/dev/null || true
             fi
-            if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
-                readable_log < /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
+            if [ "$RES" != "success" ]; then
+                # keep the failed attempt's log locally (the banners point the
+                # operator to it), with or without a loghost
+                if [ "$luna_loghost" ]; then
+                    readable_log < /tmp/luna_install.log | logger -d -n "$luna_loghost" -P 514
+                fi
                 cat /tmp/luna_install.log > /tmp/luna_install.log.prev
                 if [ ! -f /tmp/luna_install.log.first ]; then
                     cat /tmp/luna_install.log > /tmp/luna_install.log.first
