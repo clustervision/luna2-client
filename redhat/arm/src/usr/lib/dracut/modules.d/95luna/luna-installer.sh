@@ -492,23 +492,20 @@ function fatal_park () {
     local ctty="${luna_ctty:-/dev/tty1}"
     echo ""
     echo "Luna2: ============================================================"
-    echo "Luna2: INSTALL FAILED FATALLY (exit ${rc}) -- NOT retrying."
-    print_failure_reason
-    case "$rc" in
-        "$LUNA_SAFETY_RC")
-            echo "Luna2: Exit ${rc} is a safety refusal: lpart declined to touch the disk;"
-            echo "Luna2: the reason is above. Fix the layout or the node's data, then boot."
-            ;;
-        "$LUNA_FATAL_RC")
-            echo "Luna2: Exit ${rc} is a non-retryable configuration or safety error from an"
-            echo "Luna2: install step; the reason is above. It would recur on every attempt,"
-            echo "Luna2: so the node is parked instead of reinstalling in a loop."
-            ;;
-        *)
-            echo "Luna2: This error recurs on every attempt; it needs operator or daemon"
-            echo "Luna2: attention (e.g. install_mode=legacy reaching the lpart client)."
-            ;;
-    esac
+    echo "Luna2: INSTALL FAILED (exit ${rc}) -- NOT retrying."
+    # Say only what is known. install.sh's exit 2/3 can come from lpart (it then
+    # wrote this attempt's reason: the file is cleared before every attempt) or
+    # from anything else the install script runs, e.g. an operator script.
+    if [ -s "$LUNA_FAILURE_FILE" ]; then
+        print_failure_reason
+        echo "Luna2: lpart reported the reason above (a safety refusal or a non-retryable"
+        echo "Luna2: configuration error); it would recur on every attempt."
+    else
+        echo "Luna2: The install script exited ${rc} (operator script or install step);"
+        echo "Luna2: see the log."
+    fi
+    echo "Luna2: Exit 2 and 3 are non-retryable, so the node is parked instead of"
+    echo "Luna2: reinstalling in a loop."
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
     echo "Luna2: ============================================================"
