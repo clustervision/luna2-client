@@ -561,7 +561,7 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		Persistent:    set.Persistent,
 		Protected:     cleanup.SelectedDisksSet(protectedPaths(sp.protected)),
 	}); err != nil {
-		return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("cleanup: %w", err)
+		return result.StorageResult{}, result.ResolvedSet{}, cleanupError(set.Name, err)
 	}
 
 	sp.logger.SetStage("partitioning")
@@ -610,6 +610,17 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		}
 	}
 	return res, resolvedRecord, nil
+}
+
+// cleanupError classifies a cleanup failure. A protected-disk barrier refusal
+// is deterministic -- the layout touches a persistent set's disk and refuses
+// identically on every retry -- so it is a safety refusal (exit 2, park for an
+// operator), not a retryable exit 1 that loops every 30 s for ever.
+func cleanupError(setName string, err error) error {
+	if errors.Is(err, cleanup.ErrProtected) {
+		return safetyRefusalf("protected-disk", "set %q: %v", setName, err)
+	}
+	return fmt.Errorf("cleanup: %w", err)
 }
 
 // serialCollisionWarnings audits the resolved disk set for identity

@@ -3,7 +3,6 @@ package cleanup
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -39,7 +38,7 @@ func (c *Cleaner) stopMDArrays(ctx context.Context, setName string, selected, pr
 					continue
 				}
 				if c.arrayTouchesSelected(ctx, arr, protected) {
-					return fmt.Errorf(
+					return protectedf(
 						"cleanup: md array %s spans a selected disk and a persistent set's disk — refusing to stop/zero it (protected-disk barrier)",
 						arr.Device)
 				}
@@ -60,7 +59,7 @@ func (c *Cleaner) stopMDArrays(ctx context.Context, setName string, selected, pr
 			protUUIDs := c.dormantArrayUUIDs(ctx, protected)
 			for uuid, part := range selUUIDs {
 				if pp, ok := protUUIDs[uuid]; ok {
-					return fmt.Errorf(
+					return protectedf(
 						"cleanup: dormant md array %s spans a selected disk (member %s) and a persistent set's disk (member %s) — refusing to zero it (protected-disk barrier)",
 						uuid, part, pp)
 				}

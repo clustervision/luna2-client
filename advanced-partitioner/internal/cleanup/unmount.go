@@ -160,9 +160,12 @@ func matchesVGSource(source, vgName string) bool {
 	if strings.HasPrefix(source, "/dev/"+vgName+"/") {
 		return true
 	}
-	esc := strings.ReplaceAll(vgName, "-", "--")
-	return strings.HasPrefix(source, "/dev/mapper/"+esc+"-") &&
-		!strings.HasPrefix(source, "/dev/mapper/"+esc+"--")
+	mapper, ok := strings.CutPrefix(source, "/dev/mapper/")
+	if !ok {
+		return false
+	}
+	vg, _, ok := splitDMName(mapper)
+	return ok && vg == vgName
 }
 
 // forceUnmountTarget mirrors _force_unmount_target: skip if not mounted,

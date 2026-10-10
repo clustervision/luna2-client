@@ -2,6 +2,7 @@ package cleanup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -44,6 +45,25 @@ type Set struct {
 	// or when a VG/md array under teardown has any member on a protected
 	// disk — whatever the selection logic upstream decided. Tests pin this.
 	Protected map[string]struct{}
+}
+
+// ErrProtected is matched (errors.Is) by every refusal of the protected-disk
+// barrier: the work would touch a persistent set's disk. Such a refusal is
+// deterministic -- the same layout refuses identically on every retry -- so
+// callers map it to the exit-2 safety refusal, never to a retryable failure.
+var ErrProtected = errors.New("protected-disk barrier")
+
+// ProtectedError is one protected-disk barrier refusal; it matches
+// ErrProtected.
+type ProtectedError struct{ Msg string }
+
+func (e *ProtectedError) Error() string { return e.Msg }
+
+// Is makes errors.Is(err, ErrProtected) true for every barrier refusal.
+func (e *ProtectedError) Is(target error) bool { return target == ErrProtected }
+
+func protectedf(format string, args ...any) error {
+	return &ProtectedError{Msg: fmt.Sprintf(format, args...)}
 }
 
 // Result is the typed equivalent of the {"status":"ok"} JSON the Bash
@@ -160,7 +180,7 @@ func (c *Cleaner) CleanupSelectedSet(ctx context.Context, set Set) (Result, erro
 	// wrong, this is the last barrier before irreversible destruction.
 	for disk := range selected {
 		if _, hit := set.Protected[disk]; hit {
-			return Result{}, fmt.Errorf(
+			return Result{}, protectedf(
 				"cleanup: selected disk %s belongs to a persistent set — refusing to touch it (protected-disk barrier)", disk)
 		}
 	}

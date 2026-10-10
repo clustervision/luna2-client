@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cleanup"
@@ -314,6 +315,9 @@ func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.
 		SelectedDisks: disks,
 		OwnsSysroot:   true,
 	}); err != nil {
+		if errors.Is(err, cleanup.ErrProtected) {
+			return nil, nil, cleanupError("sanitize", err)
+		}
 		return nil, nil, fmt.Errorf("sanitize: pre-erase stack teardown: %w", err)
 	}
 	s := sanitize.New(sanitize.Options{Runner: sp.runner, Logger: sp.logger, DryRun: dryRun, ReadBack: sp.sanitizeReadBack})

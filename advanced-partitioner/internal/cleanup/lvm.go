@@ -3,7 +3,6 @@ package cleanup
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -128,7 +127,7 @@ func (c *Cleaner) teardownVG(ctx context.Context, vgName string, protected map[s
 	if hasLVM && len(protected) > 0 {
 		for _, pv := range c.pvsForVG(ctx, vgName) {
 			if PartitionOnSelectedDisk(pv, protected) {
-				return fmt.Errorf(
+				return protectedf(
 					"cleanup: VG %q has physical volume %s on a persistent set's disk — refusing teardown (protected-disk barrier)",
 					vgName, pv)
 			}
@@ -283,7 +282,7 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 				continue
 			}
 			if PartitionOnSelectedDisk(pvPath, protected) {
-				return fmt.Errorf(
+				return protectedf(
 					"cleanup: VG %q spans a selected disk and persistent-set PV %s — refusing to remove it (protected-disk barrier); resolve the disk layout conflict first",
 					vg, pvPath)
 			}
@@ -295,7 +294,7 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 				}
 				for _, m := range members {
 					if PartitionOnSelectedDisk(m, protected) {
-						return fmt.Errorf(
+						return protectedf(
 							"cleanup: VG %q has md PV %s with member %s on a persistent set's disk — refusing to remove it (protected-disk barrier)",
 							vg, pvPath, m)
 					}
@@ -328,25 +327,57 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 
 // --- LVM helpers ----------------------------------------------------------
 
-// dmsetupMappersForVG returns the mapper names whose names start with
-// "<vg>-" (the device-mapper naming convention LVM uses for LVs).
+// dmsetupMappersForVG returns the device-mapper names of the VG's LVs. LVM
+// names a mapping "<vg>-<lv>" with every '-' INSIDE either name doubled, so
+// the VG ends at the first single '-' (splitDMName). A prefix test on
+// vg+"-" got both directions wrong: tearing down VG "data" also matched
+// "data--2-root" (VG "data-2", possibly a persistent set's), and a VG with a
+// hyphen ("my-vg" -> "my--vg-lv") never matched its own mappers.
 func (c *Cleaner) dmsetupMappersForVG(ctx context.Context, vgName string) []string {
 	res, ok := c.runOK(ctx, "dmsetup", "ls")
 	if !ok {
 		return nil
 	}
-	prefix := vgName + "-"
 	var names []string
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
 		}
-		if strings.HasPrefix(fields[0], prefix) {
+		if vg, _, ok := splitDMName(fields[0]); ok && vg == vgName {
 			names = append(names, fields[0])
 		}
 	}
 	return names
+}
+
+// splitDMName splits an LVM device-mapper name into its VG and LV names,
+// undoing the escaping: the separator is the first '-' that is not part of a
+// "--" pair, and "--" inside either part stands for one '-'.
+//
+//	"data-root"     -> "data",   "root"
+//	"data--2-root"  -> "data-2", "root"
+//	"my----vg-lv"   -> "my--vg", "lv"
+//	"os-swap--a"    -> "os",     "swap-a"
+//
+// ok is false for a name with no single '-' (not an LVM mapping, e.g.
+// "mpatha").
+func splitDMName(name string) (vg, lv string, ok bool) {
+	for i := 0; i < len(name); i++ {
+		if name[i] != '-' {
+			continue
+		}
+		if i+1 < len(name) && name[i+1] == '-' {
+			i++ // an escaped '-' inside the VG name
+			continue
+		}
+		if i == 0 || i == len(name)-1 {
+			return "", "", false
+		}
+		unesc := func(s string) string { return strings.ReplaceAll(s, "--", "-") }
+		return unesc(name[:i]), unesc(name[i+1:]), true
+	}
+	return "", "", false
 }
 
 // findmntTargetForSource returns the mount target for a given device
