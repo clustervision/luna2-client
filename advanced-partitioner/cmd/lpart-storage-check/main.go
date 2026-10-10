@@ -100,7 +100,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	fs := cli.NewToolFlagSet(toolName)
 	f.Bind(fs)
 	fs.StringVar(&f.ConfigPath, "config", "", "Path to v2 storage JSON")
-	fs.StringVar(&f.Sysroot, "sysroot", mount.DefaultSysroot, "Mount target root")
+	fs.StringVar(&f.Sysroot, "sysroot", mount.EffectiveSysroot(), "Mount target root (defaults to $rootmnt, else /sysroot)")
 	fs.BoolVar(&f.Details, "details", false, "Print extended device inventory at startup")
 	fs.StringVar(&f.ResultOut, "result-out", defaultResultOut, "Where to write storage-check-result.json")
 	fs.StringVar(&f.InstallContextPath, "install-context", installcontext.DefaultJSONPath,

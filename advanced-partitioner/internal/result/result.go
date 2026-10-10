@@ -173,7 +173,7 @@ func Assemble(in AssembleInput) StorageResult {
 		RegisterNVRAM:     "auto",
 		ClearUEFINVRAM:    in.Set.ClearUEFINVRAM(),
 		RAIDMode:          in.Set.RAIDMode(),
-		MountedTargetRoot: nonEmpty(in.Mount.MountedTargetRoot, mount.DefaultSysroot),
+		MountedTargetRoot: nonEmpty(in.Mount.MountedTargetRoot, mount.EffectiveSysroot()),
 		FirstInstall:      in.FirstInstall,
 		Persistent:        in.Persistent,
 	}

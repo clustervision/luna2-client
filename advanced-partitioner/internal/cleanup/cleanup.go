@@ -10,6 +10,7 @@ import (
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/mount"
 )
 
 // Set is the subset of v2.Set the cleanup cascade needs. lpart-storage-prepare
@@ -121,7 +122,9 @@ type Cleaner struct {
 // New returns a Cleaner with sensible defaults filled in.
 func New(o Options) *Cleaner {
 	if o.Sysroot == "" {
-		o.Sysroot = "/sysroot"
+		// $rootmnt on initramfs-tools (Ubuntu: /root), /sysroot on dracut --
+		// the same root the mounter uses, or leftovers there are never unmounted
+		o.Sysroot = mount.EffectiveSysroot()
 	}
 	if o.CommandAvailable == nil {
 		o.CommandAvailable = defaultCommandAvailable
