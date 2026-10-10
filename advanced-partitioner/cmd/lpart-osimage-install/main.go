@@ -277,14 +277,22 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// Every path is protected as written AND with its symlinks resolved inside
 	// the sysroot (all components, not just the first), so a link and what it
 	// points to are both kept.
+	var filterErr error
 	expand := func(kind string, raw []string) []string {
-		return osimage.ExpandFilterPaths(f.Sysroot, resolver.ResolveAll(norm(kind, raw)))
+		n := norm(kind, raw)
+		if err := osimage.ValidateFilterPaths(kind, n); err != nil && filterErr == nil {
+			filterErr = err
+		}
+		return osimage.ExpandFilterPaths(f.Sysroot, resolver.ResolveAll(n))
 	}
 	preserve := osimage.ParsePatterns(expand("preserve", f.Preserve))
 	preserveEmpty := osimage.ParsePatterns(expand("preserve_empty", f.PreserveEmpty))
 	noNew := osimage.ParsePatterns(expand("no_new_files", f.NoNewFiles))
 	keepExtra := osimage.ParsePatterns(expand("keep_extra", f.KeepExtra))
 	imageWins := osimage.ParsePatterns(expand("image_wins", f.ImageWins))
+	if filterErr != nil {
+		return cli.ExitFatalConfig(stderr, toolName, "osimage-filter", "%v", filterErr)
+	}
 	// Pre-compute tar excludes so the log captures them regardless of
 	// whether --skip-extract / --skip-download short-circuit later.
 	excludes := osimage.BuildTarExcludes(preserve, preserveEmpty, noNew)
@@ -531,6 +539,19 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			// tar overwrites the partial tree, so a failed stream costs one
 			// full download, never a broken install.
 			logger.Warn("streamed extract failed; falling back to classic download+extract: " + serr.Error())
+			if fstype == "tmpfs" {
+				// RAM root: clear the partly extracted tree BEFORE the tarball
+				// lands in /tmp (also RAM), or the fallback needs the double
+				// peak streaming exists to avoid.
+				if perr := osimage.PrepareSysroot(context.Background(), osimage.PrepareOptions{
+					Sysroot: f.Sysroot, Logger: logger, DryRun: f.DryRun, Resolver: resolver,
+					FindmntTargets: findmntTargets(runner), PersistentMountpoints: srSummary.PersistentMountpoints,
+					Details: f.Details,
+				}); perr != nil {
+					errln(stderr, "%v", perr)
+					return 1
+				}
+			}
 			cachePath, err = osimage.Download(context.Background(), dopts)
 			if err != nil {
 				errln(stderr, "%v", err)

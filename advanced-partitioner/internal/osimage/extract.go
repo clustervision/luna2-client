@@ -331,6 +331,13 @@ func PrepareSysroot(ctx context.Context, opts PrepareOptions) error {
 			}
 			continue
 		}
+		if _, isMount := mountSet[dir]; isMount && dir != opts.Sysroot {
+			// The directory is itself a mounted filesystem (a data set on /home,
+			// /scratch, /data): its contents belong to that set, not to the os
+			// image. Wiping it deleted every file of a healthy data set.
+			opts.detail("  keeping preserve-empty dir (a mounted filesystem, not part of the os set): %s", p.Base)
+			continue
+		}
 		children, err := os.ReadDir(dir)
 		if err != nil {
 			continue

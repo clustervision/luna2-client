@@ -277,6 +277,11 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 	br := bufio.NewReaderSize(src, 1<<20)
 	tr := tar.NewReader(io.TeeReader(br, fw))
 	members := map[string]memberInfo{}
+	// hard links whose target tar excluded: tar cannot create them ("Cannot
+	// hard link to ...: No such file or directory", exit 2); they are linked
+	// to the preserved on-disk file after the extract
+	type pendingLink struct{ link, target string }
+	var pending []pendingLink
 	var streamErr error
 	for {
 		fw.hold = true
@@ -298,6 +303,12 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 					break
 				} else if fixed {
 					res.TypeChanges++
+				}
+			}
+			if hdr.Typeflag == tar.TypeLink && (!excluded || winsMatch(o.ImageWins, rel)) {
+				tgt := strings.TrimSuffix(strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+hdr.Linkname)), "/"), "/")
+				if ExcludedByTar(tgt, o.TarExcludes) && !winsMatch(o.ImageWins, tgt) {
+					pending = append(pending, pendingLink{rel, tgt})
 				}
 			}
 			if !excluded || winsMatch(o.ImageWins, rel) {
@@ -344,8 +355,24 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 	if srcErr != nil {
 		return res, fmt.Errorf("sync: decompress: %w", srcErr)
 	}
+	if werr1 != nil && len(pending) > 0 && onlyHardlinkErrors(tar1Err.String(), len(pending)) {
+		werr1 = nil // the pending links are created below
+	}
 	if werr1 != nil {
 		return res, fmt.Errorf("sync: tar extract: %v: %s", werr1, strings.TrimSpace(tar1Err.String()))
+	}
+	for _, pl := range pending {
+		dst, src := filepath.Join(o.Sysroot, pl.link), filepath.Join(o.Sysroot, pl.target)
+		if _, err := os.Lstat(src); err != nil {
+			o.warn("sync: %s is a hard link to the preserved %s, which is not on disk: link not created", pl.link, pl.target)
+			delete(members, pl.link)
+			continue
+		}
+		_ = os.Remove(dst)
+		if err := os.Link(src, dst); err != nil {
+			return res, fmt.Errorf("sync: hard link %s -> %s: %w", pl.link, pl.target, err)
+		}
+		o.info("sync: %s linked to the preserved %s (hard link into a preserved path)", pl.link, pl.target)
 	}
 	if werr2 != nil {
 		// tar exits 2 when a requested member is not in the archive: an
@@ -752,4 +779,22 @@ func (o SyncOptions) detail(format string, args ...any) {
 	if o.Logger != nil && o.Details {
 		o.Logger.UserInfo(format, args...)
 	}
+}
+
+// onlyHardlinkErrors reports whether tar's stderr holds nothing but "Cannot
+// hard link to" errors (at most max of them) and the closing exit summary.
+func onlyHardlinkErrors(stderr string, max int) bool {
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "":
+		case strings.Contains(line, "Cannot hard link to"):
+			n++
+		case strings.Contains(line, "Exiting with failure status due to previous errors"):
+		default:
+			return false
+		}
+	}
+	return n > 0 && n <= max
 }

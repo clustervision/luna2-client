@@ -261,3 +261,38 @@ func TestLoadFilterConfigRejectsUnknownKeys(t *testing.T) {
 		t.Fatal("an invalid verify value must be a config error")
 	}
 }
+
+// A hard link in the image whose target is preserved (excluded from tar)
+// must not fail the sync: it is linked to the preserved file on disk.
+func TestSyncHardlinkIntoPreserved(t *testing.T) {
+	if _, err := exec.LookPath("tar"); err != nil {
+		t.Skip("GNU tar not available")
+	}
+	root := t.TempDir()
+	write(t, root, "opt/keep/bin/tool", "local tool\n")
+	d, f := byte(tar.TypeDir), byte(tar.TypeReg)
+	img := buildTar(t, []ent{
+		{"./", "", "", d, 0o755}, {"./opt/", "", "", d, 0o755}, {"./opt/keep/", "", "", d, 0o755}, {"./opt/keep/bin/", "", "", d, 0o755},
+		{"./opt/keep/bin/tool", "image tool\n", "", f, 0o755},
+		{"./usr/", "", "", d, 0o755}, {"./usr/bin/", "", "", d, 0o755},
+		{"./usr/bin/tool", "", "./opt/keep/bin/tool", byte(tar.TypeLink), 0o755},
+		// target preserved but absent on disk: tar fails "Cannot hard link to"
+		{"./opt/keep/bin/gone", "image gone\n", "", f, 0o755},
+		{"./usr/bin/gone", "", "./opt/keep/bin/gone", byte(tar.TypeLink), 0o755},
+	})
+	prot, ex := protectionFor([]string{"opt/keep"}, nil, nil, nil, nil)
+	if _, err := SyncExtract(context.Background(), syncOpts(root, img, prot, ex, nil, "metadata")); err != nil {
+		t.Fatalf("SyncExtract: %v", err)
+	}
+	if got, _ := read(root, "usr/bin/tool"); got != "local tool\n" {
+		t.Fatalf("usr/bin/tool = %q, want the preserved file", got)
+	}
+	a, _ := os.Stat(filepath.Join(root, "usr/bin/tool"))
+	b, _ := os.Stat(filepath.Join(root, "opt/keep/bin/tool"))
+	if !os.SameFile(a, b) {
+		t.Fatal("usr/bin/tool is not a hard link to the preserved file")
+	}
+	if _, err := os.Lstat(filepath.Join(root, "usr/bin/gone")); err == nil {
+		t.Fatal("usr/bin/gone links to a preserved file that is absent: it must not be created")
+	}
+}

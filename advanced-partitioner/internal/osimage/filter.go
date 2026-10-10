@@ -1,6 +1,7 @@
 package osimage
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -229,4 +230,29 @@ func ExpandFilterPaths(sysroot string, paths []string) []string {
 		}
 	}
 	return out
+}
+
+// ValidateFilterPaths refuses filter paths whose meaning differs between this
+// package's matcher and GNU tar, or that would protect (and exclude from the
+// extract) the whole image:
+//   - '[', ']' and '\' are literal here but special to tar's --exclude, so a
+//     path could be kept on disk and still be overwritten by tar;
+//   - a wildcard in the first component ("*", "*/x", "***") matches every
+//     top-level directory: the extract would install nothing and still pass;
+//   - preserve_empty takes literal directories only (a glob there created a
+//     directory literally named "*" and wiped nothing).
+func ValidateFilterPaths(kind string, paths []string) error {
+	for _, p := range paths {
+		if strings.ContainsAny(p, "[]\\") {
+			return fmt.Errorf("osimage_filter %s %q: the characters [ ] \\ are not supported", kind, p)
+		}
+		first := strings.SplitN(p, "/", 2)[0]
+		if strings.ContainsAny(first, "*?") {
+			return fmt.Errorf("osimage_filter %s %q: a wildcard in the first path component matches every top-level directory", kind, p)
+		}
+		if kind == "preserve_empty" && strings.ContainsAny(p, "*?") {
+			return fmt.Errorf("osimage_filter preserve_empty %q: takes a literal directory, not a pattern", p)
+		}
+	}
+	return nil
 }

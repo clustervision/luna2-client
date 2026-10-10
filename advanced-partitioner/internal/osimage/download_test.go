@@ -55,10 +55,10 @@ func TestFileBaseFromLunaURL(t *testing.T) {
 
 func TestProvisionOrderAlwaysEndsWithHTTP(t *testing.T) {
 	for in, want := range map[[2]string]string{
-		{"torrent", ""}:     "torrent,http",
-		{"", ""}:            "torrent,http",
-		{"http", ""}:        "http",
-		{"torrent", "http"}: "torrent,http",
+		{"torrent", ""}:      "torrent,http",
+		{"", ""}:             "torrent,http",
+		{"http", ""}:         "http",
+		{"torrent", "http"}:  "torrent,http",
 		{"https", "torrent"}: "https,torrent",
 	} {
 		if got := strings.Join(ProvisionOrder(in[0], in[1]), ","); got != want {

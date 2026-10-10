@@ -215,3 +215,27 @@ func TestResolveInSysroot(t *testing.T) {
 		t.Errorf("ExpandFilterPaths = %v", got)
 	}
 }
+
+func TestValidateFilterPaths(t *testing.T) {
+	ok := map[string][]string{
+		"preserve":       {"var/log", "etc/ssh/ssh_host_*", "home/*/.ssh", "var/log/***"},
+		"preserve_empty": {"scratch", "var/tmp"},
+		"image_wins":     {"etc/ssh/sshd_config", "etc/yum.repos.d/*.repo"},
+	}
+	for kind, ps := range ok {
+		if err := ValidateFilterPaths(kind, ps); err != nil {
+			t.Errorf("%s %v: unexpected %v", kind, ps, err)
+		}
+	}
+	bad := map[string][]string{
+		"preserve":       {"*", "***", "*/etc", "etc/[ab]", `etc\x`},
+		"preserve_empty": {"home/*/tmp"},
+	}
+	for kind, ps := range bad {
+		for _, p := range ps {
+			if err := ValidateFilterPaths(kind, []string{p}); err == nil {
+				t.Errorf("%s %q must be refused", kind, p)
+			}
+		}
+	}
+}
