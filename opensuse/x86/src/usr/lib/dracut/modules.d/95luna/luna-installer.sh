@@ -432,11 +432,21 @@ function retry_countdown () {
 # maintenance shell. 'poweroff' stops the node; exiting the shell re-opens it.
 # install_mode=sanitize finished (marker from lpart-node-installer): report and
 # power the node off. Nothing is left to boot, and returning to the retry loop
-# would only start another erase.
+# would only start another erase. The marker holds what lpart-storage-prepare
+# reported (the disks it erased, or that there was nothing to erase); print
+# that, never a fixed claim.
+LUNA_SANITIZE_MARKER=/tmp/install_files/runtime/sanitize.done
 function luna_sanitize_stop () {
-    local rc="${1:-0}"
+    local rc="${1:-0}" _line
     echo "Luna2: ============================================================"
-    echo "Luna2: SANITIZE COMPLETE -- every local disk was erased and verified."
+    echo "Luna2: SANITIZE FINISHED -- lpart-storage-prepare reported:"
+    if [ -s "$LUNA_SANITIZE_MARKER" ]; then
+        while IFS= read -r _line || [ -n "$_line" ]; do
+            echo "Luna2:   ${_line}"
+        done < "$LUNA_SANITIZE_MARKER"
+    else
+        echo "Luna2:   (no report was written -- check the install log)"
+    fi
     echo "Luna2: install_mode=sanitize stops the node: powering off in 10 s."
     echo "Luna2: (install script exit status ${rc}; set another install_mode before the next boot)"
     echo "Luna2: ============================================================"
@@ -600,7 +610,7 @@ if [ "x$root" = "xluna" ]; then
             # marker after a verified erase; stop here whatever the rest of
             # install.sh did (its OS steps cannot succeed without an OS, and a
             # retry would erase the disks again every minute).
-            if [ -f /tmp/install_files/runtime/sanitize.done ]; then
+            if [ -f "$LUNA_SANITIZE_MARKER" ]; then
                 luna_sanitize_stop "$rc"   # never returns
             fi
             [ "$rc" = "0" ] && RES="success"

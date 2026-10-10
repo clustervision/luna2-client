@@ -111,6 +111,9 @@ type Pipeline struct {
 	storageState model.Storage // last emitted storage, for re-emit with InUse/Method
 	methodLine   string        // config-derived Method (selection + counts), shown from resolve onward
 	stepStderr   []string      // tail of the current step's stderr, for the failure file
+	// stepLine, when set, sees every stdout/stderr line of the running step
+	// (from the mirror goroutine; read it only after the step returned).
+	stepLine func(string)
 
 	resultMu sync.Mutex
 	result   Result
@@ -342,6 +345,7 @@ func (p *Pipeline) runPart() error {
 		args = append(args, "--config", p.rt("storage.json"))
 	}
 	timeout := p.opts.StepTimeout
+	var report sanitizeReport
 	if mode.IsSanitize() {
 		// Zero-filling runs at the disks' write speed, one disk after the
 		// other: a fixed 2 h bound killed it part-way on large HDDs, and the
@@ -350,8 +354,10 @@ func (p *Pipeline) runPart() error {
 		if timeout > 0 {
 			p.info("sanitize: storage-prepare may take up to " + timeout.String() + " (local disk sizes at 50 MB/s)")
 		}
+		p.stepLine = report.observe
 	}
 	err = p.runStepTimeout("storage-prepare", timeout, append([]string{p.bin("lpart-storage-prepare")}, args...))
+	p.stepLine = nil
 	if err != nil {
 		p.stageFail("storage-prepare", err.Error())
 		return err
@@ -386,8 +392,12 @@ func (p *Pipeline) runPart() error {
 	p.stageDone("storage-prepare", "")
 
 	if mode.IsSanitize() {
-		p.info("sanitize complete; no OS image or bootloader for an erase run -- the node will be powered off")
-		if err := os.WriteFile(p.rt(SanitizeDoneMarker), []byte("sanitize complete\n"), 0o644); err != nil {
+		// The marker says what storage-prepare reported, not a fixed claim:
+		// the boot wrapper prints it as the node's last word before power-off.
+		summary := report.summary()
+		p.info("sanitize: " + strings.ReplaceAll(strings.TrimSpace(summary), "\n", "; "))
+		p.info("no OS image or bootloader for an erase run -- the node will be powered off")
+		if err := os.WriteFile(p.rt(SanitizeDoneMarker), []byte(summary), 0o644); err != nil {
 			p.info("could not write " + p.rt(SanitizeDoneMarker) + ": " + err.Error())
 		}
 		return nil
@@ -521,6 +531,9 @@ func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []st
 	go func() {
 		defer mirrored.Done()
 		for ev := range mirror {
+			if p.stepLine != nil && (ev.Type == engine.EvCommandStderr || ev.Type == engine.EvCommandStdout) {
+				p.stepLine(ev.Message)
+			}
 			if ev.Type == engine.EvCommandStderr {
 				p.stepStderr = append(p.stepStderr, ev.Message)
 				if len(p.stepStderr) > stepStderrLines {

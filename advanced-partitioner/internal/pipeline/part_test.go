@@ -64,6 +64,39 @@ func TestPartPhaseClearsStaleResults(t *testing.T) {
 	}
 }
 
+// The sanitize marker carries what storage-prepare reported.
+func TestSanitizeMarkerReportsTheErase(t *testing.T) {
+	rt, logs, bin := partEnv(t, "sanitize")
+	fakeBin(t, bin, "lpart-storage-prepare", `echo "sanitize: erasing 2 local disk(s): [/dev/sda /dev/sdb]" >&2
+echo "/dev/sda: zero-filled (read-back verified blank)" >&2
+echo "/dev/sdb: blkdiscard succeeded (blocks discarded, read-back verified blank)" >&2`)
+	if err := runPartWith(t, rt, logs, bin); err != nil {
+		t.Fatalf("runPart: %v", err)
+	}
+	b, err := os.ReadFile(filepath.Join(rt, SanitizeDoneMarker))
+	if err != nil {
+		t.Fatalf("marker: %v", err)
+	}
+	got := string(b)
+	for _, want := range []string{"2 local disk(s) erased", "/dev/sda (zero-filled)", "/dev/sdb (discarded)"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("marker lost %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestSanitizeMarkerForAnEmptyPool(t *testing.T) {
+	rt, logs, bin := partEnv(t, "sanitize")
+	fakeBin(t, bin, "lpart-storage-prepare", `echo "sanitize: no local disks found -- nothing was erased" >&2`)
+	if err := runPartWith(t, rt, logs, bin); err != nil {
+		t.Fatalf("runPart: %v", err)
+	}
+	b, _ := os.ReadFile(filepath.Join(rt, SanitizeDoneMarker))
+	if got := string(b); !strings.Contains(got, "nothing was erased") || strings.Contains(got, "verified") {
+		t.Fatalf("empty pool must not claim an erase:\n%s", got)
+	}
+}
+
 func TestSanitizeTimeout(t *testing.T) {
 	floor := 2 * time.Hour
 	if got := sanitizeTimeout(nil, floor); got != 0 {
@@ -76,6 +109,20 @@ func TestSanitizeTimeout(t *testing.T) {
 	got := sanitizeTimeout([]disk{{Size: 2e12}, {Size: 2e12}}, floor)
 	if got < 22*time.Hour || got > 23*time.Hour {
 		t.Fatalf("2x2TB: got %s, want ~22h", got)
+	}
+}
+
+func TestSanitizeReportUnknown(t *testing.T) {
+	var r sanitizeReport
+	r.observe("unrelated line")
+	if got := r.summary(); !strings.Contains(got, "reported no erased disk") {
+		t.Fatalf("no evidence must not claim an erase: %q", got)
+	}
+	r = sanitizeReport{}
+	r.observe("sanitize: erasing 3 local disk(s): [a b c]")
+	r.observe("/dev/a: zero-filled (read-back verified blank)")
+	if got := r.summary(); !strings.Contains(got, "1 of 3 local disk(s)") {
+		t.Fatalf("partial evidence must say so: %q", got)
 	}
 }
 
