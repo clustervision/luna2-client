@@ -16,7 +16,7 @@ func TestPredictMemoryRoot(t *testing.T) {
 			},
 		}},
 	}
-	got := PredictFilesystemsFromConfig(cfg)
+	got := PredictFilesystemsFromConfig(cfg, nil)
 	if len(got.Filesystems) != 1 {
 		t.Fatalf("got %d filesystems; want 1", len(got.Filesystems))
 	}
@@ -41,7 +41,7 @@ func TestPredictSingleDiskLVM(t *testing.T) {
 			},
 		}},
 	}
-	got := PredictFilesystemsFromConfig(cfg)
+	got := PredictFilesystemsFromConfig(cfg, nil)
 	// swap and empty mounts are skipped; 3 entries.
 	if len(got.Filesystems) != 3 {
 		t.Fatalf("got %d filesystems: %+v", len(got.Filesystems), got.Filesystems)
@@ -73,7 +73,7 @@ func TestPredictNVMePartitionPaths(t *testing.T) {
 			},
 		}},
 	}
-	got := PredictFilesystemsFromConfig(cfg)
+	got := PredictFilesystemsFromConfig(cfg, nil)
 	wantDevs := map[string]string{
 		"/boot/efi": "/dev/nvme0n1p1",
 		"/boot":     "/dev/nvme0n1p2",
@@ -99,7 +99,7 @@ func TestPredictSkipsSwapAndEmpty(t *testing.T) {
 			},
 		}},
 	}
-	got := PredictFilesystemsFromConfig(cfg)
+	got := PredictFilesystemsFromConfig(cfg, nil)
 	if len(got.Filesystems) != 1 {
 		t.Fatalf("expected 1 entry (swap skipped); got %d", len(got.Filesystems))
 	}
@@ -125,7 +125,7 @@ func TestPredictMultiSetMemoryPlusData(t *testing.T) {
 			},
 		},
 	}
-	got := PredictFilesystemsFromConfig(cfg)
+	got := PredictFilesystemsFromConfig(cfg, nil)
 	if len(got.Filesystems) != 2 {
 		t.Fatalf("expected 2 filesystems; got %d", len(got.Filesystems))
 	}
@@ -148,7 +148,7 @@ func TestPredictRAID1BootOnMD(t *testing.T) {
 		},
 	}
 	got := map[string]string{}
-	for _, f := range PredictFilesystemsForSet(set).Filesystems {
+	for _, f := range PredictFilesystemsForSet(set, false).Filesystems {
 		got[f.Mount] = f.Device
 	}
 	if got["/boot/efi"] != "/dev/md/os-efi" {

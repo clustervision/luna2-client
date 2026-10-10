@@ -267,7 +267,17 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	logger.SetStage("mount")
 	logger.UserInfo("All sets healthy — mounting storage tree")
-	predicted := fsmod.PredictFilesystemsFromConfig(cfg)
+	predicted := fsmod.PredictFilesystemsFromConfig(cfg, func(set *v2.Set) bool {
+		devs := set.EffectiveDevices()
+		if set.Role != "os" || len(devs) == 0 {
+			return false
+		}
+		r, err := resolver.Resolve(context.Background(), devs[0])
+		if err != nil {
+			return false
+		}
+		return storagehealth.HasBIOSBootPartition(context.Background(), runner, r.ResolvedPath)
+	})
 	mt, err := mounter.MountSysrootTree(context.Background(), predicted)
 	if err != nil {
 		errln(stderr, "mount: %v", err)

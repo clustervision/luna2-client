@@ -41,6 +41,7 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/partition"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/raid"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/storagehealth"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sysenv"
 )
 
@@ -493,7 +494,12 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		sp.logger.SetStage("activate_existing")
 		sp.activateExisting(ctx, set, rmode, selectedDisks)
 		sp.logger.SetStage("filesystems")
-		fs := fsmod.PredictFilesystemsForSet(set)
+		var firstDisk string
+		if len(selectedDisks) > 0 {
+			firstDisk = selectedDisks[0].ResolvedPath
+		}
+		biosBoot := set.Role == "os" && storagehealth.HasBIOSBootPartition(ctx, sp.runner, firstDisk)
+		fs := fsmod.PredictFilesystemsForSet(set, biosBoot)
 		sp.logger.SetStage("mounts")
 		mt, err := sp.mount.MountSysrootTree(ctx, fs)
 		if err != nil {
@@ -654,111 +660,15 @@ func (sp *setProcessor) verifyDiskIdentity(ctx context.Context, d selector.Resol
 // idempotent — already-running arrays / active VGs are no-ops — because the
 // subsequent mount is the hard gate with the meaningful error.
 func (sp *setProcessor) activateExisting(ctx context.Context, set *v2.Set, rmode string, disks []selector.Resolved) {
-	run := func(path string, args ...string) {
-		if _, err := sp.runner.Run(ctx, executor.CommandSpec{
-			Path: path, Args: args,
-			CaptureStdout: true, CaptureStderr: true,
-		}); err != nil {
-			sp.logger.Info("activate (best-effort) " + path + " " + strings.Join(args, " ") + ": " + err.Error())
-		}
-	}
-	if rmode != "" && rmode != "none" {
-		mdName := raid.MDNameForSet(set.Name)
-		// Assemble with EXPLICIT members. EnsureNoAutoAssemble writes an
-		// mdadm.conf with no ARRAY lines and auto-assembly disabled for the
-		// whole install, so the previous name-only `mdadm --assemble
-		// /dev/md/<name>` had no way to find its members and ALWAYS failed
-		// (exit 1) — the persistent-RAID mount path was dead on arrival
-		// (regression 3.51 caught it: assemble fails → VG never appears →
-		// mount /dev/<vg>/<lv> exits 32 → retry-park). Members are found by
-		// examining each partition on THIS set's resolved disks, so nothing
-		// outside the set is ever assembled — consistent with the
-		// no-auto-assemble safety posture.
-		sp.assembleExplicit(ctx, mdName, disks, run)
-		if set.Role == "os" {
-			sp.assembleExplicit(ctx, mdName+"-efi", disks, run)
-			sp.assembleExplicit(ctx, mdName+"-boot", disks, run)
-		}
-		run("udevadm", "settle")
-	}
-	if set.StorageType() == v2.StorageLVM {
-		// Manual activation is unaffected by the disabled event-based
-		// autoactivation (auto_activation_volume_list only governs udev's
-		// pvscan) — this is the sanctioned way to bring the VG up.
-		run("vgchange", "-ay", set.VGName())
-		run("udevadm", "settle")
-	}
-}
-
-// assembleExplicit assembles /dev/md/<mdName> from the member partitions it
-// finds on the given disks (mdadm --examine, superblock Name match). No
-// members found is a no-op: the array may already be running, and the
-// subsequent mount stays the hard gate.
-func (sp *setProcessor) assembleExplicit(ctx context.Context, mdName string, disks []selector.Resolved, run func(string, ...string)) {
-	var members []string
+	_ = rmode // the shared routine reads the raid mode from the set itself
+	paths := make([]string, 0, len(disks))
 	for _, d := range disks {
-		for _, p := range sp.partitionsOn(ctx, d.ResolvedPath) {
-			if sp.mdSuperblockName(ctx, p) == mdName {
-				members = append(members, p)
-			}
-		}
+		paths = append(paths, d.ResolvedPath)
 	}
-	if len(members) == 0 {
-		sp.logger.Info("activate: no member partitions with superblock name %q on the set's disks (array already running, or not raid)", mdName)
-		return
-	}
-	run("mdadm", append([]string{"--assemble", "/dev/md/" + mdName}, members...)...)
-}
-
-// partitionsOn lists the partition device paths on one disk. KNAME, not
-// PATH: the PATH column arrived in util-linux 2.33 and el8 ships 2.32 — with
-// PATH the call fails there and activateExisting saw zero partitions, so a
-// persistent md could never be assembled on el8 (regression 3.51 "did not
-// boot", second site of the same bug as cleanup.partitionsOf; discover.go's
-// lsblkDiscoverColumns comment documents the rule).
-func (sp *setProcessor) partitionsOn(ctx context.Context, disk string) []string {
-	res, err := sp.runner.Run(ctx, executor.CommandSpec{
-		Path: "lsblk", Args: []string{"-ln", "-o", "KNAME,TYPE", disk},
-		CaptureStdout: true, CaptureStderr: true,
-	})
-	if err != nil {
-		return nil
-	}
-	var parts []string
-	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == "part" {
-			parts = append(parts, "/dev/"+fields[0])
-		}
-	}
-	return parts
-}
-
-// mdSuperblockName returns the array name from a partition's md superblock
-// ("Name : any:data (...)" → "data"), or "" when the partition has none.
-func (sp *setProcessor) mdSuperblockName(ctx context.Context, part string) string {
-	res, err := sp.runner.Run(ctx, executor.CommandSpec{
-		Path: "mdadm", Args: []string{"--examine", part},
-		CaptureStdout: true, CaptureStderr: true,
-	})
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "Name :") {
-			continue
-		}
-		name := strings.TrimSpace(strings.TrimPrefix(trimmed, "Name :"))
-		if i := strings.IndexAny(name, " \t"); i >= 0 {
-			name = name[:i]
-		}
-		if i := strings.LastIndexByte(name, ':'); i >= 0 {
-			name = name[i+1:]
-		}
-		return name
-	}
-	return ""
+	// Assemble with EXPLICIT members (md auto-assembly is disabled for the
+	// whole install), then vgchange; shared with the health probe so both see
+	// the same devices. See storagehealth.ActivateExisting.
+	storagehealth.ActivateExisting(ctx, sp.runner, set, paths, sp.logger)
 }
 
 // protectedPaths renders the protected-disk set as a path slice for

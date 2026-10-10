@@ -61,6 +61,19 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 		return failures
 	}
 
+	// Assemble the set's md arrays from their explicit members first: md
+	// auto-assembly is off in the installer (rd.md=0, no ARRAY lines), so on a
+	// raid set the PV and the mirrored ESP and /boot arrays do not exist yet and
+	// the vgchange below failed on every healthy raid1 os set, which made sync
+	// park and auto re-create a healthy mirror on every boot.
+	disks := make([]string, 0, len(resolved))
+	for _, r := range resolved {
+		disks = append(disks, r.ResolvedPath)
+	}
+	if rm := set.RAIDMode(); rm != "" && rm != "none" {
+		ActivateExisting(ctx, runner, set, disks, logger)
+	}
+
 	if set.StorageType() == v2.StorageLVM {
 		vgName := set.VGName()
 		if _, err := runner.Run(ctx, executor.CommandSpec{
@@ -73,20 +86,17 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 	}
 
 	diskPath := resolved[0].ResolvedPath
-	partCounter := 0
+	biosBoot := set.Role == "os" && HasBIOSBootPartition(ctx, runner, diskPath)
 	for _, vol := range set.Volumes {
 		if vol.Provider == "memory" {
 			continue
 		}
-		if vol.Provider == "partition" {
-			partCounter++
-		}
-		device := volumeDevice(set, vol, diskPath, partCounter)
+		device := volumeDevice(set, vol, diskPath, set.PartitionNumber(vol, biosBoot))
 		if device == "" {
 			continue
 		}
 
-		if !blockDeviceExists(device) {
+		if !blockDeviceExistsFn(device) {
 			mark(vol.Name, "block device not found: "+device)
 			continue
 		}
@@ -120,13 +130,16 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 // arrays (the raw partition shows as linux_raid_member, not the real fs), so
 // the health probe must look there or it falsely reports a fresh mirror broken
 // and re-runs reformat instead of mounting. partIdx is the 1-based partition
-// counter for raw partition volumes. Returns "" for providers with no device
-// (e.g. memory).
+// number the builder gave the volume (set.PartitionNumber). Returns "" for
+// providers with no device (e.g. memory) and for partIdx 0.
 func volumeDevice(set *v2.Set, vol v2.Volume, diskPath string, partIdx int) string {
 	switch vol.Provider {
 	case "partition":
 		if md := set.BootMirrorDevice(vol); md != "" {
 			return md
+		}
+		if partIdx <= 0 {
+			return ""
 		}
 		return devices.PartitionPath(diskPath, partIdx)
 	case "lvm":
@@ -214,6 +227,9 @@ func rcOf(res executor.CommandResult, err error) int {
 	}
 	return -1
 }
+
+// blockDeviceExistsFn is a test seam; it defaults to stat'ing the real device.
+var blockDeviceExistsFn = blockDeviceExists
 
 func blockDeviceExists(path string) bool {
 	info, err := os.Stat(path)

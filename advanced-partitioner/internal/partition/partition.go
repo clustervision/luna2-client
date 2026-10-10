@@ -208,7 +208,7 @@ func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selec
 	// BOOT after that loss — otherwise the array's redundancy is theatre
 	// (FTA C2: /boot+ESP used to exist only on disk 0). raid0 is excluded:
 	// it has no redundancy for the boot chain to match.
-	if set.Role == "os" && raidIsRedundant(layout.RAIDMode) {
+	if set.MirrorsBoot() {
 		layout.MirrorBoot = true
 	}
 	// GRUB for BIOS refuses to install without a BIOS boot partition for its

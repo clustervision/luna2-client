@@ -173,11 +173,85 @@ func (s *Set) MDName() string {
 }
 
 // MirrorsBoot reports whether this set mirrors its ESP and /boot onto md
-// arrays rather than placing them as raw partitions. This matches the
-// partition builder's rule (an os set under UEFI with raid1); the health
-// probe uses it to look for the ESP/boot filesystems on the md devices.
+// arrays rather than placing them as raw partitions. Single source for the
+// rule: the partition builder, the health probe and the filesystem predictor
+// all use it. Every redundant OS RAID mode mirrors the boot chain (raid1, 5, 6
+// and 10: a redundant root must still BOOT after a disk loss); raid0 and none
+// do not. It used to say raid1 only while the builder mirrored all four, so a
+// healthy raid5/6/10 os set was probed at its raw ESP/boot partitions (md
+// members), judged broken, and auto re-created it on every boot.
 func (s *Set) MirrorsBoot() bool {
-	return s.Role == "os" && s.RAIDMode() == "raid1"
+	if s.Role != "os" {
+		return false
+	}
+	switch s.RAIDMode() {
+	case "raid1", "raid5", "raid6", "raid10":
+		return true
+	}
+	return false
+}
+
+// PartitionNumber returns the 1-based GPT partition number the partition
+// builder gives a partition-provider volume of this set, or 0 for a volume
+// that has no partition of its own (lvm, memory, or a /boot or /boot/efi
+// volume of a non-os set). biosBoot tells whether the disk leads with a BIOS
+// boot partition (EF02), which the builder creates on a BIOS node for an os set
+// with a bootloader. It mirrors partition.BuildLayout exactly:
+//
+//	os set:   [EF02] -> /boot/efi -> /boot -> other partition volumes (JSON order)
+//	data set: other partition volumes (JSON order)
+//
+// The health probe and the mount-existing predictor used to count partition
+// volumes in JSON order instead, which put /boot on the ESP on every BIOS node
+// (and on any layout that lists a volume before /boot or /boot/efi).
+func (s *Set) PartitionNumber(vol Volume, biosBoot bool) int {
+	if vol.Provider != "partition" {
+		return 0
+	}
+	isBootVol := vol.Mountpoint == "/boot" || vol.Mountpoint == "/boot/efi"
+	if isBootVol && s.Role != "os" {
+		return 0
+	}
+	n := 0
+	hasEFI, hasBoot := false, false
+	for _, v := range s.Volumes {
+		if v.Provider != "partition" {
+			continue
+		}
+		switch v.Mountpoint {
+		case "/boot/efi":
+			hasEFI = true
+		case "/boot":
+			hasBoot = true
+		}
+	}
+	if s.Role == "os" {
+		if biosBoot {
+			n++
+		}
+		if hasEFI {
+			n++
+			if vol.Mountpoint == "/boot/efi" {
+				return n
+			}
+		}
+		if hasBoot {
+			n++
+			if vol.Mountpoint == "/boot" {
+				return n
+			}
+		}
+	}
+	for _, v := range s.Volumes {
+		if v.Provider != "partition" || v.Mountpoint == "/boot" || v.Mountpoint == "/boot/efi" {
+			continue
+		}
+		n++
+		if v.Name == vol.Name && v.Mountpoint == vol.Mountpoint {
+			return n
+		}
+	}
+	return 0
 }
 
 // BootMirrorDevice returns the md device that carries a boot-mirroring set's

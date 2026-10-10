@@ -592,10 +592,14 @@ func TestMDNameAndMirrorsBoot(t *testing.T) {
 			t.Errorf("%s: MDName(%q)=%q want %q", c.name, c.in, got, c.wantMD)
 		}
 	}
-	if !(&Set{Role: "os", Raid: "1"}).MirrorsBoot() {
-		t.Error("os+raid1 must mirror boot")
+	// Same rule as the partition builder: every redundant os raid mode mirrors
+	// the boot chain (FTA C2); raid0, none and data sets do not.
+	for _, r := range []string{"1", "5", "6", "10"} {
+		if !(&Set{Role: "os", Raid: r}).MirrorsBoot() {
+			t.Errorf("os+raid%s must mirror boot (the builder mirrors it)", r)
+		}
 	}
-	for _, s := range []*Set{{Role: "os", Raid: "0"}, {Role: "os", Raid: "10"}, {Role: "data", Raid: "1"}, {Role: "os", Raid: "none"}} {
+	for _, s := range []*Set{{Role: "os", Raid: "0"}, {Role: "data", Raid: "1"}, {Role: "data", Raid: "10"}, {Role: "os", Raid: "none"}} {
 		if s.MirrorsBoot() {
 			t.Errorf("role=%s raid=%s must NOT mirror boot", s.Role, s.Raid)
 		}
