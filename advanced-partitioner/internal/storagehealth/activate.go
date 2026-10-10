@@ -61,12 +61,17 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 	rmode := set.RAIDMode()
 	if rmode != "" && rmode != "none" {
 		mdName := set.MDName()
-		assembleExplicit(ctx, runner, mdName, disks, run, logger)
+		names := []string{mdName}
 		if set.Role == "os" {
-			assembleExplicit(ctx, runner, mdName+"-efi", disks, run, logger)
-			assembleExplicit(ctx, runner, mdName+"-boot", disks, run, logger)
+			names = append(names, mdName+"-efi", mdName+"-boot")
+		}
+		for _, n := range names {
+			assembleExplicit(ctx, runner, n, disks, run, logger)
 		}
 		run("udevadm", "settle")
+		for _, n := range names {
+			warnIfDegraded(ctx, runner, set.Name, n, logger)
+		}
 	}
 	if set.StorageType() == v2.StorageLVM {
 		// By UUID, the VG on the set's own disks: a same-named VG on another
@@ -225,4 +230,41 @@ func mdSuperblockName(ctx context.Context, runner executor.Runner, part string) 
 		return name
 	}
 	return ""
+}
+
+// warnIfDegraded logs a loud warning when /dev/md/<mdName> runs degraded.
+// A mirror member that lost its md superblock (or failed) is not a missing
+// disk: the array starts on the other member, the set probes healthy and is
+// used -- correctly -- but nothing said so, and the mirror silently stayed
+// single for every later install. Arrays that do not exist are skipped.
+func warnIfDegraded(ctx context.Context, runner executor.Runner, setName, mdName string, logger *txlog.Logger) {
+	if logger == nil {
+		return
+	}
+	res, err := runner.Run(ctx, executor.CommandSpec{
+		Path: "mdadm", Args: []string{"--detail", "/dev/md/" + mdName},
+		CaptureStdout: true, CaptureStderr: true,
+	})
+	if err != nil {
+		return
+	}
+	var state, active, total string
+	for _, line := range strings.Split(string(res.Stdout), "\n") {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), " : ")
+		if !ok {
+			continue
+		}
+		switch strings.TrimSpace(k) {
+		case "State":
+			state = strings.TrimSpace(v)
+		case "Active Devices":
+			active = strings.TrimSpace(v)
+		case "Raid Devices":
+			total = strings.TrimSpace(v)
+		}
+	}
+	if !strings.Contains(state, "degraded") {
+		return
+	}
+	logger.Warn(fmt.Sprintf("set %s: array %s runs DEGRADED (%s of %s members active, state %q); the set is used as it is -- re-add or replace the failed member (mdadm --detail /dev/md/%s), or reinstall with install_mode full to rebuild it", setName, mdName, active, total, state, mdName))
 }
