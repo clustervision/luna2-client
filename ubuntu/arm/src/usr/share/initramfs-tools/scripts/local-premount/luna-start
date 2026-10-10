@@ -184,12 +184,80 @@ luna_finish() {
 
 }
 
+# Without luna.ctty: the last console= on the command line (the kernel's
+# /dev/console), else tty1 -- a park shell on tty1 is invisible on a
+# serial-console node. Same rule as 95luna's luna-installer.sh.
 _get_luna_ctty() {
-    local luna_ctty
+    local luna_ctty _o _c="" _args=()
     luna_ctty=$(getargs luna.ctty=)
-    # TODO [ "x${luna_ctty}" = "x" ] && luna_ctty=$(getargs console=)
-    [ "x${luna_ctty}" = "x" ] && luna_ctty="/dev/tty1"
-    echo -n $luna_ctty
+    if [ -z "${luna_ctty}" ]; then
+        { read -r -a _args < /proc/cmdline; } 2>/dev/null
+        for _o in "${_args[@]}"; do
+            case "$_o" in console=*) _c="${_o#console=}"; _c="${_c%%,*}" ;; esac
+        done
+        [ "$_c" = "tty0" ] && _c=tty1
+        [ -n "$_c" ] && [ -c "/dev/${_c#/dev/}" ] && luna_ctty="/dev/${_c#/dev/}"
+    fi
+    [ -n "${luna_ctty}" ] || luna_ctty="/dev/tty1"
+    echo -n "$luna_ctty"
+}
+
+# lpart writes the failing stage + reason here; the tmpfs survives retries,
+# so it is cleared before every attempt (as is the sanitize marker).
+LUNA_FAILURE_FILE=/tmp/install_files/logs/last-failure.txt
+LUNA_SANITIZE_MARKER=/tmp/install_files/runtime/sanitize.done
+
+# install_mode=sanitize finished: report what lpart-storage-prepare reported
+# (the marker content) and power off -- a retry would only erase again.
+luna_sanitize_stop() {
+    local _line
+    echo "Luna2: SANITIZE FINISHED -- lpart-storage-prepare reported:"
+    if [ -s "$LUNA_SANITIZE_MARKER" ]; then
+        while IFS= read -r _line || [ -n "$_line" ]; do echo "Luna2:   ${_line}"; done < "$LUNA_SANITIZE_MARKER"
+    else
+        echo "Luna2:   (no report was written -- check the install log)"
+    fi
+    echo "Luna2: install_mode=sanitize stops the node: powering off in 10 s (install.sh rc=$1)."
+    [ "$luna_loghost" ] && logger -d -n "$luna_loghost" < /tmp/luna_install.log
+    sync
+    sleep 10
+    poweroff -f 2>/dev/null
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+    echo o > /proc/sysrq-trigger 2>/dev/null
+    while true; do sleep 60; done
+}
+
+# install.sh exit 2 (safety refusal) or 3 (non-retryable config error) recurs
+# on every attempt: show the reason, park in a shell, never retry.
+fatal_park() {
+    local _line
+    echo "Luna2: INSTALL FAILED (exit $1) -- NOT retrying."
+    if [ -s "$LUNA_FAILURE_FILE" ]; then
+        echo "Luna2: Reason (reported by lpart):"
+        while IFS= read -r _line || [ -n "$_line" ]; do echo "Luna2:   ${_line}"; done < "$LUNA_FAILURE_FILE"
+    else
+        echo "Luna2: The install script exited $1 (operator script or install step); see the log."
+    fi
+    echo "Luna2: Exit 2 and 3 are non-retryable: the node is parked. 'poweroff' stops it;"
+    echo "Luna2: exiting the shell re-opens it (no retry)."
+    [ "$luna_loghost" ] && logger -d -n "$luna_loghost" < /tmp/luna_install.log
+    while true; do
+        if { exec 9<>"$luna_ctty"; } 2>/dev/null; then
+            exec 9<&-
+            setsid -c /bin/sh -i -l 0<>"$luna_ctty" 1<>"$luna_ctty" 2<>"$luna_ctty"
+        else
+            sleep 3600
+        fi
+    done
+}
+
+# curl --interface with an empty $luna_nic swallowed the next option: bind
+# to the NIC only when one matched luna.mac.
+luna_curl() {
+    local -a _opts=()
+    [ -n "$INSECURE" ] && _opts+=("$INSECURE")
+    [ -n "$luna_nic" ] && _opts+=(--interface "$luna_nic")
+    curl "${_opts[@]}" "$@"
 }
 
 get_credentials() {
@@ -226,8 +294,8 @@ fetch_token() {
         INSECURE='--insecure'
     fi
     luna_mac=$(getargs luna.mac=)
-    luna_nic=$(find_nic ${luna_mac})
-    curl $INSECURE --interface $luna_nic -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
+    luna_nic=$(find_nic "${luna_mac}")
+    luna_curl -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
     valid=$(grep token /lunatmp/token.json)
     if [ "$valid" ]; then
         token=$(cat /lunatmp/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
@@ -264,7 +332,7 @@ if [ "x$ROOT" = "xluna" ]; then
             echo "Luna2: Trying to get install script."
             while [ 0 ]; do
                 token=$(fetch_token)
-                curl $INSECURE --interface $luna_nic -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
+                luna_curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
                 http_code=$(cat /lunatmp/http_code.out)
                 if [ "$http_code" = "200" ]; then
                     break
@@ -273,8 +341,17 @@ if [ "x$ROOT" = "xluna" ]; then
                     sleep 10
                 fi
             done
-            /bin/bash /lunatmp/install.sh && RES="success"
-            echo "Luna2: install.sh exit status: $RES"
+            rm -f "$LUNA_FAILURE_FILE" "$LUNA_SANITIZE_MARKER"
+            /bin/bash /lunatmp/install.sh
+            rc=$?
+            [ "$rc" = "0" ] && RES="success"
+            echo "Luna2: install.sh exit status: $RES (rc=$rc)"
+            if [ -f "$LUNA_SANITIZE_MARKER" ]; then
+                luna_sanitize_stop "$rc"   # never returns
+            fi
+            if [ "$RES" != "success" ] && { [ "$rc" = "2" ] || [ "$rc" = "3" ]; }; then
+                fatal_park "$rc"           # never returns
+            fi
             if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
                 cat /tmp/luna_install.log | logger -d -n $luna_loghost
                 echo -n '' > /tmp/luna_install.log
