@@ -306,9 +306,11 @@ func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.
 	}); err != nil {
 		return nil, nil, fmt.Errorf("sanitize: pre-erase stack teardown: %w", err)
 	}
-	s := sanitize.New(sanitize.Options{Runner: sp.runner, Logger: sp.logger})
+	s := sanitize.New(sanitize.Options{Runner: sp.runner, Logger: sp.logger, DryRun: dryRun, ReadBack: sp.sanitizeReadBack})
 	if _, err := s.EraseAll(ctx, disks); err != nil {
-		return nil, nil, err
+		// Deterministic: the same disk fails the same way on every retry, so
+		// park for an operator (safety refusal, exit 2) instead of looping.
+		return nil, nil, safetyRefusalf("sanitize-incomplete", "%v", err)
 	}
 	return nil, nil, nil
 }

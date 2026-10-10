@@ -383,6 +383,8 @@ type setProcessor struct {
 	mount    *mount.Mounter
 	checker  *fscheck.Checker  // health probe for the data fence
 	pool     []discover.Device // discovered disks for selection=discover + sanitize
+	// sanitizeReadBack overrides the sanitize read-back verification (tests).
+	sanitizeReadBack func(disk string) (bool, error)
 	// protected holds the canonical kernel paths of every PERSISTENT set's
 	// disks (filled by reserveManualSets). It is handed to cleanup as an
 	// independent barrier: no destructive cleanup step may touch these

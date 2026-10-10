@@ -4,15 +4,27 @@
 // operates only on fully-qualified disk paths the caller resolved, and logs
 // exactly what it did to each disk.
 //
-// Erase strategy per disk, in order:
+// Erase strategy per disk, in order; every step that reports success is
+// verified by reading samples back (start, middle, end must be zero):
 //
-//  1. blkdiscard -f          — discard every block; on SSD/NVMe/thin-provisioned
-//     devices this is the fast, effectively-secure path.
-//  2. wipefs -a + sgdisk --zap-all — fallback when discard is unsupported
-//     (e.g. plain rotational disks): clears all filesystem/RAID signatures and
-//     the partition table. This removes the layout but is NOT a cryptographic
-//     erase; the caller is warned. True crypto-erase (nvme format --ses,
-//     hdparm --security-erase) is a future enhancement.
+//  1. blkdiscard             — discard every block; on SSD/NVMe/thin-provisioned
+//     devices this is the fast path. Advisory: a device may claim success and
+//     keep the data, hence the read-back.
+//  2. blkdiscard -z          — zero-out: the kernel writes zeroes over the whole
+//     device (WRITE ZEROES / WRITE SAME where the device offers it, plain
+//     writes otherwise). Works on every block device, including rotational
+//     disks and virtio; it takes as long as writing the disk once.
+//  3. neither verified       — the disk is NOT reported erased: signatures and
+//     the partition table are still cleared (wipefs -a + sgdisk --zap-all) to
+//     limit the damage, and EraseDisk returns an error so the node parks for an
+//     operator instead of reporting a false sanitize.
+//
+// No "-f": util-linux 2.32 (el8) has no --force for blkdiscard ("invalid
+// option -- 'f'"), so with it discard was never even attempted on el8 and
+// every el8 sanitize fell back to signatures-only. The pre-erase stack
+// teardown releases the disks, so the in-use check that -f disables does not
+// apply. True crypto-erase (nvme format --ses, hdparm --security-erase) is a
+// future enhancement.
 package sanitize
 
 import (
@@ -29,26 +41,35 @@ import (
 type Options struct {
 	Runner executor.Runner
 	Logger *txlog.Logger
+	// DryRun: commands are only logged by the executor, so there is nothing
+	// to read back; the first method is reported without verification.
+	DryRun bool
+	// ReadBack overrides the read-back verification (tests); nil reads the
+	// real device.
+	ReadBack func(disk string) (bool, error)
 }
 
 // Sanitizer erases disks through the central executor.
 type Sanitizer struct {
-	runner executor.Runner
-	logger *txlog.Logger
+	runner   executor.Runner
+	logger   *txlog.Logger
+	dryRun   bool
+	readBack func(disk string) (bool, error)
 }
 
 // New builds a Sanitizer. Runner is required.
 func New(o Options) *Sanitizer {
-	return &Sanitizer{runner: o.runner(), logger: o.Logger}
+	return &Sanitizer{runner: o.runner(), logger: o.Logger, dryRun: o.DryRun, readBack: o.ReadBack}
 }
 
 func (o Options) runner() executor.Runner { return o.Runner }
 
 // Result records what happened to one disk.
 type Result struct {
-	Disk      string
-	Method    string // "blkdiscard" or "wipe+zap"
-	Discarded bool   // true when blkdiscard succeeded (secure on SSD/NVMe)
+	Disk        string
+	Method      string // "blkdiscard" or "zeroout"
+	Discarded   bool   // true when blkdiscard succeeded and read back blank
+	Overwritten bool   // true when the zero-out succeeded and read back blank
 }
 
 // EraseAll erases every disk and returns the per-disk results. It is
@@ -73,18 +94,24 @@ func (s *Sanitizer) EraseAll(ctx context.Context, disks []string) ([]Result, err
 	return out, nil
 }
 
-// EraseDisk erases a single disk via the layered strategy.
+// EraseDisk erases a single disk via the layered strategy. An error means the
+// disk could not be verified erased (signatures and partition table are
+// cleared anyway); the caller must not report the sanitize as done.
 func (s *Sanitizer) EraseDisk(ctx context.Context, disk string) (Result, error) {
 	if disk == "" {
 		return Result{}, fmt.Errorf("sanitize: empty disk path")
 	}
 	s.info("sanitizing %s", disk)
 
-	_, err := s.runner.Run(ctx, executor.CommandSpec{
-		Path: "blkdiscard", Args: []string{"-f", disk},
+	// 1. discard, verified
+	if _, err := s.runner.Run(ctx, executor.CommandSpec{
+		Path: "blkdiscard", Args: []string{disk},
 		CaptureStderr: true,
-	})
-	if err == nil {
+	}); err == nil {
+		if s.dryRun {
+			s.info("%s: dry-run: would discard, verify by read-back, and zero-fill if needed", disk)
+			return Result{Disk: disk, Method: "blkdiscard"}, nil
+		}
 		// Discard is ADVISORY: a device may report success while the
 		// hypervisor/firmware silently ignored the unmap (seen live on
 		// qcow2-backed virtio: "blkdiscard succeeded" with the filesystem
@@ -95,16 +122,33 @@ func (s *Sanitizer) EraseDisk(ctx context.Context, disk string) (Result, error) 
 			s.info("%s: blkdiscard succeeded (blocks discarded, read-back verified blank)", disk)
 			return Result{Disk: disk, Method: "blkdiscard", Discarded: true}, nil
 		} else if verr != nil {
-			s.warn("%s: blkdiscard reported success but read-back verification failed (%v); falling back to wipe+zap", disk, verr)
+			s.warn("%s: blkdiscard reported success but read-back verification failed (%v); zero-filling the device", disk, verr)
 		} else {
-			s.warn("%s: blkdiscard reported success but data persists (advisory discard ignored by the device); falling back to wipe+zap", disk)
+			s.warn("%s: blkdiscard reported success but data persists (advisory discard ignored by the device); zero-filling the device", disk)
 		}
 	} else {
-		s.warn("%s: blkdiscard unsupported/failed (%v); falling back to wipe+zap", disk, err)
+		s.warn("%s: blkdiscard unsupported/failed (%v); zero-filling the device", disk, err)
 	}
 
-	// Fallback: clear signatures + partition table. Best-effort each, but at
-	// least one must succeed or the disk is reported as un-erasable.
+	// 2. zero-out, verified
+	s.info("%s: overwriting the whole device with zeroes (blkdiscard -z); this takes as long as writing the disk once", disk)
+	if _, err := s.runner.Run(ctx, executor.CommandSpec{
+		Path: "blkdiscard", Args: []string{"-z", disk},
+		CaptureStderr: true,
+	}); err == nil {
+		if blank, verr := s.readsBackBlank(disk); verr == nil && blank {
+			s.info("%s: zero-filled (read-back verified blank)", disk)
+			return Result{Disk: disk, Method: "zeroout", Overwritten: true}, nil
+		} else if verr != nil {
+			s.warn("%s: zero-fill reported success but read-back verification failed (%v)", disk, verr)
+		} else {
+			s.warn("%s: zero-fill reported success but data persists", disk)
+		}
+	} else {
+		s.warn("%s: zero-fill failed (%v)", disk, err)
+	}
+
+	// 3. not erased: limit the damage, then fail closed.
 	_, wipeErr := s.runner.Run(ctx, executor.CommandSpec{
 		Path: "wipefs", Args: []string{"-a", disk},
 		CaptureStderr: true,
@@ -113,11 +157,7 @@ func (s *Sanitizer) EraseDisk(ctx context.Context, disk string) (Result, error) 
 		Path: "sgdisk", Args: []string{"--zap-all", disk},
 		CaptureStderr: true,
 	})
-	if wipeErr != nil && zapErr != nil {
-		return Result{}, fmt.Errorf("sanitize %s: blkdiscard, wipefs, and sgdisk all failed (wipefs: %v; sgdisk: %v)", disk, wipeErr, zapErr)
-	}
-	s.warn("%s: erased via wipe+zap (signatures + partition table cleared); NOT a cryptographic erase", disk)
-	return Result{Disk: disk, Method: "wipe+zap", Discarded: false}, nil
+	return Result{}, fmt.Errorf("sanitize %s: the device could not be discarded or zero-filled and verified; only its signatures and partition table were cleared (wipefs: %v; sgdisk: %v) -- the data is still on the disk", disk, wipeErr, zapErr)
 }
 
 // verifySampleMiB is the size of each read-back sample. Three samples
@@ -129,6 +169,9 @@ const verifySampleMiB = 1
 var readBlankFn = readsBackBlankDevice
 
 func (s *Sanitizer) readsBackBlank(disk string) (bool, error) {
+	if s.readBack != nil {
+		return s.readBack(disk)
+	}
 	return readBlankFn(disk)
 }
 

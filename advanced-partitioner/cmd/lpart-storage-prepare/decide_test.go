@@ -131,6 +131,7 @@ func TestRunSanitizeTearsDownStacksBeforeErase(t *testing.T) {
 		pool: []discover.Device{
 			{Path: "/dev/vda", KernelPath: "/dev/vda", Size: gib(20)},
 		},
+		sanitizeReadBack: func(string) (bool, error) { return true, nil },
 	}
 	if _, _, err := sp.runSanitize(context.Background(), false); err != nil {
 		t.Fatalf("runSanitize: %v", err)
