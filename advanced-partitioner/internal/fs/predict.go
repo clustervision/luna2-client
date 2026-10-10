@@ -20,8 +20,11 @@ import (
 //	lvm      → /dev/<vg>/<lv>  (the LVM-managed symlink the bash uses;
 //	            equivalent to /dev/mapper/<vg>-<lv>)
 //
-// swap and empty mountpoints are skipped so the mount-tree builder
-// never tries to mount them.
+// Swap volumes are INCLUDED, exactly as the create path (MakeFilesystems)
+// records them (mount "swap", fs "swap"): the mount-tree builder skips them,
+// and the fstab writer turns them into "UUID=... none swap" lines. Dropping
+// them here lost swap from the fstab of every refreshed (mount-existing)
+// node. Volumes with an empty mountpoint are skipped.
 //
 // The partition counter is anchored at the FIRST resolved disk. For a
 // boot-mirroring set (os+raid1) the ESP and /boot live on md arrays, not
@@ -48,11 +51,19 @@ func PredictFilesystemsFromConfig(cfg *v2.Config, biosBoot func(*v2.Set) bool) F
 //
 // biosBoot tells whether the set's first disk leads with a BIOS boot partition.
 func PredictFilesystemsForSet(set *v2.Set, biosBoot bool) Filesystems {
-	out := Filesystems{}
 	var diskPath string
 	if devs := set.EffectiveDevices(); len(devs) > 0 {
 		diskPath = devs[0]
 	}
+	return PredictFilesystemsOnDisk(set, diskPath, biosBoot)
+}
+
+// PredictFilesystemsOnDisk is PredictFilesystemsForSet with the disk that
+// anchors raw partition paths given explicitly -- the first disk PRESENT on
+// the node, which differs from the first configured device when a raid
+// set's first member has died and the set runs degraded.
+func PredictFilesystemsOnDisk(set *v2.Set, diskPath string, biosBoot bool) Filesystems {
+	out := Filesystems{}
 
 	for _, v := range set.Volumes {
 		var device string
@@ -79,7 +90,7 @@ func PredictFilesystemsForSet(set *v2.Set, biosBoot bool) Filesystems {
 			continue
 		}
 
-		if v.Mountpoint == "" || v.Mountpoint == "swap" {
+		if v.Mountpoint == "" {
 			continue
 		}
 
