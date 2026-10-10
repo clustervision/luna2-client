@@ -2,6 +2,7 @@ package diskresolve
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -57,18 +58,23 @@ func ParseSize(raw string) (int64, error) {
 	if err != nil {
 		return 0, fmt.Errorf("cannot parse size %q: %w", raw, err)
 	}
+	mult := int64(1) // "" -- bytes
 	switch m[2] {
 	case "T":
-		return n * 1024 * 1024 * 1024 * 1024, nil
+		mult = 1 << 40
 	case "G":
-		return n * 1024 * 1024 * 1024, nil
+		mult = 1 << 30
 	case "M":
-		return n * 1024 * 1024, nil
+		mult = 1 << 20
 	case "K":
-		return n * 1024, nil
-	default: // "" — bytes
-		return n, nil
+		mult = 1 << 10
 	}
+	// 16777216T used to wrap to 0, which reads as "no bound" -- a min_size
+	// that silently matched every disk.
+	if n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("size %q is too large", raw)
+	}
+	return n * mult, nil
 }
 
 // ParseMatch builds a Match from raw config strings. MinSize/MaxSize are

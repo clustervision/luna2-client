@@ -3,8 +3,11 @@ package v2
 import (
 	"encoding/json"
 	"fmt"
+	"path"
 	"path/filepath"
 	"strings"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/jsonstrict"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/raidlevel"
 )
@@ -35,9 +38,20 @@ func (c *Config) ValidateRaw(raw []byte) error {
 }
 
 func (c *Config) validateRaw(raw []byte) error {
+	// encoding/json merges repeated (and case-variant) keys into one struct,
+	// so an earlier occurrence could set a field every key check below misses.
+	if err := jsonstrict.Check(raw); err != nil {
+		return fmt.Errorf("config_validation: %w", err)
+	}
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &top); err != nil {
 		return fmt.Errorf("config_validation: top-level: %w", err)
+	}
+	if v, ok := top["comment"]; ok {
+		var str string
+		if err := json.Unmarshal(v, &str); err != nil {
+			return fmt.Errorf("config_validation: top-level: comment must be a string")
+		}
 	}
 
 	if err := unknownKey(top, allowedTopLevel, "top-level"); err != nil {
@@ -272,6 +286,9 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 	// devices[], spares included; a discover set resolves count active members
 	// (0 = the level's minimum) plus spares on top.
 	active := 0
+	if s.Count < 0 {
+		return fmt.Errorf("config_validation: %s: count=%d must not be negative", setRef(idx, s.Name), s.Count)
+	}
 	switch s.Selection {
 	case "manual":
 		active = len(s.Devices) - s.Spares
@@ -541,6 +558,9 @@ func (s *Set) validateDevicesConsistent(idx int) error {
 				"config_validation: sets[%d].devices: device-mapper/multipath path %q is not supported as a set device (dm partition naming has no reliable convention); use the underlying disk's by-id, by-path, or kernel name",
 				idx, d)
 		}
+		if err := checkDevicePathForm(idx, s.Name, d); err != nil {
+			return err
+		}
 		if err := checkDiskLinkStyle(idx, s.Name, d); err != nil {
 			return err
 		}
@@ -556,6 +576,36 @@ func (s *Set) validateDevicesConsistent(idx int) error {
 			return fmt.Errorf(
 				"config_validation: sets[%d].devices: all paths must use the same style (/dev/..., by-id, by-path)",
 				idx)
+		}
+	}
+	return nil
+}
+
+// checkDevicePathForm refuses device strings that can name no disk: blanks or
+// control characters ("/dev/sda "), a path that is not in clean form
+// ("/dev/../etc/passwd", "/dev//sda", "/dev/sda/"), the directories /dev and
+// /dev/disk themselves, and a /dev/disk link that is not exactly
+// /dev/disk/<kind>/<name>. They used to pass validation and failed on the
+// node as "device not found" -- after the layout was accepted everywhere.
+func checkDevicePathForm(idx int, setName, dev string) error {
+	bad := func(why string) error {
+		return fmt.Errorf("config_validation: %s: device %q %s", setRef(idx, setName), dev, why)
+	}
+	for _, r := range dev {
+		if r <= ' ' || r == 0x7f {
+			return bad("contains a blank or control character")
+		}
+	}
+	if path.Clean(dev) != dev {
+		return bad(fmt.Sprintf("is not a clean path (write it as %q)", path.Clean(dev)))
+	}
+	if dev == "/dev" || dev == "/dev/disk" {
+		return bad("is a directory, not a disk")
+	}
+	if rest, ok := strings.CutPrefix(dev, "/dev/disk/"); ok {
+		dir, name, found := strings.Cut(rest, "/")
+		if !found || name == "" || strings.Contains(name, "/") {
+			return bad(fmt.Sprintf("must be /dev/disk/%s/<link name>", dir))
 		}
 	}
 	return nil

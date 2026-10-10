@@ -504,3 +504,46 @@ func TestRunsDegradedWith(t *testing.T) {
 		}
 	}
 }
+
+// Review findings of the daemon-parity work (10 Oct): documents the validator
+// used to accept although they can never install as written.
+func TestRuleStrictDocument(t *testing.T) {
+	base := func(dev string) string {
+		return `{"version":2,"sets":[{"name":"os","role":"os","selection":"manual","raid":"none","devices":["` + dev + `"],` +
+			`"volumes":[{"name":"uefi","mountpoint":"/boot/efi","fs":"vfat","provider":"partition","size":"600M"},` +
+			`{"name":"boot","mountpoint":"/boot","fs":"xfs","provider":"partition","size":"2G"},` +
+			`{"name":"root","mountpoint":"/","fs":"xfs","provider":"lvm","size":"100%"}]}]}`
+	}
+	cases := []struct{ name, doc, want string }{
+		{"ok", base("/dev/vda"), ""},
+		{"ok-by-id", base("/dev/disk/by-id/virtio-LAB-VDA"), ""},
+		{"blank-in-path", base("/dev/sda "), "contains a blank or control character"},
+		{"dotdot", base("/dev/../etc/passwd"), "is not a clean path"},
+		{"double-slash", base("/dev//sda"), "is not a clean path"},
+		{"trailing-slash", base("/dev/sda/"), "is not a clean path"},
+		{"dev-disk-dir", base("/dev/disk"), "is a directory, not a disk"},
+		{"by-id-dir", base("/dev/disk/by-id"), "must be /dev/disk/by-id/<link name>"},
+		{"dup-key", `{"version":2,"version":2,"sets":[]}`, `key "version" appears twice`},
+		{"case-variant-key", strings.Replace(base("/dev/vda"), `"raid":"none"`, `"raid":"none","RAID":"1"`, 1), `are the same field`},
+		{"stale-slice", strings.Replace(base("/dev/vda"), `"devices":["/dev/vda"]`, `"devices":["/dev/vda","/dev/vdb"],"devices":["/dev/vdc"]`, 1), `key "devices" appears twice`},
+		{"trailing-data", base("/dev/vda") + ` {}`, "not valid JSON"},
+		{"comment-not-string", strings.Replace(base("/dev/vda"), `{"version":2,`, `{"version":2,"comment":{"x":1},`, 1), "comment must be a string"},
+		{"negative-count-manual", strings.Replace(base("/dev/vda"), `"raid":"none",`, `"raid":"none","count":-1,`, 1), "count=-1 must not be negative"},
+	}
+	for _, c := range cases {
+		raw := []byte(c.doc)
+		cfg, err := Parse(raw)
+		if err == nil {
+			err = cfg.ValidateRaw(raw)
+		}
+		if c.want == "" {
+			if err != nil {
+				t.Errorf("%s: unexpected refusal: %v", c.name, err)
+			}
+			continue
+		}
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: got %v, want %q", c.name, err, c.want)
+		}
+	}
+}

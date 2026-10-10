@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/jsonstrict"
 )
 
 // FilterConfig is the JSON shape consumed by `lpart-osimage-install --config`.
@@ -47,6 +49,11 @@ func LoadFilterConfig(path string) (*FilterConfig, error) {
 	}
 	if len(bytes.TrimSpace(body)) == 0 {
 		return &FilterConfig{}, nil
+	}
+	// one JSON object, no repeated keys: a second "preserve" used to replace
+	// the first list silently, and data after the object was ignored
+	if err := jsonstrict.Check(body); err != nil {
+		return nil, &ErrFilterConfig{fmt.Errorf("osimage_filter: invalid (%w)", err)}
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.DisallowUnknownFields()
