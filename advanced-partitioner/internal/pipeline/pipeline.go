@@ -416,8 +416,12 @@ func (p *Pipeline) runPart() error {
 func (p *Pipeline) runOSImage(mode installcontext.Mode) error {
 	switch {
 	case mode.IsLocal():
+		// --resolved: storage-check verifies the disks storage-prepare chose.
+		// A selection=discover set has no devices in storage.json; they are
+		// resolved from the disk pool and exist only in storage-resolved.json.
 		return p.runStep("osimage", p.bin("lpart-storage-check"),
 			"--config", p.rt("storage.json"),
+			"--resolved", p.rt("storage-resolved.json"),
 			"--install-context", p.rt("install-context.json"),
 			"--log-dir", p.opts.LogDir, "--details")
 	case mode.ExtractsImage():

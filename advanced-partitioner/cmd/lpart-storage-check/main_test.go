@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
 )
 
 // validConfig is a minimal valid v1.4 disklayout used by the guard tests.
@@ -142,5 +144,85 @@ func TestDryRunRefused(t *testing.T) {
 	stderr, rc = runEnv(t, "--dry-run", "--config", "/nonexistent.json")
 	if rc == 0 || !strings.Contains(stderr, "not supported") {
 		t.Fatalf("refusal must fire before config handling: rc=%d %s", rc, stderr)
+	}
+}
+
+// discoverConfig is a v1.4 disklayout whose os set picks its disks from the
+// pool: the config names no devices, storage-prepare resolves them.
+const discoverConfig = `{
+	"version": 2,
+	"sets": [
+		{"name": "os", "role": "os", "selection": "discover", "raid": "1",
+		 "volumes": [
+		   {"name": "uefi", "mountpoint": "/boot/efi", "fs": "vfat", "provider": "partition", "size": "600M"},
+		   {"name": "root", "mountpoint": "/", "fs": "xfs", "provider": "lvm", "size": "100%"}
+		 ]}
+	]
+}`
+
+// storage-resolved.json as lpart-storage-prepare writes it (result.WriteResolved).
+const resolvedJSON = `{
+  "version": 2,
+  "sets": [
+    {"name": "os", "role": "os", "firmware_mode": "uefi", "selector_type": "device_paths",
+     "storage_type": "disk", "raid_mode": "raid1",
+     "selected_disks": [
+       {"configured_path": "/dev/vdb", "resolved_path": "/dev/vdb", "selector_type": "device_paths", "size_bytes": 1, "model": "", "serial": ""},
+       {"configured_path": "/dev/vda", "resolved_path": "/dev/vda", "selector_type": "device_paths", "size_bytes": 1, "model": "", "serial": ""}
+     ]}
+  ]
+}`
+
+func loadConfig(t *testing.T, body string) *v2.Config {
+	t.Helper()
+	cfg, raw, err := v2.LoadFile(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.ValidateRaw(raw); err != nil {
+		t.Fatalf("fixture must validate: %v", err)
+	}
+	return cfg
+}
+
+// install_mode=local on a selection=discover layout: storage-check must check
+// the disks storage-prepare selected (from storage-resolved.json), in its
+// order, instead of an empty device list ("set has no resolved devices" ->
+// exit 2 -> the node parked on every boot).
+func TestApplyResolvedFillsDiscoverSets(t *testing.T) {
+	cfg := loadConfig(t, discoverConfig)
+	resolved := writeConfig(t, resolvedJSON)
+	if err := applyResolved(cfg, resolved); err != nil {
+		t.Fatalf("applyResolved: %v", err)
+	}
+	if got := strings.Join(cfg.Sets[0].EffectiveDevices(), ","); got != "/dev/vdb,/dev/vda" {
+		t.Fatalf("devices = %q, want storage-prepare's selection in its order", got)
+	}
+	// A manual layout needs no resolved file.
+	if err := applyResolved(loadConfig(t, validConfig), ""); err != nil {
+		t.Fatalf("manual set: %v", err)
+	}
+}
+
+func TestApplyResolvedRefusesWithoutTheDisks(t *testing.T) {
+	if err := applyResolved(loadConfig(t, discoverConfig), ""); err == nil || !strings.Contains(err.Error(), "--resolved") {
+		t.Fatalf("a discover set without --resolved must be refused, got %v", err)
+	}
+	other := writeConfig(t, strings.ReplaceAll(resolvedJSON, `"name": "os"`, `"name": "data"`))
+	if err := applyResolved(loadConfig(t, discoverConfig), other); err == nil || !strings.Contains(err.Error(), "not in") {
+		t.Fatalf("a set missing from the resolved file must be refused, got %v", err)
+	}
+	if err := applyResolved(loadConfig(t, discoverConfig), "/no/such/storage-resolved.json"); err == nil {
+		t.Fatal("an unreadable resolved file must be refused")
+	}
+}
+
+// The refusal is deterministic, so it is a fatal config error (exit 3), not
+// a retry every 30 s.
+func TestDiscoverWithoutResolvedIsFatal(t *testing.T) {
+	stderr, rc := runEnv(t, "--config", writeConfig(t, discoverConfig),
+		"--install-context", writeConfig(t, `{"install_mode":"local"}`))
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=resolved-devices") {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
 	}
 }

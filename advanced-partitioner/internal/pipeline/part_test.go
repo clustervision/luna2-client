@@ -97,6 +97,25 @@ func TestSanitizeMarkerForAnEmptyPool(t *testing.T) {
 	}
 }
 
+// install_mode=local verifies the disks storage-prepare selected: a
+// selection=discover set has its devices only in storage-resolved.json.
+func TestLocalModePassesTheResolvedDisksToStorageCheck(t *testing.T) {
+	rt, logs, bin := partEnv(t, "local")
+	argsOut := filepath.Join(rt, "check-args")
+	fakeBin(t, bin, "lpart-storage-prepare", `exit 0`)
+	fakeBin(t, bin, "lpart-storage-check", `echo "$@" > `+argsOut)
+	if err := runPartWith(t, rt, logs, bin); err != nil {
+		t.Fatalf("runPart: %v", err)
+	}
+	b, err := os.ReadFile(argsOut)
+	if err != nil {
+		t.Fatalf("storage-check not run: %v", err)
+	}
+	if want := "--resolved " + filepath.Join(rt, "storage-resolved.json"); !strings.Contains(string(b), want) {
+		t.Fatalf("storage-check args %q lack %q", strings.TrimSpace(string(b)), want)
+	}
+}
+
 func TestSanitizeTimeout(t *testing.T) {
 	floor := 2 * time.Hour
 	if got := sanitizeTimeout(nil, floor); got != 0 {

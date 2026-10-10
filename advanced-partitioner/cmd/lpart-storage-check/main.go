@@ -37,6 +37,7 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fscheck"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installcontext"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/mount"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/storagehealth"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sysenv"
 )
@@ -59,6 +60,7 @@ type flags struct {
 	Details            bool
 	ResultOut          string
 	InstallContextPath string
+	ResolvedPath       string
 	// test affordances
 	CmdlinePath      string
 	SkipCommandCheck bool
@@ -94,6 +96,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&f.ResultOut, "result-out", defaultResultOut, "Where to write storage-check-result.json")
 	fs.StringVar(&f.InstallContextPath, "install-context", installcontext.DefaultJSONPath,
 		"Path to install-context.json (mode/osimage-sync flags)")
+	fs.StringVar(&f.ResolvedPath, "resolved", "",
+		"Path to lpart-storage-prepare's storage-resolved.json: selection=discover sets are checked on the disks it selected")
 	fs.StringVar(&f.CmdlinePath, "cmdline-path", "", "(test) override /proc/cmdline path")
 	fs.BoolVar(&f.SkipCommandCheck, "skip-command-check", false, "(test) skip the storage-check command preflight")
 
@@ -179,7 +183,15 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		errln(stderr, "%v", err)
 		return 1
 	}
+	// A selection=discover set names no devices in the config: storage-prepare
+	// picks them from the disk pool and records them in storage-resolved.json
+	// only. Without them the check resolves an empty device list, reports
+	// "set has no resolved devices" and parks every install_mode=local boot.
+	if err := applyResolved(cfg, f.ResolvedPath); err != nil {
+		return cli.ExitFatalConfig(stderr, toolName, "resolved-devices", "%v", err)
+	}
 	logger.KV("config_path", f.ConfigPath)
+	logger.KV("resolved_path", f.ResolvedPath)
 	logger.KV("sysroot", f.Sysroot)
 
 	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
@@ -299,6 +311,58 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.UserInfo("Storage healthy — mounted under %s", f.Sysroot)
 	logger.UserInfo("storage-check-result: %s", f.ResultOut)
 	return 0
+}
+
+// applyResolved fills each selection=discover disk set's devices from
+// storage-resolved.json (the disks lpart-storage-prepare selected for it, in
+// its order). Manual and memory sets keep their configured devices.
+func applyResolved(cfg *v2.Config, path string) error {
+	var discover []*v2.Set
+	for i := range cfg.Sets {
+		set := &cfg.Sets[i]
+		if set.SelectionMode() == "discover" && set.StorageType() != v2.StorageMemory && len(set.Devices) == 0 {
+			discover = append(discover, set)
+		}
+	}
+	if len(discover) == 0 {
+		return nil
+	}
+	if path == "" {
+		return fmt.Errorf("set %q is selection=discover: pass --resolved with lpart-storage-prepare's storage-resolved.json (the config names no devices)", discover[0].Name)
+	}
+	body, err := os.ReadFile(path) //nolint:gosec // operator-supplied path
+	if err != nil {
+		return fmt.Errorf("read resolved devices: %w", err)
+	}
+	var agg result.ResolvedAggregate
+	if err := json.Unmarshal(body, &agg); err != nil {
+		return fmt.Errorf("parse %s: %w", path, err)
+	}
+	byName := make(map[string]result.ResolvedSet, len(agg.Sets))
+	for _, rs := range agg.Sets {
+		byName[rs.Name] = rs
+	}
+	for _, set := range discover {
+		rs, ok := byName[set.Name]
+		if !ok {
+			return fmt.Errorf("set %q (selection=discover) is not in %s", set.Name, path)
+		}
+		devs := make([]string, 0, len(rs.SelectedDisks))
+		for _, d := range rs.SelectedDisks {
+			p := d.ConfiguredPath
+			if p == "" {
+				p = d.ResolvedPath
+			}
+			if p != "" {
+				devs = append(devs, p)
+			}
+		}
+		if len(devs) == 0 {
+			return fmt.Errorf("set %q (selection=discover): %s lists no selected disks", set.Name, path)
+		}
+		set.Devices = devs
+	}
+	return nil
 }
 
 func writeJSON(path string, body any) error {
