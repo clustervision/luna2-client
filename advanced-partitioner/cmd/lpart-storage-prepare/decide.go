@@ -353,34 +353,12 @@ func (sp *setProcessor) missingDeviceError(set *v2.Set) error {
 		return nil
 	}
 	present := len(sp.manualDisks[set.Name])
-	if degradedRunnable(set, present) {
+	if set.RunsDegradedWith(present) {
 		return nil
 	}
 	return fatalConfigf("device-missing",
 		"set %q: device(s) %s not present on this node, and raid %s cannot run without them (%d of %d device(s) present) -- replace the disk or correct the disklayout; no disk was touched",
 		set.Name, strings.Join(missing, ", "), set.Raid, present, len(set.EffectiveDevices()))
-}
-
-// degradedRunnable reports whether a redundant raid set can still run with
-// `present` of its configured devices. Only raid1/5/6/10 can run degraded;
-// for raid10 this is the necessary condition and mdadm --assemble --run makes
-// the final call (it refuses when a whole mirror pair is gone).
-func degradedRunnable(set *v2.Set, present int) bool {
-	active := len(set.EffectiveDevices()) - set.SpareCount()
-	if present < 1 {
-		return false
-	}
-	switch set.RAIDMode() {
-	case "raid1":
-		return true
-	case "raid5":
-		return present >= active-1
-	case "raid6":
-		return present >= active-2
-	case "raid10":
-		return present >= (active+1)/2
-	}
-	return false
 }
 
 // preflightCreate runs the deterministic checks of a set about to be

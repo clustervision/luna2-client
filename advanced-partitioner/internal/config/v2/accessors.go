@@ -415,3 +415,27 @@ func (s *Set) BootFS() string {
 
 // (The hands-off "persistent" flag is the exported Set.Persistent field;
 // the decision engine, lpart-storage-check, and lpart-osimage-install key off it.)
+
+// RunsDegradedWith reports whether this redundant raid set can still run
+// with `present` of its configured devices. Only raid1/5/6/10 can run
+// degraded; for raid10 this is the necessary condition and mdadm --assemble
+// --run makes the final call (it refuses when a whole mirror pair is gone).
+// Shared by lpart-storage-prepare (mount modes) and lpart-storage-check
+// (install_mode=local), so both judge a missing member the same way.
+func (s *Set) RunsDegradedWith(present int) bool {
+	active := len(s.EffectiveDevices()) - s.SpareCount()
+	if present < 1 {
+		return false
+	}
+	switch s.RAIDMode() {
+	case "raid1":
+		return true
+	case "raid5":
+		return present >= active-1
+	case "raid6":
+		return present >= active-2
+	case "raid10":
+		return present >= (active+1)/2
+	}
+	return false
+}

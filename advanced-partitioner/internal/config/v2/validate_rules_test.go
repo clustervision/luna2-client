@@ -469,3 +469,38 @@ func TestRuleBootloaderOsSetOnly(t *testing.T) {
 	}
 	runRuleCases(t, cases)
 }
+
+func TestRunsDegradedWith(t *testing.T) {
+	devs := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = "/dev/disk/by-id/d" + string(rune('a'+i))
+		}
+		return out
+	}
+	cases := []struct {
+		raid    string
+		devices int
+		spares  int
+		present int
+		want    bool
+	}{
+		{"1", 2, 0, 1, true},
+		{"1", 2, 0, 0, false},
+		{"none", 1, 0, 0, false},
+		{"0", 2, 0, 1, false},
+		{"5", 4, 0, 3, true},
+		{"5", 4, 0, 2, false},
+		{"5", 5, 1, 3, true}, // spare gone and one active gone
+		{"6", 5, 0, 3, true},
+		{"6", 5, 0, 2, false},
+		{"10", 4, 0, 2, true},
+		{"10", 4, 0, 1, false},
+	}
+	for _, c := range cases {
+		s := &Set{Name: "data", Role: "data", Raid: c.raid, Spares: c.spares, Devices: devs(c.devices)}
+		if got := s.RunsDegradedWith(c.present); got != c.want {
+			t.Errorf("raid%s %d dev %d spare, %d present: got %v want %v", c.raid, c.devices, c.spares, c.present, got, c.want)
+		}
+	}
+}

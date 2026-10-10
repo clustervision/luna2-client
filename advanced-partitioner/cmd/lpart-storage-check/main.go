@@ -36,6 +36,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -221,6 +222,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	})
 
 	var failures []storagehealth.Unhealthy
+	// First PRESENT device per set: the BIOS boot partition probe below must
+	// not look at a configured member that is missing (degraded raid).
+	presentFirst := map[string]string{}
 	for i := range cfg.Sets {
 		set := &cfg.Sets[i]
 		storageType := set.StorageType()
@@ -230,7 +234,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			continue
 		}
 
-		resolved, err := resolver.ResolveAll(context.Background(), set.EffectiveDevices())
+		resolved, missing, err := resolvePresent(context.Background(), resolver, set.EffectiveDevices())
+		if err == nil && len(missing) > 0 && !set.RunsDegradedWith(len(resolved)) {
+			err = fmt.Errorf("device(s) %s not present on this node, and raid %s cannot run without them (%d of %d device(s) present)",
+				strings.Join(missing, ", "), set.Raid, len(resolved), len(set.EffectiveDevices()))
+		}
 		if err != nil {
 			failures = append(failures, storagehealth.Unhealthy{
 				SetName: set.Name, VolumeName: "(devices)",
@@ -239,6 +247,12 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			logger.KV("verdict", set.Name+"=broken")
 			continue
 		}
+		for _, m := range missing {
+			// Same rule and wording as lpart-storage-prepare: a redundant
+			// raid set that still assembles boots degraded, loudly.
+			logger.Warn(fmt.Sprintf("set %s: running degraded, member %s missing; replace the disk and reinstall with install_mode full to rebuild", set.Name, m))
+		}
+		presentFirst[set.Name] = resolved[0].ResolvedPath
 		verdict, fs := storagehealth.Classify(context.Background(), runner, checker, set, resolved, logger)
 		logger.KV("verdict", set.Name+"="+string(verdict))
 		failures = append(failures, fs...)
@@ -287,15 +301,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.SetStage("mount")
 	logger.UserInfo("All sets healthy — mounting storage tree")
 	predicted := fsmod.PredictFilesystemsFromConfig(cfg, func(set *v2.Set) bool {
-		devs := set.EffectiveDevices()
-		if set.Role != "os" || len(devs) == 0 {
+		disk, ok := presentFirst[set.Name]
+		if set.Role != "os" || !ok {
 			return false
 		}
-		r, err := resolver.Resolve(context.Background(), devs[0])
-		if err != nil {
-			return false
-		}
-		return storagehealth.HasBIOSBootPartition(context.Background(), runner, r.ResolvedPath)
+		return storagehealth.HasBIOSBootPartition(context.Background(), runner, disk)
 	})
 	mt, err := mounter.MountSysrootTree(context.Background(), predicted)
 	if err != nil {
@@ -385,4 +395,26 @@ func writeJSON(path string, body any) error {
 	}
 	//nolint:gosec // operator-supplied output path
 	return os.WriteFile(path, append(enc, '\n'), 0o640)
+}
+
+// resolvePresent resolves each configured device on its own. A device that
+// does not exist on this node is returned in missing (the caller decides
+// whether the set can run degraded); any other resolve error (mounted,
+// read-only, not a whole disk) fails the set as before.
+func resolvePresent(ctx context.Context, resolver *selector.Resolver, devices []string) (present []selector.Resolved, missing []string, err error) {
+	for _, dev := range devices {
+		r, rerr := resolver.Resolve(ctx, dev)
+		if rerr != nil {
+			if errors.Is(rerr, selector.ErrNotFound) {
+				missing = append(missing, dev)
+				continue
+			}
+			return nil, nil, rerr
+		}
+		present = append(present, r)
+	}
+	if len(present) == 0 && len(missing) > 0 {
+		return nil, missing, fmt.Errorf("none of the set's devices (%s) is present on this node", strings.Join(missing, ", "))
+	}
+	return present, missing, nil
 }
