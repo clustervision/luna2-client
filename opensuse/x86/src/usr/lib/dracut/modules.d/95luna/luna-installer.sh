@@ -299,16 +299,25 @@ function _get_luna_ctty () {
     echo -n $luna_ctty
 }
 
+# luna_trim prints $1 without leading/trailing whitespace. Unlike $(echo $x)
+# it does not glob-expand: a password holding '*' stays the password.
+function luna_trim () {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "$v"
+}
+
 function get_credentials {
     LUNA_INI='/trinity/local/luna/node/config/luna.ini'
-    if [ -f $LUNA_INI ]; then
+    if [ -f "$LUNA_INI" ]; then
         while IFS='=' read -ra line; do
-            if [ ! "$(echo $line | grep -E '^(#|;)')" ] && [ "$line" ]; then
-                if [ "$(echo $line | grep '^\[')" ]; then
-                    section=$(echo $line | grep -oE "[A-Z]+")
+            if [ ! "$(luna_trim "$line" | grep -E '^(#|;)')" ] && [ "$line" ]; then
+                if [ "$(luna_trim "$line" | grep '^\[')" ]; then
+                    section=$(luna_trim "$line" | grep -oE "[A-Z]+")
                 else
-                    key=$(echo ${line[0]})
-                    value=$(echo ${line[1]})
+                    key=$(luna_trim "${line[0]}")
+                    value=$(luna_trim "${line[1]}")
                     declare -x "${section}_${key}"="$value"
                 fi
             fi
@@ -320,10 +329,22 @@ function get_credentials {
     echo "${API_USERNAME}:${API_PASSWORD}"
 }
 
+# curl's --interface takes the next word as its argument. With an empty
+# $luna_nic (no NIC matched luna.mac; dhcp then ran on every interface) the
+# unquoted expansion vanished, --interface swallowed the next option and the
+# fetch failed for ever ("Could not get install script"). Bind to the NIC
+# only when it is known.
+function luna_curl () {
+    local -a _opts=()
+    [ -n "$INSECURE" ] && _opts+=("$INSECURE")
+    [ -n "$luna_nic" ] && _opts+=(--interface "$luna_nic")
+    curl "${_opts[@]}" "$@"
+}
+
 function fetch_token {
     CREDENTIALS=$(get_credentials)
-    USERNAME=$(echo $CREDENTIALS | awk -F':' '{ print $1 }')
-    PASSWORD=$(echo $CREDENTIALS | awk -F':' '{ print $2 }')
+    USERNAME=$(echo "$CREDENTIALS" | awk -F':' '{ print $1 }')
+    PASSWORD=$(echo "$CREDENTIALS" | awk -F':' '{ print $2 }')
     export TPM2TOOLS_TCTI="device:/dev/tpm0"
     command -v ldconfig >/dev/null 2>&1 && ldconfig
     TPM=$(tpm2_pcrread sha256:0 2> /dev/null | grep '0x' | awk -F' : ' '{ print $2 }')
@@ -338,14 +359,14 @@ function fetch_token {
         INSECURE='--insecure'
     fi
     luna_mac=$(getargs luna.mac=)
-    luna_nic=$(find_nic ${luna_mac})
-    curl $INSECURE --interface $luna_nic -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
+    luna_nic=$(find_nic "${luna_mac}")
+    luna_curl -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
     valid=$(grep token /lunatmp/token.json)
     if [ "$valid" ]; then
         token=$(cat /lunatmp/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
         token=$(echo "${token:1:-1}")
-        echo $token > /lunatmp/token.dat
-        echo $token
+        echo "$token" > /lunatmp/token.dat
+        echo "$token"
     else
         >&2 cat /lunatmp/token.json
         >&2 echo
@@ -590,12 +611,12 @@ if [ "x$root" = "xluna" ]; then
     else
         RES="failure"
         luna_mac=$(getargs luna.mac=)
-        luna_nic=$(find_nic ${luna_mac})
+        luna_nic=$(find_nic "${luna_mac}")
         while [ "x$RES" = "xfailure" ]; do
             echo "Luna2: Trying to get install script."
             while [ 0 ]; do
                 token=$(fetch_token)
-                curl $INSECURE --interface $luna_nic -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
+                luna_curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
                 http_code=$(cat /lunatmp/http_code.out)
                 if [ "$http_code" == "200" ]; then
                     break
