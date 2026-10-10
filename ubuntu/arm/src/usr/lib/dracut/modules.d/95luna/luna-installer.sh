@@ -291,12 +291,32 @@ function luna_finish () {
 
 }
 
+# The console the kernel uses last: the last console= on the command line is
+# /dev/console, where lpart-phase renders the installer. Interactive recovery
+# (retry countdown, park shell) must sit on the same device: on a
+# serial-console node tty1 is a VT nobody sees. console=tty0 ("the foreground
+# VT") maps to tty1; options after the comma (ttyS0,115200n8) are dropped.
+function _last_kernel_console () {
+    local _o _c="" _args=()
+    { read -r -a _args < /proc/cmdline; } 2>/dev/null
+    for _o in "${_args[@]}"; do
+        case "$_o" in
+            console=*) _c="${_o#console=}"; _c="${_c%%,*}" ;;
+        esac
+    done
+    [ -n "$_c" ] || return 0
+    [ "$_c" = "tty0" ] && _c=tty1
+    _c="/dev/${_c#/dev/}"
+    [ -c "$_c" ] && echo -n "$_c"
+    return 0
+}
+
 function _get_luna_ctty () {
     local luna_ctty
     luna_ctty=$(getargs luna.ctty=)
-    # TODO [ "x${luna_ctty}" = "x" ] && luna_ctty=$(getargs console=)
-    [ "x${luna_ctty}" = "x" ] && luna_ctty="/dev/tty1"
-    echo -n $luna_ctty
+    [ -n "${luna_ctty}" ] || luna_ctty=$(_last_kernel_console)
+    [ -n "${luna_ctty}" ] || luna_ctty="/dev/tty1"
+    echo -n "$luna_ctty"
 }
 
 # luna_trim prints $1 without leading/trailing whitespace. Unlike $(echo $x)
@@ -428,8 +448,22 @@ function retry_countdown () {
         sleep "$secs"
         return 0
     fi
-    local i key
-    for (( i=secs; i>0; i-- )); do
+    local i key _quiet=0 _n=0
+    # Input is read from the recovery console only (fd 9), and the first second
+    # is ignored: what is already buffered there (keys pressed during the
+    # install, serial line noise) and what arrives in that second is dropped,
+    # so a stray byte does not take the node into a shell instead of a retry.
+    printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$secs" >"$ctty"
+    while (( _quiet < 10 && _n < 4096 )); do
+        if read -t 0.1 -n 1 -s key <&9; then
+            (( _n++ ))
+        elif (( $? > 128 )); then
+            (( _quiet++ ))            # 0.1 s without input
+        else
+            sleep 1; break            # EOF/error: no input to ignore
+        fi
+    done
+    for (( i=secs-1; i>0; i-- )); do
         printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$i" >"$ctty"
         if read -t 1 -n 1 -s key <&9; then
             exec 9<&-
@@ -437,6 +471,8 @@ function retry_countdown () {
             echo "Luna2: Dropping to shell. 'exit' resumes the retry; 'poweroff' stops." >"$ctty"
             setsid -c /bin/sh -i -l 0<>"$ctty" 1<>"$ctty" 2<>"$ctty"
             return 0
+        elif (( $? <= 128 )); then
+            sleep 1                   # EOF/error, not a timeout: keep the pause
         fi
     done
     exec 9<&-
