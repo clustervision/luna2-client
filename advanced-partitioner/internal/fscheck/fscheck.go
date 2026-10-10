@@ -31,8 +31,12 @@
 //	  the fs's own crash recovery) and re-check; still unclean → unhealthy.
 //
 //	vfat (fsck.vfat -n OR fsck.fat -n — check only):
-//	  0  clean; anything else unhealthy (no journal to replay; -a's
-//	  auto-fixes can truncate crosslinked files, so no auto-repair here)
+//	  0  clean
+//	  1  healthy ONLY when the sole finding is the FAT dirty bit (see
+//	     dirtyBitOnly): Linux sets it while the ESP is mounted, so every hard
+//	     reset, power loss, crash or fence leaves it; it is not damage.
+//	  else unhealthy (no journal to replay; -a's auto-fixes can truncate
+//	  crosslinked files, so no auto-repair here)
 //
 //	swap: no fsck. The caller is expected to check the LABEL/UUID match
 //	separately; this package returns OK unconditionally.
@@ -51,6 +55,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"regexp"
+	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
@@ -188,8 +194,8 @@ func (c *Checker) checkXFS(ctx context.Context, device string) Result {
 	return Result{Device: device, FS: "xfs", OK: true}
 }
 
-// checkVfat runs the chosen FAT checker with -a. rc 0 and rc 1 are
-// healthy.
+// checkVfat runs the chosen FAT checker with -n (check only). rc 0 is
+// healthy; rc 1 is healthy only when the dirty bit is the sole finding.
 func (c *Checker) checkVfat(ctx context.Context, device, fs string) Result {
 	res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
 		Path: c.o.FsckVfatCmd, Args: []string{"-n", device},
@@ -198,6 +204,10 @@ func (c *Checker) checkVfat(ctx context.Context, device, fs string) Result {
 	rc := exitCode(res, err)
 	if rc == 0 {
 		c.log("fsck.vfat -n OK: %s", device)
+		return Result{Device: device, FS: fs, OK: true}
+	}
+	if rc == 1 && dirtyBitOnly(string(res.Stdout)+"\n"+string(res.Stderr)) {
+		c.log("fsck.vfat -n: %s only has the FAT dirty bit set (not unmounted cleanly: hard reset, power loss or crash) -- healthy, left unchanged", device)
 		return Result{Device: device, FS: fs, OK: true}
 	}
 	return Result{
@@ -248,4 +258,72 @@ func (c *Checker) warn(format string, args ...any) {
 	if c.o.Logger != nil {
 		c.o.Logger.Warn(fmt.Sprintf(format, args...))
 	}
+}
+
+// FAT dirty-bit-only detection. fsck.fat -n exits 1 for ANY finding, and the
+// dirty bit -- set by Linux for as long as the filesystem is mounted -- is one.
+// Every hard reset, power loss, crash or fence of a node therefore made a
+// healthy ESP "unhealthy": sync and local parked the node and auto wiped the
+// whole os set. The output is accepted as dirty-bit-only when every line is one
+// of the lines below and the dirty-bit line is present; anything else (FATs
+// differ, lost clusters, bad directory entries, ...) stays unhealthy.
+//
+// dosfstools 4.1 (el8):  "0x41: Dirty bit is set. ..." (0x25 on FAT16)
+// dosfstools 4.2 (el9):  "Dirty bit is set. ..." and, on FAT32, the boot
+// sector/backup difference at byte 65 -- the dirty flag itself, which only the
+// primary boot sector carries ("  65:01/00").
+var (
+	vfatDirtyLine   = regexp.MustCompile(`^(0x[0-9a-fA-F]+: )?Dirty bit is set\. Fs was not properly unmounted and some data may be corrupt\.$`)
+	vfatBenignLines = []*regexp.Regexp{
+		regexp.MustCompile(`^fsck\.(fat|vfat|msdos) [0-9][^ ]* \(.*\)$`),
+		regexp.MustCompile(`^Automatically removing dirty bit\.$`),
+		regexp.MustCompile(`^Leaving filesystem unchanged\.$`),
+		regexp.MustCompile(`^\S.*: [0-9]+ files, [0-9]+/[0-9]+ clusters$`),
+	}
+	vfatBackupHeader = []string{
+		"There are differences between boot sector and its backup.",
+		"This is mostly harmless. Differences: (offset:original/backup)",
+		"Not automatically fixing this.",
+	}
+	vfatBackupDiff = regexp.MustCompile(`^([0-9]+):([0-9a-fA-F]{2})/([0-9a-fA-F]{2})$`)
+)
+
+// fat32DirtyFlagOffset is the boot-sector byte (0x41) that holds the FAT32
+// dirty flag; FAT16 keeps it at 0x25 and has no backup boot sector.
+const fat32DirtyFlagOffset = "65"
+
+func dirtyBitOnly(output string) bool {
+	sawDirty := false
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if vfatDirtyLine.MatchString(line) {
+			sawDirty = true
+			continue
+		}
+		if m := vfatBackupDiff.FindStringSubmatch(line); m != nil {
+			if m[1] != fat32DirtyFlagOffset {
+				return false
+			}
+			continue
+		}
+		benign := false
+		for _, h := range vfatBackupHeader {
+			if line == h {
+				benign = true
+				break
+			}
+		}
+		for _, re := range vfatBenignLines {
+			if !benign && re.MatchString(line) {
+				benign = true
+			}
+		}
+		if !benign {
+			return false
+		}
+	}
+	return sawDirty
 }

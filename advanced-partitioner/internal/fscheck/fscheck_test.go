@@ -220,3 +220,41 @@ func TestExitCodeFromError(t *testing.T) {
 		t.Fatal("err + rc 7 should map to 7")
 	}
 }
+
+// Real fsck.fat -n output captured on el8 (dosfstools 4.1) and el9 (4.2) for a
+// dirty-only and a genuinely damaged FAT (lab, 10 October 2026).
+func TestDirtyBitOnly(t *testing.T) {
+	cases := []struct {
+		name string
+		out  string
+		want bool
+	}{
+		{"el8 fat32 dirty", "fsck.fat 4.1 (2017-01-24)\n0x41: Dirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n Automatically removing dirty bit.\nLeaving filesystem unchanged.\n/dev/vda1: 16 files, 2573/153296 clusters\n", true},
+		{"el8 fat16 dirty", "fsck.fat 4.1 (2017-01-24)\n0x25: Dirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n Automatically removing dirty bit.\nLeaving filesystem unchanged.\n/tmp/fat16-dirty.img: 1 files, 1/32695 clusters\n", true},
+		{"el9 fat16 dirty", "fsck.fat 4.2 (2021-01-31)\nDirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n Automatically removing dirty bit.\n\nLeaving filesystem unchanged.\nfat16-dirty.img: 1 files, 1/32695 clusters\n", true},
+		{"el9 fat32 dirty (backup differs at the dirty flag only)", "fsck.fat 4.2 (2021-01-31)\nThere are differences between boot sector and its backup.\nThis is mostly harmless. Differences: (offset:original/backup)\n  65:01/00\n  Not automatically fixing this.\nDirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n Automatically removing dirty bit.\n\nLeaving filesystem unchanged.\nfat32-dirty.img: 1 files, 2/153290 clusters\n", true},
+		{"el9 backup differs elsewhere too", "fsck.fat 4.2 (2021-01-31)\nThere are differences between boot sector and its backup.\nThis is mostly harmless. Differences: (offset:original/backup)\n  65:01/00\n  3:4d/4e\n  Not automatically fixing this.\nDirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n Automatically removing dirty bit.\nLeaving filesystem unchanged.\nx: 1 files, 2/1 clusters\n", false},
+		{"el8 FATs differ", "fsck.fat 4.1 (2017-01-24)\nFATs differ - using first FAT.\nLeaving filesystem unchanged.\n/tmp/fat32-broken.img: 1 files, 2/153290 clusters\n", false},
+		{"dirty plus FATs differ", "fsck.fat 4.1 (2017-01-24)\n0x41: Dirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n Automatically removing dirty bit.\nFATs differ - using first FAT.\nLeaving filesystem unchanged.\n/dev/vda1: 16 files, 2573/153296 clusters\n", false},
+		{"codepage error (missing gconv)", "fsck.fat 4.1 (2017-01-24)\nCP437: Invalid argument\n", false},
+		{"empty", "", false},
+	}
+	for _, c := range cases {
+		if got := dirtyBitOnly(c.out); got != c.want {
+			t.Errorf("%s: dirtyBitOnly = %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+func TestCheckVfatDirtyBitIsHealthy(t *testing.T) {
+	dirty := "fsck.fat 4.1 (2017-01-24)\n0x41: Dirty bit is set. Fs was not properly unmounted and some data may be corrupt.\n Automatically removing dirty bit.\nLeaving filesystem unchanged.\n/dev/vda1: 16 files, 2573/153296 clusters\n"
+	f := executor.NewFakeRunner(executor.FakeResponse{Stdout: []byte(dirty), ExitCode: 1, Err: errors.New("exit status 1")})
+	if res := New(Options{Runner: f}).CheckFS(context.Background(), "/dev/vda1", "vfat"); !res.OK {
+		t.Fatalf("dirty-bit-only ESP must be healthy, got %+v", res)
+	}
+	broken := "fsck.fat 4.1 (2017-01-24)\nFATs differ - using first FAT.\nLeaving filesystem unchanged.\n/dev/vda1: 16 files, 2573/153296 clusters\n"
+	g := executor.NewFakeRunner(executor.FakeResponse{Stdout: []byte(broken), ExitCode: 1, Err: errors.New("exit status 1")})
+	if res := New(Options{Runner: g}).CheckFS(context.Background(), "/dev/vda1", "vfat"); res.OK {
+		t.Fatal("a FAT with differing FATs must stay unhealthy")
+	}
+}
