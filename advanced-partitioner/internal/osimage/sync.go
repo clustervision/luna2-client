@@ -557,7 +557,50 @@ func (o SyncOptions) sweep(members map[string]memberInfo, keepDirs map[string]bo
 	return removed, err
 }
 
+// fsMagicNoPOSIX are statfs f_type values of filesystems that store no Unix
+// owner/mode and keep mtimes in 2-second steps: msdos/vfat and exfat.
+var fsMagicNoPOSIX = map[int64]bool{0x4d44: true, 0x2011bab0: true}
+
+// statfsType is a test seam: the filesystem type (statfs f_type) of path.
+var statfsType = func(path string) (int64, error) {
+	var sfs syscall.Statfs_t
+	if err := syscall.Statfs(path, &sfs); err != nil {
+		return 0, err
+	}
+	return int64(sfs.Type), nil //nolint:unconvert // Type is int64 on amd64, int32 elsewhere
+}
+
+// posixMetaFS reports whether the filesystem of path (device dev) keeps Unix
+// owner, mode and 1-second mtimes. Cached per device; an unreadable statfs
+// counts as POSIX, so the strict comparison stays the default.
+func posixMetaFS(dev uint64, path string, cache map[uint64]bool) bool {
+	if v, ok := cache[dev]; ok {
+		return v
+	}
+	v := true
+	if t, err := statfsType(path); err == nil && fsMagicNoPOSIX[t] {
+		v = false
+	}
+	cache[dev] = v
+	return v
+}
+
+// mtimeMatches compares a file's mtime with the image's: to the second on a
+// POSIX filesystem, within 2 seconds on vfat (FAT rounds write times down to
+// an even second).
+func mtimeMatches(disk, image time.Time, posix bool) bool {
+	if posix {
+		return disk.Truncate(time.Second).Equal(image.Truncate(time.Second))
+	}
+	d := disk.Sub(image)
+	if d < 0 {
+		d = -d
+	}
+	return d < 2*time.Second
+}
+
 func (o SyncOptions) verify(members map[string]memberInfo) (int, []string) {
+	fsKind := map[uint64]bool{}
 	var bad []string
 	n := 0
 	keys := make([]string, 0, len(members))
@@ -578,6 +621,13 @@ func (o SyncOptions) verify(members map[string]memberInfo) (int, []string) {
 		}
 		st, _ := fi.Sys().(*syscall.Stat_t)
 		n++
+		// The ESP is vfat: it stores no owner or mode bits (the mount options
+		// decide them) and keeps mtimes in 2-second steps. Compare type, size,
+		// content and mtime (2 s tolerance) there; owner and mode cannot match.
+		posix := true
+		if st != nil {
+			posix = posixMetaFS(uint64(st.Dev), abs, fsKind) //nolint:unconvert // Dev is uint64 on amd64, uint32 elsewhere
+		}
 		switch m.typ {
 		case tar.TypeDir:
 			if !fi.IsDir() {
@@ -599,7 +649,7 @@ func (o SyncOptions) verify(members map[string]memberInfo) (int, []string) {
 				if fi.Size() != m.size {
 					bad = append(bad, fmt.Sprintf("%s: size %d, image %d", rel, fi.Size(), m.size))
 				}
-				if !fi.ModTime().Truncate(time.Second).Equal(m.mtime.Truncate(time.Second)) {
+				if !mtimeMatches(fi.ModTime(), m.mtime, posix) {
 					bad = append(bad, fmt.Sprintf("%s: mtime %s, image %s", rel, fi.ModTime().UTC().Format(time.RFC3339), m.mtime.UTC().Format(time.RFC3339)))
 				}
 				if m.sum != "" {
@@ -611,7 +661,7 @@ func (o SyncOptions) verify(members map[string]memberInfo) (int, []string) {
 		default:
 			continue
 		}
-		if st != nil && m.typ != tar.TypeLink {
+		if st != nil && m.typ != tar.TypeLink && posix {
 			if int(st.Uid) != m.uid || int(st.Gid) != m.gid {
 				bad = append(bad, fmt.Sprintf("%s: owner %d:%d, image %d:%d", rel, st.Uid, st.Gid, m.uid, m.gid))
 			}
