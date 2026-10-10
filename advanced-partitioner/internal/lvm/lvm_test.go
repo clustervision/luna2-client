@@ -2,6 +2,7 @@ package lvm
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -66,7 +67,7 @@ func TestBuildHappyPathNoRAID(t *testing.T) {
 		"mdadm --zero-superblock /dev/sda3",
 		"wipefs -a /dev/sda3",
 		"pvcreate -ff -y /dev/sda3",
-		"vgs --noheadings -o vg_uuid,vg_name",
+		"pvs --noheadings -o vg_uuid,vg_name,pv_name",
 		"vgcreate os /dev/sda3",
 		"lvcreate --noudevsync -y -Z n -W n -n swap -L 1G os",
 		"vgmknodes os",
@@ -170,23 +171,26 @@ func mustHaveCall(t *testing.T, f *executor.FakeRunner, want string) {
 }
 
 // NB-9 (FTA v2 BE-A6b): a stale same-name VG left by a prior different-topology
-// install must be purged (by UUID) BEFORE vgcreate, or the second same-name VG
-// makes lvcreate ambiguous -> exit 5. Here `vgs` reports a stale "os" (UUID
-// STALEUUID01) plus an unrelated VG that must be left alone.
+// install on THIS set's disks must be purged (by UUID) BEFORE vgcreate, or the
+// second same-name VG makes lvcreate ambiguous -> exit 5. Here pvs reports a
+// stale "os" (UUID STALEUUID01) on sdb (one of the set's disks) plus an
+// unrelated VG that must be left alone.
 func TestBuildPurgesStaleSameNameVG(t *testing.T) {
 	f := executor.NewFakeRunner(executor.FakeResponse{})
 	f.AddMatch(executor.FakeMatch{
-		Path: "vgs",
+		Path: "pvs",
 		Response: executor.FakeResponse{
-			Stdout: []byte("  STALEUUID01 os\n  OTHERUUID99 keepme\n"),
+			Stdout: []byte("  STALEUUID01 os /dev/sdb3\n  OTHERUUID99 keepme /dev/sdc1\n"),
 		},
 	})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/sdb"},
+		Response: executor.FakeResponse{Stdout: []byte("sdb\nsdb3\n")}})
 	set := &v2.Set{
 		Name: "os", Role: "os", Raid: "none",
 		Volumes: []v2.Volume{{Name: "root", Provider: "lvm", Mountpoint: "/", FS: "xfs", Size: "100%"}},
 	}
 	if _, err := New(Options{Runner: f}).Build(context.Background(), set,
-		partition.Layout{StoragePartitions: []string{"/dev/sda3"}},
+		partition.Layout{StoragePartitions: []string{"/dev/sda3"}, Disks: []string{"/dev/sda", "/dev/sdb"}},
 		raid.State{RAIDMode: "none"}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -213,5 +217,30 @@ func TestBuildPurgesStaleSameNameVG(t *testing.T) {
 	}
 	if purgeIdx < 0 || createIdx < 0 || purgeIdx > createIdx {
 		t.Fatalf("purge must precede vgcreate: purge=%d create=%d", purgeIdx, createIdx)
+	}
+}
+
+// A VG with the set's name on a disk OUTSIDE the set (an old OS disk still
+// attached) is never removed by the build: it refuses with ForeignVGError
+// before vgcreate, instead of vgremove-ing a disk the layout does not own.
+func TestBuildRefusesForeignSameNameVG(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "pvs",
+		Response: executor.FakeResponse{Stdout: []byte("  OLDOSUUID os /dev/sdc3\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/sda"},
+		Response: executor.FakeResponse{Stdout: []byte("sda\nsda3\n")}})
+	set := &v2.Set{Name: "os", Role: "os", Raid: "none",
+		Volumes: []v2.Volume{{Name: "root", Provider: "lvm", Mountpoint: "/", FS: "xfs", Size: "100%"}}}
+	_, err := New(Options{Runner: f}).Build(context.Background(), set,
+		partition.Layout{StoragePartitions: []string{"/dev/sda3"}, Disks: []string{"/dev/sda"}},
+		raid.State{RAIDMode: "none"})
+	var fe *ForeignVGError
+	if !errors.As(err, &fe) || fe.UUID != "OLDOSUUID" {
+		t.Fatalf("want ForeignVGError for OLDOSUUID, got %v", err)
+	}
+	for _, c := range f.Calls() {
+		if c.Path == "vgremove" || c.Path == "vgchange" || c.Path == "vgcreate" {
+			t.Fatalf("foreign VG case must not run %s %v", c.Path, c.Args)
+		}
 	}
 }

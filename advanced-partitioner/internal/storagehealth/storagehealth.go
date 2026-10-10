@@ -19,6 +19,7 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fscheck"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lvm/vgselect"
 )
 
 // Verdict classifies a non-persistent set's on-disk state.
@@ -90,12 +91,26 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 	}
 
 	if set.StorageType() == v2.StorageLVM {
+		// Activate THIS set's VG by UUID: the one whose PVs are on the set's
+		// disks. `vgchange -ay <name>` is ambiguous (and refuses) when a disk
+		// outside the set -- an old OS disk still attached -- carries a VG of
+		// the same name; the healthy set was then judged broken and auto
+		// recreated it.
 		vgName := set.VGName()
+		vg, problem, unknown := OwnVG(ctx, runner, vgName, disks, logger)
+		switch {
+		case unknown:
+			markUnknown("(lvm)", problem)
+			return failures
+		case problem != "":
+			mark("(lvm)", problem)
+			return failures
+		}
 		if _, err := runner.Run(ctx, executor.CommandSpec{
-			Path: "vgchange", Args: []string{"-ay", vgName},
+			Path: "vgchange", Args: []string{"-ay", "--select", vg.Select()},
 			CaptureStdout: true, CaptureStderr: true,
 		}); err != nil {
-			mark("(lvm)", fmt.Sprintf("vgchange -ay %s failed: %v", vgName, err))
+			mark("(lvm)", fmt.Sprintf("vgchange -ay --select %s (VG %s) failed: %v", vg.Select(), vgName, err))
 			return failures
 		}
 	}
@@ -141,6 +156,31 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 		}
 	}
 	return failures
+}
+
+// OwnVG finds the set's volume group: the VG named vgName with PVs on the
+// set's disks. A same-named VG elsewhere is logged and ignored. problem is a
+// verification failure ("" when exactly one own VG exists); unknown is set
+// when the probe itself failed (pvs/lsblk error), which says nothing about the
+// set's health.
+func OwnVG(ctx context.Context, runner executor.Runner, vgName string, disks []string, logger *txlog.Logger) (vg vgselect.VG, problem string, unknown bool) {
+	loc, err := vgselect.Locate(ctx, runner, vgName, disks)
+	if err != nil {
+		return vgselect.VG{}, fmt.Sprintf("cannot list volume groups: %v", err), true
+	}
+	for _, f := range loc.Foreign {
+		if logger != nil {
+			logger.Warn(fmt.Sprintf("VG %q (uuid %s, PVs %v) is on a disk outside set %q -- ignored, never activated", f.Name, f.UUID, f.PVs, vgName))
+		}
+	}
+	switch len(loc.Own) {
+	case 1:
+		return loc.Own[0], "", false
+	case 0:
+		return vgselect.VG{}, fmt.Sprintf("no volume group %q on the set's disks", vgName), false
+	default:
+		return vgselect.VG{}, fmt.Sprintf("%d volume groups named %q on the set's disks", len(loc.Own), vgName), false
+	}
 }
 
 // volumeDevice returns the block device a volume's filesystem lives on, given

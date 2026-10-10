@@ -68,7 +68,16 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 		run("udevadm", "settle")
 	}
 	if set.StorageType() == v2.StorageLVM {
-		run("vgchange", "-ay", set.VGName())
+		// By UUID, the VG on the set's own disks: a same-named VG on another
+		// disk makes `vgchange -ay <name>` ambiguous (see OwnVG).
+		vg, problem, _ := OwnVG(ctx, runner, set.VGName(), disks, logger)
+		if problem != "" {
+			if logger != nil {
+				logger.Info("activate (best-effort) VG " + set.VGName() + ": " + problem)
+			}
+			return
+		}
+		run("vgchange", "-ay", "--select", vg.Select())
 		run("udevadm", "settle")
 	}
 }

@@ -77,7 +77,7 @@ func TestTeardownVGRefusesVGOnProtectedDisk(t *testing.T) {
 	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "pv_name,vg_name"},
 		Response: executor.FakeResponse{Stdout: []byte("  /dev/sdb1 os\n")}})
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep})
-	err := c.teardownVG(context.Background(), "os", SelectedDisksSet([]string{"/dev/sdb"}))
+	err := c.teardownVG(context.Background(), "os", SelectedDisksSet([]string{"/dev/sda"}), SelectedDisksSet([]string{"/dev/sdb"}))
 	if err == nil {
 		t.Fatal("teardownVG must refuse a VG with a PV on a protected disk")
 	}

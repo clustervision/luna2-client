@@ -581,6 +581,10 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		sp.logger.SetStage("lvm")
 		lvmState, err = sp.lvm.Build(ctx, set, layout, mdState)
 		if err != nil {
+			var fe *lvm.ForeignVGError
+			if errors.As(err, &fe) {
+				return result.StorageResult{}, result.ResolvedSet{}, safetyRefusalf("foreign-vg", "set %q: %v", set.Name, err)
+			}
 			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("lvm: %w", err)
 		}
 	}

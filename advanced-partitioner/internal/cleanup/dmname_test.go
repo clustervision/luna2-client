@@ -61,7 +61,7 @@ func TestTeardownVGLeavesHyphenatedNeighbourAlone(t *testing.T) {
 		Response: executor.FakeResponse{Stdout: []byte("data-root\t(253:0)\ndata--2-root\t(253:1)\n")}})
 	f.AddMatch(executor.FakeMatch{Path: "vgs", ArgsPrefix: []string{"data"}, Response: executor.FakeResponse{Err: errFail()}})
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep})
-	if err := c.teardownVG(context.Background(), "data", nil); err != nil {
+	if err := c.teardownVG(context.Background(), "data", nil, nil); err != nil {
 		t.Fatalf("teardownVG: %v", err)
 	}
 	sawOwn := false

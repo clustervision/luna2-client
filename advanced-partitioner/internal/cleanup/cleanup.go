@@ -186,7 +186,7 @@ func (c *Cleaner) CleanupSelectedSet(ctx context.Context, set Set) (Result, erro
 	}
 
 	c.unmountUnderSysroot(ctx, set.Name, set.OwnsSysroot, selected)
-	if err := c.teardownVG(ctx, set.Name, set.Protected); err != nil {
+	if err := c.teardownVG(ctx, set.Name, selected, set.Protected); err != nil {
 		return Result{}, err
 	}
 	if err := c.teardownSameDiskVGs(ctx, selected, set.Protected); err != nil {

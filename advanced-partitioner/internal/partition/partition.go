@@ -64,6 +64,10 @@ type Layout struct {
 	// on non-uefi firmware; it carries no filesystem and no mountpoint, so it
 	// is never one of the set's volumes.
 	BIOSBootPartitions []string `json:"bios_boot_partitions,omitempty"`
+	// Disks are the set's whole disks the layout was written to (kernel
+	// paths), so later steps can tell the set's own LVM/md metadata from a
+	// same-named group on another disk.
+	Disks []string `json:"disks,omitempty"`
 }
 
 // Options configures a Builder.
@@ -256,6 +260,9 @@ func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selec
 		}
 	}
 
+	for _, d := range resolved {
+		layout.Disks = append(layout.Disks, d.ResolvedPath)
+	}
 	for _, d := range resolved {
 		disk := d.ResolvedPath
 		b.runBest(ctx, "sgdisk", "--zap-all", disk)

@@ -17,6 +17,17 @@ func withAllDevices(t *testing.T) {
 	t.Cleanup(func() { blockDeviceExistsFn = orig })
 }
 
+// addVG stubs the VG probe: VG name (uuid) with one PV per entry, each pv on
+// the given disk's lsblk listing.
+func addVG(f *executor.FakeRunner, pvs string, disks map[string]string) {
+	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "vg_uuid,vg_name,pv_name"},
+		Response: executor.FakeResponse{Stdout: []byte(pvs)}})
+	for d, kn := range disks {
+		f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", d},
+			Response: executor.FakeResponse{Stdout: []byte(kn)}})
+	}
+}
+
 func addFS(f *executor.FakeRunner, dev, fs string) {
 	f.AddMatch(executor.FakeMatch{Path: "blkid", ArgsPrefix: []string{"-s", "TYPE", "-o", "value", dev},
 		Response: executor.FakeResponse{Stdout: []byte(fs + "\n")}})
@@ -33,6 +44,7 @@ func TestVerifyDiskSetBIOSBootLayoutHealthy(t *testing.T) {
 	addFS(f, "/dev/vda2", "vfat")
 	addFS(f, "/dev/vda3", "xfs")
 	addFS(f, "/dev/os/root", "xfs")
+	addVG(f, "  OSUUID os /dev/vda4\n", map[string]string{"/dev/vda": "vda\nvda1\nvda2\nvda3\nvda4\n"})
 	set := &v2.Set{Name: "os", Role: "os", Raid: "none", Bootloader: v2.BootloaderFirst, Devices: []string{"/dev/vda"},
 		Volumes: []v2.Volume{
 			{Name: "uefi", Mountpoint: "/boot/efi", FS: "vfat", Size: "600M", Provider: "partition"},
@@ -67,6 +79,8 @@ func TestVerifyDiskSetAssemblesRaidBeforeVgchange(t *testing.T) {
 	addFS(f, "/dev/md/os-efi", "vfat")
 	addFS(f, "/dev/md/os-boot", "xfs")
 	addFS(f, "/dev/os/root", "xfs")
+	addVG(f, "  OSUUID os /dev/md127\n", map[string]string{
+		"/dev/sda": "sda\nsda3\nmd127\n", "/dev/sdb": "sdb\nsdb3\nmd127\n"})
 	set := &v2.Set{Name: "os", Role: "os", Raid: "1", Devices: []string{"/dev/sda", "/dev/sdb"},
 		Volumes: []v2.Volume{
 			{Name: "uefi", Mountpoint: "/boot/efi", FS: "vfat", Size: "600M", Provider: "partition"},
@@ -101,5 +115,40 @@ func TestHasBIOSBootPartition(t *testing.T) {
 	g := executor.NewFakeRunner(executor.FakeResponse{Stdout: []byte("c12a7328-f81f-11d2-ba4b-00a0c93ec93b\n")})
 	if HasBIOSBootPartition(context.Background(), g, "/dev/vda") {
 		t.Fatal("an ESP on partition 1 is not a BIOS boot partition")
+	}
+}
+
+// A same-named VG on a disk OUTSIDE the set (an old OS disk still attached)
+// must not make the probe ambiguous: the set's own VG is activated by UUID,
+// the foreign one is never activated, and the set is healthy.
+func TestVerifyDiskSetIgnoresForeignSameNameVG(t *testing.T) {
+	withAllDevices(t)
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	addFS(f, "/dev/vda1", "vfat")
+	addFS(f, "/dev/os/root", "xfs")
+	addVG(f, "  OSUUID os /dev/vda2\n  OLDUUID os /dev/vdz2\n", map[string]string{"/dev/vda": "vda\nvda1\nvda2\n"})
+	set := &v2.Set{Name: "os", Role: "os", Raid: "none", Devices: []string{"/dev/vda"},
+		Volumes: []v2.Volume{
+			{Name: "uefi", Mountpoint: "/boot/efi", FS: "vfat", Size: "600M", Provider: "partition"},
+			{Name: "root", Mountpoint: "/", FS: "xfs", Size: "100%", Provider: "lvm"},
+		}}
+	checker := fscheck.New(fscheck.Options{Runner: f})
+	if fails := VerifyDiskSet(context.Background(), f, checker, set, resolved("/dev/vda"), nil); len(fails) != 0 {
+		t.Fatalf("a foreign same-name VG made the healthy set unhealthy: %+v", fails)
+	}
+	sawOwn := false
+	for _, c := range f.Calls() {
+		if c.Path != "vgchange" {
+			continue
+		}
+		joined := strings.Join(c.Args, " ")
+		if joined == "-ay --select vg_uuid=OSUUID" {
+			sawOwn = true
+			continue
+		}
+		t.Fatalf("only the set's own VG may be activated, by uuid; got vgchange %s", joined)
+	}
+	if !sawOwn {
+		t.Fatal("own VG not activated")
 	}
 }
