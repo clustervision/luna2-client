@@ -32,6 +32,7 @@ func silentLogger(t *testing.T) *txlog.Logger {
 // wipes, local/persistent only mount.
 func TestDecideActionDataFence(t *testing.T) {
 	H, B, K := storagehealth.VerdictHealthy, storagehealth.VerdictBlank, storagehealth.VerdictBroken
+	U := storagehealth.VerdictUnknown
 	cases := []struct {
 		name       string
 		mode       installcontext.Mode
@@ -61,6 +62,11 @@ func TestDecideActionDataFence(t *testing.T) {
 		{"auto/healthy", installcontext.ModeAuto, "data", false, H, actMount, false},
 		{"auto/broken-os", installcontext.ModeAuto, "os", false, K, actCreate, false},
 		{"auto/broken-data", installcontext.ModeAuto, "data", false, K, actMount, true},
+		// unknown (a checker did not run): never mount, never wipe -- not
+		// even the os set under auto, which recreates a BROKEN os set.
+		{"auto/unknown-os", installcontext.ModeAuto, "os", false, U, actMount, true},
+		{"auto/unknown-data", installcontext.ModeAuto, "data", false, U, actMount, true},
+		{"sync/unknown-os", installcontext.ModeSync, "os", false, U, actMount, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

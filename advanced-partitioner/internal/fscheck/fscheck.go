@@ -43,6 +43,12 @@
 //
 //	tmpfs: nothing to check — always OK.
 //
+// A checker that could not run (binary missing, exec failure, killed by a
+// signal or a timeout: no exit status) says NOTHING about the filesystem. It
+// is reported with Unavailable set, never as a plain unhealthy volume: the
+// data fence must not read "e2fsck is not in this ramdisk" as "the set is
+// broken" -- auto would then recreate (wipe) a healthy os set.
+//
 // Cross-platform notes:
 //   - e2fsck, xfs_repair, mkswap/swaplabel ship identically on every
 //     distro and architecture we support.
@@ -54,7 +60,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	iofs "io/fs"
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 
@@ -70,6 +78,35 @@ type Result struct {
 	// Reason is filled when OK is false. It is the operator-visible
 	// "why" string that bubbles into the unhealthy report.
 	Reason string
+	// Unavailable is set (with OK false) when the checker itself could not
+	// run -- missing binary, exec failure, no exit status. The filesystem
+	// was NOT checked, so callers must treat the volume as UNKNOWN, never as
+	// broken: a missing tool is not evidence of damage.
+	Unavailable bool
+}
+
+// unavailable builds the Result for a checker that never produced a verdict.
+func unavailable(device, fsType, tool string, err error) Result {
+	return Result{
+		Device: device, FS: fsType, OK: false, Unavailable: true,
+		Reason: fmt.Sprintf("checker unavailable: %s did not run on %s (%v) -- the filesystem was NOT checked", tool, device, err),
+	}
+}
+
+// checkerUnavailable reports whether a probe failed without a verdict: the
+// binary is missing or could not be executed, or the process ended without an
+// exit status (signal, timeout). Exit codes, even unexpected ones, are
+// verdicts and are NOT unavailable.
+func checkerUnavailable(res executor.CommandResult, err error) bool {
+	if err == nil {
+		return false
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) || errors.Is(err, exec.ErrNotFound) ||
+		errors.Is(err, iofs.ErrNotExist) || errors.Is(err, iofs.ErrPermission) {
+		return true
+	}
+	return exitCode(res, err) == -1
 }
 
 // Options configures a Checker.
@@ -136,6 +173,9 @@ func (c *Checker) checkExt(ctx context.Context, device, fs string) Result {
 		Path: "e2fsck", Args: []string{"-f", "-p", device},
 		CaptureStdout: true, CaptureStderr: true,
 	})
+	if checkerUnavailable(res, err) {
+		return unavailable(device, fs, "e2fsck", err)
+	}
 	rc := exitCode(res, err)
 	if rc == 0 || rc == 1 {
 		c.log("fsck OK (rc=%d): %s (%s)", rc, device, fs)
@@ -158,6 +198,9 @@ func (c *Checker) checkXFS(ctx context.Context, device string) Result {
 		Path: "xfs_repair", Args: []string{"-n", device},
 		CaptureStdout: true, CaptureStderr: true,
 	})
+	if checkerUnavailable(res, err) {
+		return unavailable(device, "xfs", "xfs_repair", err)
+	}
 	rc := exitCode(res, err)
 	if rc == 0 {
 		c.log("xfs_repair -n OK: %s", device)
@@ -186,6 +229,9 @@ func (c *Checker) checkXFS(ctx context.Context, device string) Result {
 		Path: "xfs_repair", Args: []string{"-n", device},
 		CaptureStdout: true, CaptureStderr: true,
 	})
+	if checkerUnavailable(res, err) {
+		return unavailable(device, "xfs", "xfs_repair", err)
+	}
 	if rc2 := exitCode(res, err); rc2 != 0 {
 		return Result{Device: device, FS: "xfs", OK: false,
 			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s after journal replay (NOT running xfs_repair -L — operator decision)", rc2, device)}
@@ -201,6 +247,9 @@ func (c *Checker) checkVfat(ctx context.Context, device, fs string) Result {
 		Path: c.o.FsckVfatCmd, Args: []string{"-n", device},
 		CaptureStdout: true, CaptureStderr: true,
 	})
+	if checkerUnavailable(res, err) {
+		return unavailable(device, fs, c.o.FsckVfatCmd, err)
+	}
 	rc := exitCode(res, err)
 	if rc == 0 {
 		c.log("fsck.vfat -n OK: %s", device)

@@ -188,6 +188,13 @@ var StoragePrepareCommands = []string{
 	"mkfs.xfs",
 	"mkfs.ext4",
 	"mkswap",
+	// The health probe's filesystem checkers (internal/fscheck). sync and
+	// auto decide mount-vs-recreate on their verdict, so a ramdisk without
+	// them must fail closed here, before anything happens -- not have every
+	// volume probed as "broken" and the os set recreated. fsck.vfat /
+	// fsck.fat is a fallback pair, handled separately.
+	"e2fsck",
+	"xfs_repair",
 }
 
 // StorageCheckCommands lists the binaries lib/commands.sh::
@@ -218,13 +225,31 @@ var BootloaderCommonCommands = []string{
 	"readlink",
 }
 
+// StoragePrepareTools are the fallback-pair names the storage-prepare
+// preflight picked.
+type StoragePrepareTools struct {
+	// MkfsFat is mkfs.fat or mkfs.vfat (fs.Builder.Options.MkfsFatName).
+	MkfsFat string
+	// FsckVfat is fsck.vfat or fsck.fat (fscheck.Options.FsckVfatCmd).
+	FsckVfat string
+}
+
 // RequireStoragePrepareCommands runs the preflight for lpart-storage-prepare
-// and returns the chosen FAT tool. The bash helper is non-trivial because
-// it accepts mkfs.fat OR mkfs.vfat — we return the chosen name so the
-// caller plumbs it into fs.Builder.Options.MkfsFatName.
-func RequireStoragePrepareCommands() (fatTool string, err error) {
+// and returns the chosen FAT tools. The bash helper is non-trivial because
+// it accepts mkfs.fat OR mkfs.vfat (and the health probe fsck.vfat OR
+// fsck.fat, like lpart-storage-check) — we return the chosen names so the
+// caller plumbs them into the fs builder and the fs checker.
+func RequireStoragePrepareCommands() (StoragePrepareTools, error) {
 	if err := RequireCommands(StoragePrepareCommands...); err != nil {
-		return "", err
+		return StoragePrepareTools{}, err
 	}
-	return RequireCommandsWithFallback("mkfs.fat", "mkfs.vfat")
+	mkfs, err := RequireCommandsWithFallback("mkfs.fat", "mkfs.vfat")
+	if err != nil {
+		return StoragePrepareTools{}, err
+	}
+	fsck, err := RequireCommandsWithFallback("fsck.vfat", "fsck.fat")
+	if err != nil {
+		return StoragePrepareTools{}, err
+	}
+	return StoragePrepareTools{MkfsFat: mkfs, FsckVfat: fsck}, nil
 }

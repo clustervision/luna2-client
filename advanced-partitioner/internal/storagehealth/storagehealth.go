@@ -35,6 +35,11 @@ const (
 	// healthy nor cleanly blank. The data fence halts (sync) or recreates
 	// only the OS set (auto) on this verdict; it never wipes a data set.
 	VerdictBroken Verdict = "broken"
+	// VerdictUnknown means the probe could not decide: a filesystem checker
+	// did not run (missing tool, exec failure). It is neither healthy nor
+	// broken, so the data fence must neither mount nor wipe on it -- auto
+	// used to read a missing e2fsck as "broken" and recreate the os set.
+	VerdictUnknown Verdict = "unknown"
 )
 
 // Unhealthy is one volume-level verification failure.
@@ -42,6 +47,10 @@ type Unhealthy struct {
 	SetName    string
 	VolumeName string
 	Reason     string
+	// Unknown marks a failure that is not evidence of damage: the probe
+	// itself could not run (fscheck Result.Unavailable). Classify turns any
+	// Unknown failure into VerdictUnknown, never VerdictBroken.
+	Unknown bool
 }
 
 // VerifyDiskSet runs the per-volume verification for one disk-backed set and
@@ -53,6 +62,12 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 		failures = append(failures, Unhealthy{SetName: set.Name, VolumeName: volName, Reason: reason})
 		if logger != nil {
 			logger.Warn("UNHEALTHY set=" + set.Name + " vol=" + volName + ": " + reason)
+		}
+	}
+	markUnknown := func(volName, reason string) {
+		failures = append(failures, Unhealthy{SetName: set.Name, VolumeName: volName, Reason: reason, Unknown: true})
+		if logger != nil {
+			logger.Warn("UNKNOWN set=" + set.Name + " vol=" + volName + ": " + reason)
 		}
 	}
 
@@ -116,7 +131,11 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 			}
 		}
 		if vol.FS != "" {
-			if res := checker.CheckFS(ctx, device, vol.FS); !res.OK {
+			res := checker.CheckFS(ctx, device, vol.FS)
+			switch {
+			case res.Unavailable:
+				markUnknown(vol.Name, res.Reason)
+			case !res.OK:
 				mark(vol.Name, res.Reason)
 			}
 		}
@@ -149,14 +168,20 @@ func volumeDevice(set *v2.Set, vol v2.Volume, diskPath string, partIdx int) stri
 	}
 }
 
-// Classify returns the tri-state verdict for a non-persistent disk-backed
-// set. A clean verification is healthy; otherwise the selected disks are
-// probed for any existing layout — entirely empty disks are blank (safe to
-// create), anything partial or mismatched is broken.
+// Classify returns the verdict for a non-persistent disk-backed set. A clean
+// verification is healthy; a probe that could not run (a checker missing from
+// the ramdisk) is unknown, whatever else was found; otherwise the selected
+// disks are probed for any existing layout — entirely empty disks are blank
+// (safe to create), anything partial or mismatched is broken.
 func Classify(ctx context.Context, runner executor.Runner, checker *fscheck.Checker, set *v2.Set, resolved []selector.Resolved, logger *txlog.Logger) (Verdict, []Unhealthy) {
 	failures := VerifyDiskSet(ctx, runner, checker, set, resolved, logger)
 	if len(failures) == 0 {
 		return VerdictHealthy, nil
+	}
+	for _, f := range failures {
+		if f.Unknown {
+			return VerdictUnknown, failures
+		}
 	}
 	if DisksBlank(ctx, runner, resolved) {
 		return VerdictBlank, failures

@@ -128,6 +128,11 @@ func (sp *setProcessor) applySet(ctx context.Context, mode installcontext.Mode, 
 	}
 
 	act, halt := decideAction(mode, set.Role, false, verdict)
+	if halt && verdict == storagehealth.VerdictUnknown {
+		return result.StorageResult{}, result.ResolvedSet{}, safetyRefusalf("health-unknown",
+			"set %q: the health probe could not decide (a filesystem checker did not run) and install_mode=%s neither mounts nor wipes an unverified set; halting -- operator review required",
+			set.Name, mode)
+	}
 	if halt {
 		return result.StorageResult{}, result.ResolvedSet{}, safetyRefusalf("data-fence",
 			"set %q is %s and install_mode=%s will not wipe it (data fence); halting -- operator review required",
@@ -154,6 +159,7 @@ func (sp *setProcessor) applySet(ctx context.Context, mode installcontext.Mode, 
 //	auto,  blank         -> create
 //	auto,  broken, os    -> create (recreate the OS set only)
 //	auto,  broken, data  -> HALT (data fence)
+//	sync/auto, unknown   -> HALT (a checker did not run: no verdict, no wipe)
 func decideAction(mode installcontext.Mode, role string, persistent bool, verdict storagehealth.Verdict) (act setAction, halt bool) {
 	if persistent {
 		return actMount, false
@@ -170,6 +176,10 @@ func decideAction(mode installcontext.Mode, role string, persistent bool, verdic
 		return actMount, false
 	case storagehealth.VerdictBlank:
 		return actCreate, false
+	case storagehealth.VerdictUnknown:
+		// The probe never ran: mounting an unverified set and wiping a
+		// possibly healthy one are both wrong. Halt for an operator.
+		return actMount, true
 	default: // broken
 		if mode == installcontext.ModeAuto && role == "os" {
 			return actCreate, false

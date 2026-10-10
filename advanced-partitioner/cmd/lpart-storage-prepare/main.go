@@ -144,16 +144,19 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Command preflight (the FAT tool name comes out of this).
+	// Command preflight (the FAT tool names come out of this). A tool missing
+	// from the install ramdisk is missing on every retry: park (exit 3) instead
+	// of looping -- and the fs checkers are part of it, so the health probe can
+	// never read "checker not installed" as "set broken".
 	logger.SetStage("command_checks")
-	fatTool := "mkfs.fat"
+	tools := sysenv.StoragePrepareTools{MkfsFat: "mkfs.fat", FsckVfat: "fsck.vfat"}
 	if !f.SkipCommandCheck {
 		chosen, err := sysenv.RequireStoragePrepareCommands()
 		if err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			return cli.ExitFatalConfig(stderr, toolName, "missing-commands",
+				"%v -- the install ramdisk lacks required storage tools; rebuild it with them", err)
 		}
-		fatTool = chosen
+		tools = chosen
 	}
 
 	// Load + validate config. The disklayout is optional: sanitize needs no
@@ -288,9 +291,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		part:     partition.New(partition.Options{Runner: runner, Logger: logger, DryRun: f.DryRun}),
 		raid:     raid.New(raid.Options{Runner: runner, Logger: logger}),
 		lvm:      lvm.New(lvm.Options{Runner: runner, Logger: logger}),
-		fs:       fsmod.New(fsmod.Options{Runner: runner, Logger: logger, MkfsFatName: fatTool}),
+		fs:       fsmod.New(fsmod.Options{Runner: runner, Logger: logger, MkfsFatName: tools.MkfsFat}),
 		mount:    mounter,
-		checker:  fscheck.New(fscheck.Options{Runner: runner, Logger: logger}),
+		checker:  fscheck.New(fscheck.Options{Runner: runner, Logger: logger, FsckVfatCmd: tools.FsckVfat}),
 	}
 
 	// Discover the disk pool once: selection=discover resolution and sanitize
