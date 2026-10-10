@@ -2,6 +2,7 @@ package v2
 
 import (
 	"fmt"
+	"path"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/raidlevel"
@@ -97,6 +98,63 @@ func (s *Set) validatePartitionOrder(idx int, r raidlevel.Raid) error {
 			return fmt.Errorf(
 				"config_validation: %s: size=100%% takes the rest of the disk, but lvm volume(s) %s need a storage partition after the direct partitions (partition order: %s); give %q a fixed size",
 				vref, strings.Join(lvmNames, ", "), s.partitionOrder(), v.Name)
+		}
+	}
+	return nil
+}
+
+// validateMountpoints refuses mountpoints the builders would silently drop or
+// mount over one another. Every builder and probe compares mountpoints as
+// exact strings ("/boot", "/boot/efi", "/"), so a mountpoint must be in
+// canonical form; a data set cannot carry the os set's boot chain or root
+// (partition.BuildLayout creates /boot and /boot/efi for the os set only, so
+// on a data set they used to vanish without a word); and the duplicate check
+// across sets is validateUniqueMountpoints.
+func (s *Set) validateMountpoints(idx int) error {
+	for j, v := range s.Volumes {
+		ref := volRef(idx, s.Name, j, v.Name)
+		if v.Mountpoint != "swap" && path.Clean(v.Mountpoint) != v.Mountpoint {
+			return fmt.Errorf(
+				"config_validation: %s: mountpoint %q is not in canonical form; write it as %q",
+				ref, v.Mountpoint, path.Clean(v.Mountpoint))
+		}
+		if s.Role != "data" {
+			continue
+		}
+		switch v.Mountpoint {
+		case "/boot", "/boot/efi":
+			return fmt.Errorf(
+				"config_validation: %s: a data set cannot carry %s: the builder creates /boot and /boot/efi on the os set's disks only (declare it on the os set)",
+				ref, v.Mountpoint)
+		case "/":
+			return fmt.Errorf(
+				"config_validation: %s: a data set cannot be mounted at \"/\": the root filesystem belongs to the os set (or, on a memboot node, the RAM root)",
+				ref)
+		}
+	}
+	return nil
+}
+
+// validateUniqueMountpoints refuses a mountpoint declared by two volumes,
+// within a set or across sets: the second mount hides the first (or, for
+// /boot/efi, the builder formats only the first). swap is not a mountpoint and
+// may repeat.
+func (c *Config) validateUniqueMountpoints() error {
+	type owner struct{ set, vol, ref string }
+	seen := map[string]owner{}
+	for i := range c.Sets {
+		s := &c.Sets[i]
+		for j, v := range s.Volumes {
+			if v.Mountpoint == "swap" {
+				continue
+			}
+			ref := fmt.Sprintf("sets[%d].volumes[%d]", i, j)
+			if prev, dup := seen[v.Mountpoint]; dup {
+				return fmt.Errorf(
+					"config_validation: mountpoint %q is declared twice: set %q volume %q (%s) and set %q volume %q (%s); each mountpoint may be used once",
+					v.Mountpoint, prev.set, prev.vol, prev.ref, s.Name, v.Name, ref)
+			}
+			seen[v.Mountpoint] = owner{set: s.Name, vol: v.Name, ref: ref}
 		}
 	}
 	return nil

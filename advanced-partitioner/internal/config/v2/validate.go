@@ -89,6 +89,9 @@ func (c *Config) validateRaw(raw []byte) error {
 	if err := c.validateSetNameCollisions(); err != nil {
 		return err
 	}
+	if err := c.validateUniqueMountpoints(); err != nil {
+		return err
+	}
 
 	// Cross-set device exclusivity (literal level). No device path may
 	// appear in more than one set: a duplicated device means one set's
@@ -352,6 +355,9 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 		}
 	}
 	if err := s.validateVolumeNamesUnique(idx); err != nil {
+		return err
+	}
+	if err := s.validateMountpoints(idx); err != nil {
 		return err
 	}
 

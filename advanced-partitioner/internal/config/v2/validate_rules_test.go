@@ -331,3 +331,44 @@ func TestRuleDevicePathStyle(t *testing.T) {
 		{"mixed-styles", osOn("/dev/sda", "/dev/disk/by-id/wwn-0x1"), "all paths must use the same style (/dev/..., by-id, by-path)"},
 	})
 }
+
+func TestRuleDataSetMountpoints(t *testing.T) {
+	data := func(vols ...string) string { return osLayout(set(dataManual("data", "none", "/dev/sdb"), vols...)) }
+	dataOnly := func(vols ...string) string { return lay(set(dataManual("data", "none", "/dev/sdb"), vols...)) }
+	runRuleCases(t, []ruleCase{
+		// The builder creates /boot and /boot/efi for the os set only; on a
+		// data set they vanished without a word.
+		{"data-boot-partition", data(vol("boot", "/boot", "xfs", "partition", "1G"), vol("d", "/d", "xfs", "lvm", "100%")),
+			`sets[1].volumes[0] (set "data", volume "boot"): a data set cannot carry /boot`},
+		{"data-esp-partition", dataOnly(vol("uefi", "/boot/efi", "vfat", "partition", "600M"), vol("d", "/d", "xfs", "lvm", "100%")),
+			`(set "data", volume "uefi"): a data set cannot carry /boot/efi`},
+		{"data-boot-lvm", dataOnly(vol("boot", "/boot", "xfs", "lvm", "1G"), vol("d", "/d", "xfs", "lvm", "100%")),
+			`a data set cannot carry /boot`},
+		{"data-root", dataOnly(vol("root", "/", "xfs", "lvm", "100%")),
+			`(set "data", volume "root"): a data set cannot be mounted at "/"`},
+		{"data-root-partition", dataOnly(vol("root", "/", "xfs", "partition", "100%")), `a data set cannot be mounted at "/"`},
+		// Duplicate mountpoints, across sets and within one.
+		{"dup-mount-across-sets", lay(
+			set(osFields("os"), espVol(), bootVol(), rootLV(), vol("scratch", "/scratch", "xfs", "lvm", "10G")),
+			set(dataManual("data", "none", "/dev/sdb"), vol("d", "/scratch", "xfs", "lvm", "100%"))),
+			`mountpoint "/scratch" is declared twice: set "os" volume "scratch" (sets[0].volumes[3]) and set "data" volume "d" (sets[1].volumes[0])`},
+		{"dup-mount-two-data-sets", osLayout(
+			set(dataManual("a", "none", "/dev/sdb"), vol("x", "/data", "xfs", "lvm", "100%")),
+			set(dataManual("b", "none", "/dev/sdc"), vol("y", "/data", "xfs", "lvm", "100%"))),
+			`mountpoint "/data" is declared twice: set "a" volume "x"`},
+		{"dup-mount-in-set", data(vol("a", "/d", "xfs", "lvm", "10G"), vol("b", "/d", "xfs", "lvm", "100%")),
+			`mountpoint "/d" is declared twice: set "data" volume "a"`},
+		{"dup-esp-in-os-set", lay(set(osFields("os"), espVol(), vol("uefi2", "/boot/efi", "vfat", "partition", "600M"), rootLV())),
+			`mountpoint "/boot/efi" is declared twice`},
+		{"mount-not-canonical", data(vol("d", "/data/", "xfs", "lvm", "100%")),
+			`(set "data", volume "d"): mountpoint "/data/" is not in canonical form; write it as "/data"`},
+		{"mount-not-canonical-boot", lay(set(osFields("os"), espVol(), vol("boot", "/boot/", "xfs", "partition", "1G"), rootLV())),
+			`mountpoint "/boot/" is not in canonical form`},
+		// Nearby layouts that must still pass.
+		{"data-mounts-ok", data(vol("d", "/data", "xfs", "lvm", "100%"), vol("s", "/data/scratch", "xfs", "lvm", "10G")), ""},
+		{"swap-in-two-sets-ok", lay(
+			set(osFields("os"), espVol(), bootVol(), vol("swap", "swap", "swap", "lvm", "2G"), rootLV()),
+			set(dataManual("data", "none", "/dev/sdb"), vol("swap", "swap", "swap", "lvm", "8G"), vol("d", "/d", "xfs", "lvm", "100%"))), ""},
+		{"data-boot-like-path-ok", data(vol("d", "/boot-images", "xfs", "lvm", "100%")), ""},
+	})
+}
