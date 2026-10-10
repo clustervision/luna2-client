@@ -73,6 +73,9 @@ func (a *debianAdapter) hasDracut() bool {
 // installed system's.
 func (a *debianAdapter) RegenerateInitramfs(ctx context.Context) error {
 	sysroot := a.deps.BootContext.Sysroot
+	if err := removeImageLVMDevicesFile(a.deps); err != nil {
+		return err
+	}
 	if a.hasUpdateInitramfs() {
 		if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
 			Path: "/usr/bin/env", Chroot: sysroot,

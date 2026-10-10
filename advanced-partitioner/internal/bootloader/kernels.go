@@ -202,3 +202,28 @@ func grubCfgEntryIDFor(grubCfg, kver string) string {
 	}
 	return ""
 }
+
+// lvmDevicesFile is LVM's devices file (el9+: use_devicesfile=1 by default).
+const lvmDevicesFile = "etc/lvm/devices/system.devices"
+
+// removeImageLVMDevicesFile deletes the image's LVM devices file before any
+// initramfs is built. The file lists the device IDs of the machine the image
+// was made on; dracut copies it into the initramfs, and LVM then ignores
+// every PV not in it -- this node's root PV included -- so the node stops at
+// "Volume group not found". Without the file LVM uses every device, which is
+// what a freshly provisioned node needs; `vgimportdevices -a` recreates it for
+// this node's PVs if a site wants the filtering back.
+func removeImageLVMDevicesFile(deps AdapterDeps) error {
+	p := filepath.Join(deps.BootContext.Sysroot, lvmDevicesFile)
+	if _, err := os.Lstat(p); err != nil {
+		return nil
+	}
+	if err := deps.FS.Remove(p); err != nil {
+		return fmt.Errorf("remove the image's LVM devices file %s: %w", p, err)
+	}
+	if deps.Logger != nil {
+		deps.Logger.UserInfo("removed the image's LVM devices file /%s (it names the image host's disks and would hide "+
+			"this node's PVs from LVM in the initramfs); LVM now scans all devices", lvmDevicesFile)
+	}
+	return nil
+}

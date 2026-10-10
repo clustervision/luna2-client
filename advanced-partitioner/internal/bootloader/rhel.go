@@ -44,10 +44,13 @@ func (a *rhelAdapter) Prepare(_ context.Context) error {
 }
 
 // RegenerateInitramfs runs `dracut -f --omit luna --kver <version>` via chroot
-// for every bootable kernel in the image (see dracutAllKernels) and remembers
-// which one the default boot entry will start. Successor of
+// for every bootable kernel in the image (see dracutAllKernels), after removing
+// the image's LVM devices file (removeImageLVMDevicesFile). Successor of
 // bootloader_rhel_regenerate_initramfs, which rebuilt one kernel only.
 func (a *rhelAdapter) RegenerateInitramfs(ctx context.Context) error {
+	if err := removeImageLVMDevicesFile(a.deps); err != nil {
+		return err
+	}
 	_, err := dracutAllKernels(ctx, a.deps, true)
 	return err
 }

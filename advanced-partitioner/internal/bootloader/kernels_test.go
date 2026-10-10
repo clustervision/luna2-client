@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fsops"
 )
 
 const (
@@ -164,5 +165,41 @@ func TestGrubCfgEntryIDFor(t *testing.T) {
 	}
 	if got := grubCfgEntryIDFor(cfg, "6.4.0-150600.23.25"); got != "" {
 		t.Fatalf("a prefix of the version must not match: %q", got)
+	}
+}
+
+// Review finding 7: the image's LVM devices file would hide this node's root
+// PV inside the initramfs, so it is removed before dracut runs -- except in
+// dry-run.
+func TestRegenerateInitramfsRemovesImageLVMDevicesFile(t *testing.T) {
+	pinRunningKernel(t, "")
+	for _, dry := range []bool{false, true} {
+		for _, fam := range []string{"rhel", "debian"} {
+			var sysroot string
+			var a Adapter
+			f := executor.NewFakeRunner(executor.FakeResponse{})
+			deps := func(s string) AdapterDeps {
+				return AdapterDeps{Runner: f, FS: fsops.FS{DryRun: dry}, BootContext: BootContext{Sysroot: s}}
+			}
+			if fam == "rhel" {
+				sysroot = stageRHELSysroot(t, false)
+				a = &rhelAdapter{deps: deps(sysroot)}
+			} else {
+				sysroot = stageDebianSysroot(t, false)
+				a = &debianAdapter{deps: deps(sysroot)}
+			}
+			devices := filepath.Join(sysroot, lvmDevicesFile)
+			mustWriteFile(t, devices, "VERSION=1.1.2\nIDTYPE=sys_wwid IDNAME=naa.6000c29 DEVNAME=/dev/sda3 PVID=abc PART=3\n")
+			if err := a.RegenerateInitramfs(context.Background()); err != nil {
+				t.Fatalf("%s: %v", fam, err)
+			}
+			_, err := os.Stat(devices)
+			if !dry && err == nil {
+				t.Errorf("%s: %s still present", fam, lvmDevicesFile)
+			}
+			if dry && err != nil {
+				t.Errorf("%s: dry-run removed %s", fam, lvmDevicesFile)
+			}
+		}
 	}
 }
