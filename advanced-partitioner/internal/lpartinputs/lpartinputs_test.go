@@ -2,6 +2,7 @@ package lpartinputs
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -14,7 +15,10 @@ func TestInstallContextRoundTrip(t *testing.T) {
 		ProvisionMethod:   "http",
 		ProvisionFallback: "torrent",
 	})
-	got := readInstallContext(filepath.Join(dir, "install-context.json"))
+	got, err := readInstallContext(filepath.Join(dir, "install-context.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
 	if got.InstallMode != "memboot" {
 		t.Fatalf("round-trip mode = %s", got.InstallMode)
 	}
@@ -22,8 +26,22 @@ func TestInstallContextRoundTrip(t *testing.T) {
 	if got.ProvisionMethod != "http" || got.ProvisionFallback != "torrent" {
 		t.Fatalf("provision round-trip = %+v", got)
 	}
-	if m := readInstallContext(filepath.Join(dir, "missing.json")); m.InstallMode != "auto" {
-		t.Fatalf("default = %s, want auto", m.InstallMode)
+	if m, err := readInstallContext(filepath.Join(dir, "missing.json")); err != nil || m.InstallMode != "auto" {
+		t.Fatalf("default = %s (%v), want auto", m.InstallMode, err)
+	}
+}
+
+// A malformed install-context.json must not silently become "auto" (an
+// intended local/full/sanitize would then converge a healthy disk).
+func TestMalformedInstallContextIsAnError(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "install-context.json"), []byte(`{"install_mode": "local",`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Resolve(dir)
+	var ie *ErrInstallContext
+	if !errors.As(err, &ie) {
+		t.Fatalf("want ErrInstallContext, got %v", err)
 	}
 }
 

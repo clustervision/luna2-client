@@ -74,6 +74,7 @@ func StreamHTTPExtract(ctx context.Context, dopts DownloadOptions, eopts Extract
 		tarArgs = append(tarArgs, "--no-acls")
 	}
 	tarArgs = append(tarArgs, "--numeric-owner")
+	tarArgs = append(tarArgs, CapabilityXattrArgs...)
 	tarArgs = append(tarArgs, eopts.TarExcludes...)
 	tarArgs = append(tarArgs, "-xf", "-", "-C", eopts.Sysroot)
 

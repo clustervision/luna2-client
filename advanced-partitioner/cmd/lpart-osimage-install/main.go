@@ -63,6 +63,9 @@ type flags struct {
 	Preserve           stringList
 	PreserveEmpty      stringList
 	NoNewFiles         stringList
+	KeepExtra          []string
+	ImageWins          []string
+	Verify             string
 	// Test affordances; never set from production CLI.
 	LunaInstallScript string
 	LunaTokenOverride string
@@ -138,13 +141,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	ic, err := installcontext.LoadFile(f.InstallContextPath)
 	if err != nil {
-		errln(stderr, "install-context: %v", err)
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "install-context", "%v", err)
 	}
 	logger.KV("install_mode", string(ic.InstallMode))
 	if !f.IgnoreInstallCtx && ic.InstallMode.IsLocal() {
-		errln(stderr, "install_mode=local — lpart-osimage-install should be skipped (run lpart-storage-check instead). Pass --ignore-install-context to force.")
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "install-mode-local", "install_mode=local — lpart-osimage-install should be skipped (run lpart-storage-check instead). Pass --ignore-install-context to force.")
 	}
 
 	// Path hygiene before any path is used in a deletion decision.
@@ -180,21 +181,26 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		f.Preserve = nil
 		f.PreserveEmpty = nil
 		f.NoNewFiles = nil
+		f.KeepExtra = nil
+		f.ImageWins = nil
 	}
 	logger.KV("first_install", srSummary.FirstInstall)
 	logger.KV("persistent_mountpoints", strings.Join(srSummary.PersistentMountpoints, ","))
 
 	// --config is exclusive with the per-path flags.
 	if f.ConfigPath != "" && (len(f.Preserve) > 0 || len(f.PreserveEmpty) > 0 || len(f.NoNewFiles) > 0) {
-		errln(stderr, "--config is exclusive: do not combine with --preserve, --preserve-empty, or --no-new-files.")
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "osimage-filter", "--config is exclusive: do not combine with --preserve, --preserve-empty, or --no-new-files.")
 	}
 	if f.ConfigPath != "" {
 		cfg, err := osimage.LoadFilterConfig(f.ConfigPath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				errln(stderr, "--config file not found: %s", f.ConfigPath)
-				return 1
+				return cli.ExitFatalConfig(stderr, toolName, "osimage-filter", "--config file not found: %s", f.ConfigPath)
+			}
+			var fe *osimage.ErrFilterConfig
+			if errors.As(err, &fe) {
+				// identical on every retry: park, do not loop
+				return cli.ExitFatalConfig(stderr, toolName, "osimage-filter", "%v", err)
 			}
 			errln(stderr, "%v", err)
 			return 1
@@ -202,6 +208,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		f.Preserve = append(f.Preserve, cfg.Preserve...)
 		f.PreserveEmpty = append(f.PreserveEmpty, cfg.PreserveEmpty...)
 		f.NoNewFiles = append(f.NoNewFiles, cfg.NoNewFiles...)
+		f.KeepExtra = append(f.KeepExtra, cfg.KeepExtra...)
+		f.ImageWins = append(f.ImageWins, cfg.ImageWins...)
+		f.Verify = cfg.Verify
 	}
 
 	// Sysroot must be mounted (skip in tests).
@@ -245,8 +254,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		LunaInstallScript: f.LunaInstallScript,
 	})
 	if err != nil {
-		errln(stderr, "%v", err)
-		return 1
+		// no osimage assigned / no image file named: identical on every retry
+		return cli.ExitFatalConfig(stderr, toolName, "osimage", "%v", err)
 	}
 
 	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
@@ -265,9 +274,17 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 		return paths
 	}
-	preserve := osimage.ParsePatterns(resolver.ResolveAll(norm("preserve", f.Preserve)))
-	preserveEmpty := osimage.ParsePatterns(resolver.ResolveAll(norm("preserve_empty", f.PreserveEmpty)))
-	noNew := osimage.ParsePatterns(resolver.ResolveAll(norm("no_new_files", f.NoNewFiles)))
+	// Every path is protected as written AND with its symlinks resolved inside
+	// the sysroot (all components, not just the first), so a link and what it
+	// points to are both kept.
+	expand := func(kind string, raw []string) []string {
+		return osimage.ExpandFilterPaths(f.Sysroot, resolver.ResolveAll(norm(kind, raw)))
+	}
+	preserve := osimage.ParsePatterns(expand("preserve", f.Preserve))
+	preserveEmpty := osimage.ParsePatterns(expand("preserve_empty", f.PreserveEmpty))
+	noNew := osimage.ParsePatterns(expand("no_new_files", f.NoNewFiles))
+	keepExtra := osimage.ParsePatterns(expand("keep_extra", f.KeepExtra))
+	imageWins := osimage.ParsePatterns(expand("image_wins", f.ImageWins))
 	// Pre-compute tar excludes so the log captures them regardless of
 	// whether --skip-extract / --skip-download short-circuit later.
 	excludes := osimage.BuildTarExcludes(preserve, preserveEmpty, noNew)
@@ -346,6 +363,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		logger.UserInfo("%s", policyNote)
 	}
 	streamWanted := false
+	refresh := !fullExtract // sync/auto on an existing, healthy install: converge, do not wipe first
 	switch strings.ToLower(streamPolicy) {
 	case "always":
 		streamWanted = true
@@ -353,6 +371,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		streamWanted = false
 	default:
 		streamWanted = fstype == "tmpfs"
+	}
+	if refresh && streamWanted {
+		logger.UserInfo("sync refresh: using the downloaded tarball (the converge needs the payload in hand before it deletes anything)")
+		streamWanted = false
 	}
 	if streamWanted {
 		firstUsable := ""
@@ -430,6 +452,46 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	if refresh && !f.SkipExtract {
+		logger.SetStage("sync")
+		skip := []string{}
+		for _, mp := range append(append([]string{}, srSummary.PersistentMountpoints...), srSummary.OtherMountpoints...) {
+			if c := strings.Trim(mp, "/"); c != "" {
+				skip = append(skip, c)
+			}
+		}
+		res, serr := osimage.SyncExtract(context.Background(), osimage.SyncOptions{
+			Logger:      logger,
+			Sysroot:     f.Sysroot,
+			TarballPath: cachePath,
+			ACLs:        acls,
+			TarExcludes: excludes,
+			Protect: osimage.Protection{
+				Preserve: preserve, PreserveEmpty: preserveEmpty, NoNewFiles: noNew, KeepExtra: keepExtra, SkipMounts: skip,
+			},
+			ImageWins:   imageWins,
+			Verify:      f.Verify,
+			DryRun:      f.DryRun,
+			Details:     f.Details,
+			RemoveAfter: true,
+		})
+		if serr != nil {
+			var ve *osimage.SyncVerifyError
+			if errors.As(serr, &ve) || strings.Contains(serr.Error(), "operator review required") {
+				return cli.ExitSafetyRefusal(stderr, toolName, "sync", "%v", serr)
+			}
+			return extractFailure(stderr, serr)
+		}
+		logger.KV("sync_members", res.Members)
+		logger.KV("sync_removed", res.Removed)
+		logger.KV("sync_verified", res.Verified)
+		logger.SetStage("extract_verify")
+		if err := osimage.VerifyExtract(logger, f.Sysroot); err != nil {
+			return cli.ExitFatalConfig(stderr, toolName, "extract-verify", "%v", err)
+		}
+		return 0
+	}
+
 	// PrepareSysroot.
 	logger.SetStage("prepare_sysroot")
 	if err := osimage.PrepareSysroot(context.Background(), osimage.PrepareOptions{
@@ -487,8 +549,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			ACLs:        acls,
 			RemoveAfter: true,
 		}); err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			return extractFailure(stderr, err)
 		}
 	}
 
@@ -497,10 +558,21 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// failure (Ubuntu) is now caught and reported here.
 	logger.SetStage("extract_verify")
 	if err := osimage.VerifyExtract(logger, f.Sysroot); err != nil {
-		errln(stderr, "%v", err)
-		return 1
+		// the image itself is incomplete (no os-release): identical on every retry
+		return cli.ExitFatalConfig(stderr, toolName, "extract-verify", "%v", err)
 	}
 	return 0
+}
+
+// extractFailure classifies a tar/sync failure: a full os filesystem fails the
+// same way on every retry (park, exit 3); anything else (a corrupt or
+// truncated download, a transient I/O error) may succeed on the next attempt.
+func extractFailure(stderr io.Writer, err error) int {
+	if strings.Contains(err.Error(), "No space left on device") {
+		return cli.ExitFatalConfig(stderr, toolName, "no-space", "%v -- the os filesystem is too small for the image (make the os set larger, or remove preserved data)", err)
+	}
+	errln(stderr, "%v", err)
+	return 1
 }
 
 // findmntTargets returns a closure that runs `findmnt -rn -o TARGET`.
@@ -567,6 +639,9 @@ func nonEmpty(s, fallback string) string {
 type storageResultSummary struct {
 	FirstInstall          bool
 	PersistentMountpoints []string
+	// OtherMountpoints are the mountpoints of non-os, non-persistent sets
+	// (data sets): the sync sweep never enters them.
+	OtherMountpoints []string
 }
 
 func readStorageResultSummary(path string) (storageResultSummary, error) {
@@ -580,8 +655,9 @@ func readStorageResultSummary(path string) (storageResultSummary, error) {
 		return out, err
 	}
 	type setProbe struct {
-		FirstInstall bool `json:"first_install"`
-		Persistent   bool `json:"persistent"`
+		FirstInstall bool   `json:"first_install"`
+		Persistent   bool   `json:"persistent"`
+		Role         string `json:"role"`
 		Filesystems  []struct {
 			Mount string `json:"mount"`
 		} `json:"filesystems"`
@@ -594,7 +670,17 @@ func readStorageResultSummary(path string) (storageResultSummary, error) {
 		return out, fmt.Errorf("parse %s: %w", path, err)
 	}
 	collect := func(s setProbe) {
-		if s.FirstInstall {
+		// Only the set that holds "/" decides whether the OS extract is a first
+		// install: a newly created data set (first_install=true) next to a
+		// healthy os set used to turn the OS refresh into a full extract with
+		// the preserve filter dropped.
+		holdsRoot := false
+		for _, f := range s.Filesystems {
+			if f.Mount == "/" {
+				holdsRoot = true
+			}
+		}
+		if s.FirstInstall && (holdsRoot || len(probe.Sets) == 0) {
 			out.FirstInstall = true
 		}
 		if s.Persistent {
@@ -603,6 +689,13 @@ func readStorageResultSummary(path string) (storageResultSummary, error) {
 					continue
 				}
 				out.PersistentMountpoints = append(out.PersistentMountpoints, f.Mount)
+			}
+		} else if s.Role != "" && s.Role != "os" {
+			for _, f := range s.Filesystems {
+				if f.Mount == "" || f.Mount == "swap" || f.Mount == "/" {
+					continue
+				}
+				out.OtherMountpoints = append(out.OtherMountpoints, f.Mount)
 			}
 		}
 	}

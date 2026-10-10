@@ -149,8 +149,19 @@ func classify(err error) FailureClass {
 	if errors.As(err, &se) && (se.Code == 2 || se.Code == 3) {
 		return FailFatal
 	}
+	var fe *fatalError
+	if errors.As(err, &fe) {
+		return FailFatal
+	}
 	return FailRetryable
 }
+
+// fatalError marks an in-process failure that repeats identically on every
+// retry (an unreadable install context, an unknown install_mode).
+type fatalError struct{ err error }
+
+func (e *fatalError) Error() string { return e.err.Error() }
+func (e *fatalError) Unwrap() error { return e.err }
 
 // New builds a Pipeline with defaults filled in.
 func New(ctx context.Context, opts Options) *Pipeline {
@@ -261,6 +272,10 @@ func (p *Pipeline) runPart() error {
 	in, err := lpartinputs.Resolve(p.opts.RuntimeDir)
 	if err != nil {
 		p.stageFail("install-context", err.Error())
+		var ie *lpartinputs.ErrInstallContext
+		if errors.As(err, &ie) {
+			return &fatalError{err}
+		}
 		return err
 	}
 	// lpartinputs.Resolve already wrote the canonical install-context.json; every
@@ -268,7 +283,7 @@ func (p *Pipeline) runPart() error {
 	mode := installcontext.Mode(in.InstallMode)
 	if err := mode.Validate(); err != nil {
 		p.stageFail("install-context", err.Error())
-		return err
+		return &fatalError{err} // an unknown install_mode never becomes valid on a retry
 	}
 	p.emitLuna(in.InstallMode)
 	p.stageDone("install-context", "source="+in.Source+" mode="+in.InstallMode)

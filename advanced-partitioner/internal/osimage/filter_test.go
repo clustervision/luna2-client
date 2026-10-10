@@ -181,3 +181,37 @@ func TestAbsolutePreservePathIsNeeded(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveInSysroot(t *testing.T) {
+	root := t.TempDir()
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.MkdirAll(filepath.Join(root, "var/spool/mail"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "usr/lib/modules"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "data/home"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "etc/rc.d"), 0o755))
+	must(os.Symlink("spool/mail", filepath.Join(root, "var/mail")))
+	must(os.Symlink("usr/lib", filepath.Join(root, "lib")))
+	must(os.Symlink("/data/home", filepath.Join(root, "home")))
+	must(os.Symlink("rc.d/rc.local", filepath.Join(root, "etc/rc.local")))
+	for in, want := range map[string]string{
+		"var/mail":            "var/spool/mail",
+		"var/mail/***":        "var/spool/mail/***",
+		"lib/modules/*/extra": "usr/lib/modules/*/extra",
+		"home/alice":          "data/home/alice",
+		"etc/rc.local":        "etc/rc.d/rc.local",
+		"etc/ssh/ssh_host_*":  "etc/ssh/ssh_host_*",
+		"nonexistent/a/b":     "nonexistent/a/b",
+	} {
+		if got := ResolveInSysroot(root, in); got != want {
+			t.Errorf("ResolveInSysroot(%q) = %q, want %q", in, got, want)
+		}
+	}
+	got := ExpandFilterPaths(root, []string{"var/mail", "etc/hosts"})
+	if strings.Join(got, ",") != "var/mail,var/spool/mail,etc/hosts" {
+		t.Errorf("ExpandFilterPaths = %v", got)
+	}
+}

@@ -170,6 +170,17 @@ func ProvisionOrder(method, fallback string) []string {
 			out = append(out, v)
 		}
 	}
+	// http is always the last resort: torrent alone (and no aria2c in the
+	// initramfs) used to be a permanent download failure, retried every 30 s.
+	hasHTTP := false
+	for _, e := range out {
+		if e == "http" || e == "https" {
+			hasHTTP = true
+		}
+	}
+	if !hasHTTP {
+		out = append(out, "http")
+	}
 	return out
 }
 
@@ -183,7 +194,7 @@ func downloadTorrent(ctx context.Context, opts DownloadOptions, cachePath string
 	opts.info("fetching torrent metadata: " + torrentURL)
 	curlArgs := append(curlBaseArgs(opts),
 		"-H", "x-access-tokens: "+opts.LunaToken,
-		"-s", "-o", torrentPath, torrentURL,
+		"-f", "-s", "-o", torrentPath, torrentURL, // -f: a 401/404 body is not a torrent
 	)
 	if _, err := opts.Runner.Run(ctx, executor.CommandSpec{
 		Path: "curl", Args: curlArgs,

@@ -165,3 +165,68 @@ func NormalizeFilterPaths(raw []string) (paths, dropped []string) {
 	}
 	return paths, dropped
 }
+
+// ResolveInSysroot follows symlinks in every component of rel (a
+// sysroot-relative path, possibly ending in a glob) inside sysroot: absolute
+// link targets are taken relative to the sysroot, relative ones relative to
+// the link's directory. Resolution stops at the first component with a
+// wildcard; the rest is appended unchanged. FirstSymlinkResolver only followed
+// the first component, so a preserve of "var/mail" (-> spool/mail) protected
+// only the link and the mail itself was deleted.
+func ResolveInSysroot(sysroot, rel string) string {
+	parts := strings.Split(strings.Trim(rel, "/"), "/")
+	var done []string
+	hops := 0
+	for i := 0; i < len(parts); i++ {
+		c := parts[i]
+		if strings.ContainsAny(c, "*?") {
+			done = append(done, parts[i:]...)
+			break
+		}
+		if c == "" || c == "." {
+			continue
+		}
+		if c == ".." {
+			if len(done) > 0 {
+				done = done[:len(done)-1]
+			}
+			continue
+		}
+		cand := append(append([]string{}, done...), c)
+		target, err := os.Readlink(filepath.Join(sysroot, filepath.Join(cand...)))
+		if err != nil || hops > 40 {
+			done = cand
+			continue
+		}
+		hops++
+		var tparts []string
+		if strings.HasPrefix(target, "/") {
+			done = nil
+			tparts = strings.Split(strings.Trim(target, "/"), "/")
+		} else {
+			tparts = strings.Split(target, "/")
+		}
+		// resolve the target's components next, then the rest of rel
+		parts = append(append(append([]string{}, parts[:i+1]...), tparts...), parts[i+1:]...)
+		parts = append(parts[:i], parts[i+1:]...)
+		i--
+	}
+	return strings.Join(done, "/")
+}
+
+// ExpandFilterPaths returns every path as written plus, when it differs, the
+// same path with all symlinks inside the sysroot resolved: protecting both keeps
+// a link and what it points to.
+func ExpandFilterPaths(sysroot string, paths []string) []string {
+	out := make([]string, 0, len(paths)*2)
+	seen := map[string]bool{}
+	for _, p := range paths {
+		for _, q := range []string{p, ResolveInSysroot(sysroot, p)} {
+			if q != "" && !seen[q] {
+				seen[q] = true
+				out = append(out, q)
+			}
+		}
+	}
+	return out
+}

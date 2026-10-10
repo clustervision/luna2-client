@@ -179,8 +179,9 @@ func TestRefusesOnInstallModeLocal(t *testing.T) {
 		"--install-context", ic,
 		"--skip-sysroot-check",
 	)
-	if rc != 1 {
-		t.Fatalf("expected rc=1; got %d (stderr=%s)", rc, stderr)
+	// deterministic (wrong tool for the mode): park, never retry
+	if rc != 3 {
+		t.Fatalf("expected rc=3; got %d (stderr=%s)", rc, stderr)
 	}
 	if !strings.Contains(stderr, "install_mode=local") {
 		t.Fatalf("error should quote install_mode value:\n%s", stderr)
