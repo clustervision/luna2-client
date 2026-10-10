@@ -3,6 +3,7 @@ package storagehealth
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -106,7 +107,60 @@ func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string
 		}
 		return
 	}
+	for _, m := range members {
+		if md := mdHolder(ctx, runner, m); md != "" {
+			adoptAssembledArray(ctx, runner, mdName, md, run, logger)
+			return
+		}
+	}
 	run("mdadm", append([]string{"--assemble", "--run", "/dev/md/" + mdName}, members...)...)
+}
+
+// mdHolder returns the kernel name of the md array that already holds
+// partition dev (e.g. "md125"), or "" when none does (sysfs holders, read
+// through the runner so tests stay hermetic).
+func mdHolder(ctx context.Context, runner executor.Runner, dev string) string {
+	res, err := runner.Run(ctx, executor.CommandSpec{
+		Path: "ls", Args: []string{"-1", "/sys/class/block/" + filepath.Base(dev) + "/holders"},
+		CaptureStdout: true, CaptureStderr: true,
+	})
+	if err != nil {
+		return ""
+	}
+	for _, n := range strings.Fields(string(res.Stdout)) {
+		if strings.HasPrefix(n, "md") {
+			return n
+		}
+	}
+	return ""
+}
+
+// adoptAssembledArray takes over an array the initramfs assembled by itself.
+// initramfs-tools (Ubuntu) runs udev incremental md assembly before the
+// installer starts; dracut does not (rd.md=0). An incrementally assembled
+// array that misses a member stays inactive and gets no /dev/md/<name> link,
+// so `mdadm --assemble` on its members failed "is busy - skipping" and the
+// health probe judged the set broken ("block device not found:
+// /dev/md/os-efi") -- a degraded mirror could never be synced or booted
+// locally on Ubuntu. Start it (degraded) and give it its name.
+func adoptAssembledArray(ctx context.Context, runner executor.Runner, mdName, md string, run func(string, ...string), logger *txlog.Logger) {
+	state := ""
+	if res, err := runner.Run(ctx, executor.CommandSpec{
+		Path: "cat", Args: []string{"/sys/block/" + md + "/md/array_state"},
+		CaptureStdout: true, CaptureStderr: true,
+	}); err == nil {
+		state = strings.TrimSpace(string(res.Stdout))
+	}
+	if logger != nil {
+		logger.Info(fmt.Sprintf("activate: array %s is already assembled as /dev/%s (state %q); using it", mdName, md, state))
+	}
+	switch state {
+	case "clean", "active", "active-idle", "readonly", "read-auto", "write-pending":
+	default: // inactive (degraded, not started) or unknown
+		run("mdadm", "--run", "/dev/"+md)
+	}
+	run("mkdir", "-p", "/dev/md")
+	run("ln", "-sfn", "../"+md, "/dev/md/"+mdName)
 }
 
 // MDNamesOnDisks maps the md array name in every superblock found on the
