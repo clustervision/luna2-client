@@ -296,6 +296,7 @@ func (a *rhelAdapter) installUEFI(ctx context.Context) error {
 		BootDevices:   a.deps.BootContext.StorageResult.BootDevices,
 		RegisterNVRAM: a.deps.BootContext.RegisterNVRAM,
 		ESPPartition:  a.deps.BootContext.StorageResult.ESPPartition,
+		ESPDevice:     espDeviceOf(a.deps.BootContext.StorageResult),
 		SnapshotDir:   a.deps.SnapshotDir,
 		BootOrder:     a.deps.BootContext.BootOrder,
 	}); err != nil {
