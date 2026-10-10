@@ -164,3 +164,46 @@ func TestRuleSetAndVolumeNames(t *testing.T) {
 			vol("root", "/data", "xfs", "lvm", "100%"))), ""},
 	})
 }
+
+func TestRuleVolumeSizes(t *testing.T) {
+	dataVolSized := func(provider, size string) string {
+		return osLayout(set(dataManual("data", "none", "/dev/sdb"), vol("d", "/d", "xfs", provider, size)))
+	}
+	cases := []ruleCase{
+		// lvm.Build fails "lv has no size" for an lvm volume without one.
+		{"lvm-no-size", dataVolSized("lvm", ""), `(set "data", volume "d"): size is required for provider=lvm`},
+		{"lvm-no-size-os-set", lay(set(osFields("os"), espVol(), vol("root", "/", "xfs", "lvm", ""))), `(set "os", volume "root"): size is required for provider=lvm`},
+		// lvm.go sorts the 100% LV last itself: JSON position does not matter.
+		{"lvm-100pct-listed-first-ok", osLayout(set(dataManual("data", "none", "/dev/sdb"),
+			vol("a", "/a", "xfs", "lvm", "100%"), vol("b", "/b", "xfs", "lvm", "10G"))), ""},
+		{"lvm-two-100pct", osLayout(set(dataManual("data", "none", "/dev/sdb"),
+			vol("a", "/a", "xfs", "lvm", "100%"), vol("b", "/b", "xfs", "lvm", "100%"))),
+			"at most one lvm volume per set may use size=100%"},
+		// match sizes go through the resolver's own parser.
+		{"match-min-size-decimal", lay(set(osFields("os")+`,"match":{"min_size":"1.5T"}`, espVol(), rootLV())),
+			`(set "os"): match.min_size: cannot parse size "1.5T"`},
+		{"match-max-size-word", lay(set(osFields("os")+`,"match":{"max_size":"big"}`, espVol(), rootLV())),
+			`(set "os"): match.max_size: cannot parse size "big"`},
+		{"match-min-above-max", lay(set(osFields("os")+`,"match":{"min_size":"2T","max_size":"1T"}`, espVol(), rootLV())),
+			`match.min_size "2T" is larger than match.max_size "1T", so no disk can match`},
+		{"match-sizes-ok", lay(set(osFields("os")+`,"match":{"min_size":"400G","max_size":"8TB"}`, espVol(), rootLV())), ""},
+	}
+	for _, bad := range []string{"1.5G", "50%", "20GB", "20", "-5G", "0G", "0M", "20g", "20 G", " 20G", "G", "100 %", "99999999999T", "99999999999999999999G"} {
+		for _, p := range []string{"partition", "lvm"} {
+			want := "is not valid"
+			switch bad {
+			case "0G", "0M":
+				want = "must be greater than zero"
+			case "99999999999T", "99999999999999999999G":
+				want = "is too large"
+			}
+			cases = append(cases, ruleCase{p + "-size-" + bad, dataVolSized(p, bad), `(set "data", volume "d"): size "` + bad + `" ` + want})
+		}
+	}
+	for _, good := range []string{"512K", "600M", "20G", "2T", "100%"} {
+		for _, p := range []string{"partition", "lvm"} {
+			cases = append(cases, ruleCase{p + "-size-ok-" + good, dataVolSized(p, good), ""})
+		}
+	}
+	runRuleCases(t, cases)
+}

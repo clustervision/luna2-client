@@ -200,6 +200,10 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 		return fmt.Errorf("config_validation: %s.selection unsupported: '%s' (allowed: discover, manual)", pfx, s.Selection)
 	}
 
+	if err := s.validateMatch(idx); err != nil {
+		return err
+	}
+
 	// save pins a discovered layout back to the node (decisions/0008); it is
 	// meaningless on a manual set, which is already the pinned form.
 	if s.Save && s.Selection != "discover" {
@@ -312,6 +316,9 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 		}
 		v := &s.Volumes[j]
 		if err := validateVolumeName(idx, s.Name, j, v.Name, v.Provider == "lvm"); err != nil {
+			return err
+		}
+		if err := validateVolumeSize(idx, s.Name, j, v); err != nil {
 			return err
 		}
 	}
