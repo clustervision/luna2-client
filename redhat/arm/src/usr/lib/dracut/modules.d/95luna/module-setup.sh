@@ -119,6 +119,21 @@ install() {
     # Shared pre/part/post hook shim: exec /usr/bin/lpart-phase pre|part|post.
     inst_simple "$moddir/lpart-phase" /usr/bin/lpart-phase
 
+    # glibc gconv modules for fsck.fat/fsck.vfat. dosfstools converts FAT short
+    # names through iconv (codepage 437 by default); without gconv-modules and
+    # IBM437.so in the initramfs EVERY ESP check fails with "CP437: Invalid
+    # argument", so lpart judged every healthy UEFI os set broken (sync/local
+    # parked, auto wiped). The directory differs per family; install whichever
+    # exist (-o). IBM850 is mkfs.vfat's default label codepage.
+    for _gconv in /usr/lib64/gconv /usr/lib/gconv /usr/lib/x86_64-linux-gnu/gconv /usr/lib/aarch64-linux-gnu/gconv; do
+        [ -d "$_gconv" ] || continue
+        inst_multiple -o "$_gconv/gconv-modules" "$_gconv/gconv-modules.cache" \
+                         "$_gconv/IBM437.so" "$_gconv/IBM850.so"
+        for _gconf in "$_gconv"/gconv-modules.d/*.conf; do
+            [ -e "$_gconf" ] && inst_simple "$_gconf"
+        done
+    done
+
     # Shared installer body, sourced by luna2-start.sh (byte-identical across distros).
     inst_simple "$moddir/luna-installer.sh" /usr/share/luna/luna-installer.sh
 

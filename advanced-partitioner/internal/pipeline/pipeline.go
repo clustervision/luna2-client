@@ -240,7 +240,18 @@ func (p *Pipeline) runPre() error {
 	return nil
 }
 
+// SanitizeDoneMarker is written to the runtime dir after a successful
+// sanitize. luna-installer.sh stops (powers off) the node when it finds it,
+// whatever the rest of the install script did: sanitize promises "erase, then
+// stop", but the daemon's install template went on with the OS steps (network,
+// hostname: chroot into an empty /sysroot), failed, and the retry loop erased
+// the disks again every minute.
+const SanitizeDoneMarker = "sanitize.done"
+
 func (p *Pipeline) runPart() error {
+	// A marker from an earlier attempt in this tmpfs must not stop a later,
+	// different run.
+	_ = os.Remove(p.rt(SanitizeDoneMarker))
 	// Populate the Node + Storage dashboard panels.
 	p.emitNode()
 	p.emitStorage()
@@ -325,7 +336,10 @@ func (p *Pipeline) runPart() error {
 	p.stageDone("storage-prepare", "")
 
 	if mode.IsSanitize() {
-		p.info("sanitize complete; no OS image or bootloader for an erase run")
+		p.info("sanitize complete; no OS image or bootloader for an erase run -- the node will be powered off")
+		if err := os.WriteFile(p.rt(SanitizeDoneMarker), []byte("sanitize complete\n"), 0o644); err != nil {
+			p.info("could not write " + p.rt(SanitizeDoneMarker) + ": " + err.Error())
+		}
 		return nil
 	}
 

@@ -430,6 +430,27 @@ function retry_countdown () {
 # $LUNA_FATAL_RC). For those, do NOT retry and do NOT fall through to luna_finish
 # (there is no installed OS to boot): show why, then park the operator in a
 # maintenance shell. 'poweroff' stops the node; exiting the shell re-opens it.
+# install_mode=sanitize finished (marker from lpart-node-installer): report and
+# power the node off. Nothing is left to boot, and returning to the retry loop
+# would only start another erase.
+function luna_sanitize_stop () {
+    local rc="${1:-0}"
+    echo "Luna2: ============================================================"
+    echo "Luna2: SANITIZE COMPLETE -- every local disk was erased and verified."
+    echo "Luna2: install_mode=sanitize stops the node: powering off in 10 s."
+    echo "Luna2: (install script exit status ${rc}; set another install_mode before the next boot)"
+    echo "Luna2: ============================================================"
+    if [ "$luna_loghost" ]; then
+        readable_log < /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
+    fi
+    sync
+    sleep 10
+    poweroff -f 2>/dev/null
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+    echo o > /proc/sysrq-trigger 2>/dev/null
+    while true; do sleep 60; done
+}
+
 LUNA_FATAL_RC=3   # keep in sync with lpart-node-installer exitFatalConfig
 # Exit 2 is the lpart tools' safety_refusal contract (data fence, persistent-
 # set protection): also deterministic, also parks. The node-installer already
@@ -575,6 +596,13 @@ if [ "x$root" = "xluna" ]; then
             done
             run_install_sh
             rc=$?
+            # sanitize = "erase, then stop". lpart-node-installer writes the
+            # marker after a verified erase; stop here whatever the rest of
+            # install.sh did (its OS steps cannot succeed without an OS, and a
+            # retry would erase the disks again every minute).
+            if [ -f /tmp/install_files/runtime/sanitize.done ]; then
+                luna_sanitize_stop "$rc"   # never returns
+            fi
             [ "$rc" = "0" ] && RES="success"
             echo "Luna2: install.sh exit status: $RES (rc=$rc)"
             if [ "$RES" != "success" ]; then

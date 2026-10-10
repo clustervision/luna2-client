@@ -505,7 +505,12 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		sp.logger.SetStage("mounts")
 		mt, err := sp.mount.MountSysrootTree(ctx, fs)
 		if err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("mount: %w", err)
+			// The layout already exists and is not rebuilt here, so a mount
+			// that fails now fails identically on every retry (local on a
+			// damaged disk looped "retrying in 30s" for ever). Park for an
+			// operator: safety refusal, exit 2.
+			return result.StorageResult{}, result.ResolvedSet{}, safetyRefusalf("mount-existing",
+				"set %q: the existing layout cannot be mounted (%v); it is not repartitioned in this mode -- operator review required (install_mode full rebuilds the set)", set.Name, err)
 		}
 		res := result.Assemble(result.AssembleInput{
 			Set: set, FirmwareMode: firmwareMode,
