@@ -35,7 +35,9 @@ const (
 // disklayout. Structural fields (role, raid, persistent, volumes) come from the
 // original authored config so volumes are reproduced verbatim; the device list
 // comes from what the resolver actually selected. selection becomes "manual" and
-// the discover-only fields (save, count, spares, match) are dropped. A set that
+// the discover-only fields (save, count, match) are dropped. spares is KEPT: the
+// device list holds the members followed by the spares, and without the count
+// the next build would turn the spares into active members. A set that
 // was selection=discover in the source carries the provenance stamp (origin,
 // when non-nil); operator-authored manual sets do not. Returns nil when no set
 // resolved to concrete disks (e.g. memboot/sanitize), so callers can skip the
@@ -78,6 +80,7 @@ func buildPinnableConfig(orig *v2.Config, resolved []result.ResolvedSet, origin 
 			Role:       src.Role,
 			Selection:  "manual",
 			Raid:       src.Raid,
+			Spares:     src.Spares,
 			Devices:    devices,
 			Persistent: src.Persistent,
 			Bootloader: src.Bootloader,

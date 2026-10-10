@@ -78,7 +78,20 @@ func (b *Builder) Build(ctx context.Context, set *v2.Set, layout partition.Layou
 	mdDevice := "/dev/md/" + mdName
 	metadata := "1.2"
 
-	if err := b.create(ctx, mdDevice, metadata, level, layout.StoragePartitions); err != nil {
+	// Hot spares: the resolver hands the set count+spares disks and the
+	// partition builder lays out every one of them, so the LAST <spares>
+	// storage partitions are spares, not active members. Creating with
+	// --raid-devices=len(members) made raid1/10 + spares fail and silently
+	// grew raid0/5/6 by the spare count.
+	spares := set.SpareCount()
+	if spares < 0 {
+		spares = 0
+	}
+	if active := len(layout.StoragePartitions) - spares; len(layout.StoragePartitions) > 0 && active < 1 {
+		return State{}, fmt.Errorf("raid: set %q has %d storage partition(s) but asks for %d spare(s): no active member left",
+			set.Name, len(layout.StoragePartitions), spares)
+	}
+	if err := b.create(ctx, mdDevice, metadata, level, layout.StoragePartitions, spares); err != nil {
 		return State{}, err
 	}
 
@@ -89,19 +102,27 @@ func (b *Builder) Build(ctx context.Context, set *v2.Set, layout partition.Layou
 		Members:         append([]string(nil), layout.StoragePartitions...),
 	}
 
+	// The boot-chain mirrors exist only for the boot partitions the layout
+	// actually has: an os set without a /boot volume (boot on the root LV)
+	// used to fail "raid.create: no members" on the -boot array. They mirror
+	// across EVERY disk of the set, spares included, so each disk the NVRAM
+	// lists can boot.
 	if layout.MirrorBoot && set.Role == "os" {
-		state.EFIMDDevice = "/dev/md/" + mdName + "-efi"
-		state.EFIMetadataVersion = "1.0"
-		state.EFIMembers = append([]string(nil), layout.EFIPartitions...)
-		if err := b.create(ctx, state.EFIMDDevice, "1.0", "1", layout.EFIPartitions); err != nil {
-			return State{}, err
+		if len(layout.EFIPartitions) > 0 {
+			state.EFIMDDevice = "/dev/md/" + mdName + "-efi"
+			state.EFIMetadataVersion = "1.0"
+			state.EFIMembers = append([]string(nil), layout.EFIPartitions...)
+			if err := b.create(ctx, state.EFIMDDevice, "1.0", "1", layout.EFIPartitions, 0); err != nil {
+				return State{}, err
+			}
 		}
-
-		state.BootMDDevice = "/dev/md/" + mdName + "-boot"
-		state.BootMetadataVersion = "1.0"
-		state.BootMembers = append([]string(nil), layout.BootPartitions...)
-		if err := b.create(ctx, state.BootMDDevice, "1.0", "1", layout.BootPartitions); err != nil {
-			return State{}, err
+		if len(layout.BootPartitions) > 0 {
+			state.BootMDDevice = "/dev/md/" + mdName + "-boot"
+			state.BootMetadataVersion = "1.0"
+			state.BootMembers = append([]string(nil), layout.BootPartitions...)
+			if err := b.create(ctx, state.BootMDDevice, "1.0", "1", layout.BootPartitions, 0); err != nil {
+				return State{}, err
+			}
 		}
 	}
 
@@ -110,10 +131,15 @@ func (b *Builder) Build(ctx context.Context, set *v2.Set, layout partition.Layou
 
 // create runs `mdadm --create <md> --run --metadata <m> --level <l> ...`
 // then wipefs's the resulting md device so a subsequent pvcreate /
-// mkfs does not refuse on a leftover signature.
-func (b *Builder) create(ctx context.Context, mdDevice, metadata, level string, members []string) error {
+// mkfs does not refuse on a leftover signature. The last `spares` members
+// become hot spares (--raid-devices counts the active ones only).
+func (b *Builder) create(ctx context.Context, mdDevice, metadata, level string, members []string, spares int) error {
 	if len(members) == 0 {
 		return fmt.Errorf("raid.create: no members for %s", mdDevice)
+	}
+	active := len(members) - spares
+	if spares < 0 || active < 1 {
+		return fmt.Errorf("raid.create: %d member(s) with %d spare(s) for %s", len(members), spares, mdDevice)
 	}
 
 	// Defensively clear each member before creating. sgdisk re-creates the
@@ -138,7 +164,12 @@ func (b *Builder) create(ctx context.Context, mdDevice, metadata, level string, 
 		"--run",
 		"--metadata", metadata,
 		"--level", level,
-		"--raid-devices", fmtInt(len(members)),
+		"--raid-devices", fmtInt(active),
+	}
+	if spares > 0 {
+		args = append(args, "--spare-devices", fmtInt(spares))
+	}
+	args = append(args,
 		"--force",
 		// --homehost=any (BE-N4): metadata 1.x records the creating host's
 		// name in the superblock. Without this the array carries the
@@ -147,7 +178,7 @@ func (b *Builder) create(ctx context.Context, mdDevice, metadata, level string, 
 		// deterministic name. "any" makes every host assemble it under the
 		// name recorded in the superblock.
 		"--homehost=any",
-	}
+	)
 	// --assume-clean is safe ONLY for non-parity levels: raid0 has no
 	// redundancy to sync and raid1/raid10 copy written data at write time,
 	// so unwritten-area mismatches are benign. For raid5/raid6 it marks the

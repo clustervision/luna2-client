@@ -176,3 +176,27 @@ func TestBuildPinnableConfig_CarriesBootloader(t *testing.T) {
 		t.Fatalf("bootloader = %q, want first", pin.Sets[0].Bootloader)
 	}
 }
+
+// A discovered set with hot spares pins its spare count: the device list is
+// members followed by spares, and dropping the count would make the next
+// create turn the spares into active members.
+func TestBuildPinnableConfig_KeepsSpares(t *testing.T) {
+	orig0 := byIDDir
+	byIDDir = t.TempDir()
+	defer func() { byIDDir = orig0 }()
+	orig := &v2.Config{Version: v2.SchemaVersion, Sets: []v2.Set{{
+		Name: "data", Role: "data", Selection: "discover", Raid: "5", Count: 4, Spares: 1,
+		Volumes: []v2.Volume{{Name: "d", Mountpoint: "/data", FS: "xfs", Size: "100%", Provider: "lvm"}},
+	}}}
+	var disks []selector.Resolved
+	for _, d := range []string{"/dev/sda", "/dev/sdb", "/dev/sdc", "/dev/sdd", "/dev/sde"} {
+		disks = append(disks, selector.Resolved{ConfiguredPath: d, ResolvedPath: d})
+	}
+	pin := buildPinnableConfig(orig, []result.ResolvedSet{{Name: "data", Role: "data", SelectedDisks: disks}}, nil)
+	if pin == nil || len(pin.Sets) != 1 {
+		t.Fatalf("want one pinned set, got %+v", pin)
+	}
+	if s := pin.Sets[0]; s.Spares != 1 || len(s.Devices) != 5 {
+		t.Fatalf("pinned set must keep spares=1 and all 5 devices, got spares=%d devices=%v", s.Spares, s.Devices)
+	}
+}

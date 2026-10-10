@@ -449,7 +449,8 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		for _, w := range serialCollisionWarnings(resolved) {
 			sp.logger.Warn(w)
 		}
-		if err := partition.ValidateRAID(rmode, len(resolved)); err != nil {
+		// Hot spares are selected disks but not array members.
+		if err := partition.ValidateRAID(rmode, len(resolved)-set.SpareCount()); err != nil {
 			return result.StorageResult{}, result.ResolvedSet{}, err
 		}
 	}

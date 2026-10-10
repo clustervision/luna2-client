@@ -108,7 +108,8 @@ func alwaysAvailable(string) bool { return true }
 
 // ValidateRAID is the Go equivalent of lib/partitioning.sh::validate_raid_mode.
 // Called by lpart-storage-prepare during the resolve phase. Mirrors the per-mode
-// disk-count rules.
+// disk-count rules. diskCount is the number of ACTIVE members: hot spares are
+// not counted (a raid1 with one spare has 3 disks and 2 members).
 func ValidateRAID(raidMode string, diskCount int) error {
 	switch raidMode {
 	case "none":
