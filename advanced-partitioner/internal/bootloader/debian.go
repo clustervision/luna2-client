@@ -66,7 +66,8 @@ func (a *debianAdapter) hasDracut() bool {
 // RegenerateInitramfs regenerates the INSTALLED system's initramfs with
 // whichever generator the image ships: `update-initramfs -u -k all`
 // (initramfs-tools, Debian-native) when present, else `dracut -f --omit luna
-// --kver <kver>` — identical to the RHEL/SUSE path — for dracut-only images
+// --kver <kver>` for every bootable kernel — identical to the RHEL/SUSE path —
+// for dracut-only images
 // (e.g. Ubuntu 24.04, whose dracut package displaced initramfs-tools). Omit
 // the luna module: it is only for the netboot install initramfs, never the
 // installed system's.
@@ -82,21 +83,10 @@ func (a *debianAdapter) RegenerateInitramfs(ctx context.Context) error {
 		}
 		return nil
 	}
-	kver, err := detectKernelVersion(sysroot)
-	if err != nil {
-		return err
-	}
-	if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
-		Path: "/usr/bin/env", Chroot: sysroot,
-		Args:          []string{"dracut", "-f", "--omit", "luna", "--kver", kver},
-		CaptureStdout: true, CaptureStderr: true,
-	}); err != nil {
-		return fmt.Errorf("dracut -f --omit luna --kver %s: %w", kver, err)
-	}
-	if msg := kernelNotNewestWarning(sysroot, kver); msg != "" && a.deps.Logger != nil {
-		a.deps.Logger.Warn(msg)
-	}
-	return nil
+	// dracut-only image: every bootable kernel, as on RHEL. GRUB_DEFAULT=0 is
+	// update-grub's newest entry, so the default is the newest kernel here.
+	_, err := dracutAllKernels(ctx, a.deps, false)
+	return err
 }
 
 // Install writes /etc/default/grub, then runs the UEFI install -- or the BIOS

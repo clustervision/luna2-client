@@ -24,8 +24,8 @@ type Adapter interface {
 	// are in place.
 	Prepare(ctx context.Context) error
 
-	// RegenerateInitramfs runs the distro's initramfs builder for the
-	// target kernel inside sysroot via chroot.
+	// RegenerateInitramfs runs the distro's initramfs builder inside
+	// sysroot via chroot, for every bootable kernel of the image.
 	RegenerateInitramfs(ctx context.Context) error
 
 	// Install runs the actual grub-install + grub-mkconfig (or family

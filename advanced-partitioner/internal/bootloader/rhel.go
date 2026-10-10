@@ -43,26 +43,13 @@ func (a *rhelAdapter) Prepare(_ context.Context) error {
 	return nil
 }
 
-// RegenerateInitramfs finds the kernel version under /sysroot/lib/modules
-// and runs `dracut -f --omit luna --kver <version>` via chroot.
-// Mirrors bootloader_rhel_regenerate_initramfs.
+// RegenerateInitramfs runs `dracut -f --omit luna --kver <version>` via chroot
+// for every bootable kernel in the image (see dracutAllKernels) and remembers
+// which one the default boot entry will start. Successor of
+// bootloader_rhel_regenerate_initramfs, which rebuilt one kernel only.
 func (a *rhelAdapter) RegenerateInitramfs(ctx context.Context) error {
-	sysroot := a.deps.BootContext.Sysroot
-	kver, err := detectKernelVersion(sysroot)
-	if err != nil {
-		return err
-	}
-	if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
-		Path: "/usr/bin/env", Chroot: sysroot,
-		Args:          []string{"dracut", "-f", "--omit", "luna", "--kver", kver},
-		CaptureStdout: true, CaptureStderr: true,
-	}); err != nil {
-		return fmt.Errorf("dracut -f --omit luna --kver %s: %w", kver, err)
-	}
-	if msg := kernelNotNewestWarning(sysroot, kver); msg != "" && a.deps.Logger != nil {
-		a.deps.Logger.Warn(msg)
-	}
-	return nil
+	_, err := dracutAllKernels(ctx, a.deps, true)
+	return err
 }
 
 // detectKernelVersion walks /sysroot/lib/modules/* and returns the version
@@ -195,16 +182,16 @@ func compareKernelVersions(a, b string) int {
 	return strings.Compare(a, b)
 }
 
-// kernelNotNewestWarning returns the text to warn with when the initramfs was built
-// for a kernel that is not the newest installed one, or "" when there is nothing to
-// say. Pure so it can be tested without a logger.
+// kernelNotNewestWarning returns the text to warn with when the default kernel
+// is not the newest installed one, or "" when there is nothing to say. Pure so
+// it can be tested without a logger.
 //
-// The boot loader orders its entries by version, so when these differ it may start a
-// different kernel from the one just rebuilt -- and that one's initramfs still carries
-// the luna module, which is how a node ends up back in the installer. Pinning an older
-// kernel on the osimage is a legitimate thing to do, so this reports rather than
-// refuses. Comparison is within the same debug flavour, matching how the target was
-// chosen, so an el10 debug tree does not make every install warn.
+// The default is the kernel the osimage boots (see defaultKernel), so this
+// fires when the osimage pins an older kernelversion -- a legitimate choice,
+// hence a report and not a refusal. Every bootable kernel's initramfs is
+// rebuilt, so the newer one is safe to pick at the menu; the warning is there
+// so nobody is surprised which kernel the node runs. Comparison is within the
+// same debug flavour, so an el10 debug tree does not make every install warn.
 func kernelNotNewestWarning(sysroot, kver string) string {
 	entries, err := os.ReadDir(filepath.Join(sysroot, "lib", "modules"))
 	if err != nil {
@@ -221,10 +208,9 @@ func kernelNotNewestWarning(sysroot, kver string) string {
 		return ""
 	}
 	return fmt.Sprintf(
-		"the initramfs was built for kernel %s, but %s is also installed and is newer. "+
-			"The boot loader orders entries by version, so this node may start %s instead, "+
-			"whose initramfs was not rebuilt and still contains the luna module",
-		kver, newest, newest)
+		"the default boot entry starts kernel %s (the kernel the osimage boots), but %s is also installed and is newer; "+
+			"both initramfs images were rebuilt, so either boots -- set the osimage kernelversion to change the default",
+		kver, newest)
 }
 
 // isDebugKernelDir reports whether a /lib/modules entry is a debug kernel variant.
@@ -319,6 +305,10 @@ func (a *rhelAdapter) installUEFI(ctx context.Context) error {
 // generateGrubConfig repairs the image's BLS entries and regenerates
 // grub.cfg. Shared by the UEFI and BIOS installs: what firmware loads differs,
 // what GRUB then reads does not.
+//
+// It then points saved_entry at the default kernel (the one dracutAllKernels
+// chose), because GRUB_DEFAULT=saved would otherwise follow whatever the image
+// host last booted.
 func (a *rhelAdapter) generateGrubConfig(ctx context.Context) error {
 	a.normalizeBLSEntries()
 	if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
@@ -329,7 +319,8 @@ func (a *rhelAdapter) generateGrubConfig(ctx context.Context) error {
 		return fmt.Errorf("grub2-mkconfig: %w", err)
 	}
 	a.makeGrubCfgDegradedSafe()
-	return nil
+	def := defaultKernel(bootableKernels(a.deps.BootContext.Sysroot), true)
+	return setDefaultBootEntry(ctx, a.deps, def)
 }
 
 // normalizeBLSEntries repairs the BLS entry files
