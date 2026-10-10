@@ -604,6 +604,11 @@ if [ "x$root" = "xluna" ]; then
                     sleep 10
                 fi
             done
+            # Per-attempt state. /tmp/install_files survives the retries, and
+            # the lpart phases clear their own files only once they run: a
+            # failure in prescript or before the first lpart phase showed the
+            # PREVIOUS attempt's lpart reason as this attempt's.
+            rm -f "$LUNA_FAILURE_FILE" "$LUNA_SANITIZE_MARKER"
             run_install_sh
             rc=$?
             # sanitize = "erase, then stop". lpart-node-installer writes the
