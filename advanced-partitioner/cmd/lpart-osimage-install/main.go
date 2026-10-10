@@ -256,9 +256,18 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// 60-90s torrent fetch via --skip-download.
 	logger.SetStage("filter_resolve")
 	resolver := osimage.FirstSymlinkResolver{Sysroot: f.Sysroot}
-	preserve := osimage.ParsePatterns(resolver.ResolveAll([]string(f.Preserve)))
-	preserveEmpty := osimage.ParsePatterns(resolver.ResolveAll([]string(f.PreserveEmpty)))
-	noNew := osimage.ParsePatterns(resolver.ResolveAll([]string(f.NoNewFiles)))
+	// Normalise first: "/var/log" and "var/log" mean the same path. Without
+	// this an absolute path matched nothing and its data was deleted.
+	norm := func(kind string, raw []string) []string {
+		paths, dropped := osimage.NormalizeFilterPaths(raw)
+		for _, d := range dropped {
+			logger.Warn(fmt.Sprintf("%s entry %q ignored: empty, \"/\" or contains \"..\"", kind, d))
+		}
+		return paths
+	}
+	preserve := osimage.ParsePatterns(resolver.ResolveAll(norm("preserve", f.Preserve)))
+	preserveEmpty := osimage.ParsePatterns(resolver.ResolveAll(norm("preserve_empty", f.PreserveEmpty)))
+	noNew := osimage.ParsePatterns(resolver.ResolveAll(norm("no_new_files", f.NoNewFiles)))
 	// Pre-compute tar excludes so the log captures them regardless of
 	// whether --skip-extract / --skip-download short-circuit later.
 	excludes := osimage.BuildTarExcludes(preserve, preserveEmpty, noNew)

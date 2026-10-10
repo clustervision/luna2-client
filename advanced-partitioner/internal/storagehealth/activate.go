@@ -2,6 +2,7 @@ package storagehealth
 
 import (
 	"context"
+	"fmt"
 	"strings"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -86,7 +87,7 @@ func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string
 	}
 	if len(members) == 0 {
 		if logger != nil {
-			logger.Info("activate: no member partitions with superblock name %q on the set's disks (array already running, or not raid)", mdName)
+			logger.Info(fmt.Sprintf("activate: no member partitions with superblock name %q on the set's disks (array already running, or not raid)", mdName))
 		}
 		return
 	}

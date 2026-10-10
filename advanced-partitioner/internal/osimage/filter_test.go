@@ -3,6 +3,7 @@ package osimage
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -131,6 +132,52 @@ func TestPatternsBase(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("[%d] %q != %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestNormalizeFilterPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"/var/log":              "var/log",
+		"var/log":               "var/log",
+		"./var/log/":            "var/log/",
+		"//var//log/***":        "var/log/***",
+		" /etc/ssh/ssh_host_* ": "etc/ssh/ssh_host_*",
+		"/":                     "",
+		"":                      "",
+		".":                     "",
+		"/var/../etc":           "",
+		"../outside":            "",
+	} {
+		if got := NormalizeFilterPath(in); got != want {
+			t.Errorf("NormalizeFilterPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// An absolute preserve path must protect its data exactly like the relative
+// form (lab: preserve ["/keeptop", "/var/log/keepdir"] was deleted, the same
+// paths without "/" were kept).
+func TestAbsolutePreservePathIsNeeded(t *testing.T) {
+	paths, dropped := NormalizeFilterPaths([]string{"/keeptop", "/var/log/keepdir", "/"})
+	if len(dropped) != 1 || dropped[0] != "/" {
+		t.Fatalf("dropped = %v, want [/]", dropped)
+	}
+	pats := ParsePatterns(paths)
+	for _, rel := range []string{"keeptop", "keeptop/m", "var", "var/log", "var/log/keepdir", "var/log/keepdir/m"} {
+		if !IsNeededByPreserve(rel, pats, nil) {
+			t.Errorf("%s must be kept for preserve %v", rel, paths)
+		}
+	}
+	for _, rel := range []string{"root", "var/log/m2", "var/tmp"} {
+		if IsNeededByPreserve(rel, pats, nil) {
+			t.Errorf("%s must NOT be kept for preserve %v", rel, paths)
+		}
+	}
+	ex := BuildTarExcludes(pats, nil, nil)
+	for _, e := range ex {
+		if strings.Contains(e, ".//") {
+			t.Errorf("malformed tar exclude %q", e)
 		}
 	}
 }

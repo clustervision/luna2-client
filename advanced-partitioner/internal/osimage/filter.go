@@ -116,3 +116,52 @@ func PatternsBase(patterns []Pattern) []string {
 	}
 	return out
 }
+
+// NormalizeFilterPath turns an operator-written filter path into the
+// sysroot-relative form every matcher here expects ("var/log", "etc/ssh/*"):
+// surrounding space, leading "/" and "./" are stripped and runs of "/" are
+// collapsed. Operators naturally write absolute paths ("/var/log"), and Luna
+// shows them that way; before this, such a path matched nothing (the tar
+// exclude became ".//var/log" and PrepareSysroot never saw it as preserved),
+// so the "preserved" data was deleted without a warning. It returns "" for a
+// path that is empty or "/" (that would mean "everything") or that contains a
+// ".." component (it could point outside the sysroot); callers drop those.
+func NormalizeFilterPath(raw string) string {
+	p := strings.TrimSpace(raw)
+	for strings.Contains(p, "//") {
+		p = strings.ReplaceAll(p, "//", "/")
+	}
+	for {
+		switch {
+		case strings.HasPrefix(p, "/"):
+			p = p[1:]
+		case strings.HasPrefix(p, "./"):
+			p = p[2:]
+		default:
+			goto done
+		}
+	}
+done:
+	if p == "" || p == "." {
+		return ""
+	}
+	for _, c := range strings.Split(p, "/") {
+		if c == ".." {
+			return ""
+		}
+	}
+	return p
+}
+
+// NormalizeFilterPaths applies NormalizeFilterPath to every entry and returns
+// the usable paths plus the raw entries that were dropped.
+func NormalizeFilterPaths(raw []string) (paths, dropped []string) {
+	for _, r := range raw {
+		if n := NormalizeFilterPath(r); n != "" {
+			paths = append(paths, n)
+		} else {
+			dropped = append(dropped, r)
+		}
+	}
+	return paths, dropped
+}
