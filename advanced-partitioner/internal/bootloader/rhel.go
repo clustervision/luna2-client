@@ -273,24 +273,12 @@ func (a *rhelAdapter) installBIOS(ctx context.Context) error {
 	return a.generateGrubConfig(ctx)
 }
 
-// writeGrubDefault writes /etc/default/grub. Mirrors
-// bootloader_rhel_write_grub_default.
+// writeGrubDefault merges lpart's keys and root-storage kernel arguments into
+// the image's /etc/default/grub (see grubdefault.go). Successor of
+// bootloader_rhel_write_grub_default, which overwrote the file.
 func (a *rhelAdapter) writeGrubDefault() error {
-	path := filepath.Join(a.deps.BootContext.Sysroot, "etc", "default", "grub")
-	if err := a.deps.FS.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir parent of %s: %w", path, err)
-	}
-	lines := []string{
-		"GRUB_TIMEOUT=5",
-		"GRUB_DEFAULT=saved",
-		"GRUB_DISABLE_SUBMENU=true",
-		"GRUB_DISABLE_OS_PROBER=true",
-		"GRUB_DISABLE_RECOVERY=true",
-		`GRUB_TERMINAL_OUTPUT="console"`,
-		GrubCmdlineValue(a.deps.BootContext.KernelArgs),
-	}
-	body := strings.Join(lines, "\n") + "\n"
-	return a.deps.FS.WriteFile(path, []byte(body), 0o644)
+	return writeMergedGrubDefault(a.deps.FS, a.deps.BootContext.Sysroot,
+		rhelGrubDefaultKeys, a.deps.BootContext.KernelArgs)
 }
 
 func (a *rhelAdapter) installUEFI(ctx context.Context) error {

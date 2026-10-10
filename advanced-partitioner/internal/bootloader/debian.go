@@ -138,24 +138,12 @@ func (a *debianAdapter) installBIOS(ctx context.Context) error {
 	return a.generateGrubConfig(ctx)
 }
 
-// writeGrubDefault mirrors bootloader_debian_write_grub_default. The
-// Debian-style /etc/default/grub differs from RHEL's: GRUB_DEFAULT=0
-// (numeric, not "saved"), no GRUB_DISABLE_SUBMENU.
+// writeGrubDefault merges lpart's keys and root-storage kernel arguments into
+// the image's /etc/default/grub (see grubdefault.go). The Debian keys differ
+// from RHEL's: GRUB_DEFAULT=0 (numeric, not "saved"), no GRUB_DISABLE_SUBMENU.
 func (a *debianAdapter) writeGrubDefault() error {
-	path := filepath.Join(a.deps.BootContext.Sysroot, "etc", "default", "grub")
-	if err := a.deps.FS.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir parent of %s: %w", path, err)
-	}
-	lines := []string{
-		"GRUB_TIMEOUT=5",
-		"GRUB_DEFAULT=0",
-		"GRUB_DISABLE_OS_PROBER=true",
-		"GRUB_DISABLE_RECOVERY=true",
-		`GRUB_TERMINAL_OUTPUT="console"`,
-		GrubCmdlineValue(a.deps.BootContext.KernelArgs),
-	}
-	body := strings.Join(lines, "\n") + "\n"
-	return a.deps.FS.WriteFile(path, []byte(body), 0o644)
+	return writeMergedGrubDefault(a.deps.FS, a.deps.BootContext.Sysroot,
+		debianGrubDefaultKeys, a.deps.BootContext.KernelArgs)
 }
 
 func (a *debianAdapter) installUEFI(ctx context.Context) error {
