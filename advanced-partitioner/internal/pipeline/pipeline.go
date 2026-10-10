@@ -269,10 +269,24 @@ func (p *Pipeline) runPre() error {
 // the disks again every minute.
 const SanitizeDoneMarker = "sanitize.done"
 
+// partOutputs are the files the part phase produces. The install tmpfs
+// survives the boot wrapper's 30 s retries, so each is removed before the
+// phase that writes it: a sanitize (which writes no storage results) or a
+// failed step must never leave the previous attempt's copy to be read as
+// this attempt's (the dashboard, the post phase's bootloader finalise).
+var partOutputs = []string{
+	SanitizeDoneMarker,
+	"storage-result.json",
+	"storage-resolved.json",
+	"storage-check-result.json",
+}
+
 func (p *Pipeline) runPart() error {
-	// A marker from an earlier attempt in this tmpfs must not stop a later,
-	// different run.
-	_ = os.Remove(p.rt(SanitizeDoneMarker))
+	for _, name := range partOutputs {
+		if err := os.Remove(p.rt(name)); err != nil && !os.IsNotExist(err) {
+			p.info("could not clear " + p.rt(name) + ": " + err.Error())
+		}
+	}
 	// Populate the Node + Storage dashboard panels.
 	p.emitNode()
 	p.emitStorage()
