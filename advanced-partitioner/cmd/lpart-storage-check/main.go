@@ -1,9 +1,17 @@
 // lpart-storage-check verifies whether existing storage matches the v2
-// intent. Exit codes (matching the bash predecessor):
+// intent. Exit codes follow the repo-wide contract (internal/cli), which
+// lpart-node-installer maps to retry (1) or park (2/3):
 //
 //	0  all sets healthy; filesystems mounted under /sysroot
-//	2  one or more sets unhealthy; caller must run lpart-storage-prepare
-//	1  script error (bad args, missing file, unexpected failure)
+//	1  retryable: an operational failure that may pass on the next attempt
+//	   (log init, unmounting a stale /sysroot, writing the result file)
+//	2  safety refusal: a set is unhealthy, or the healthy-looking existing
+//	   layout cannot be mounted -- local mode never rebuilds, so it needs
+//	   an operator (safety_refusal=<reason>)
+//	3  fatal configuration error: identical on every attempt (bad flags,
+//	   unreadable install context, not the installer env, a missing fsck
+//	   tool, a missing/invalid disklayout, no resolved discover disks)
+//	   (fatal_config=<reason>)
 //
 // Behavioural reference: /root/NEWTREE/bin/lpart-storage-check.
 //
@@ -102,7 +110,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&f.SkipCommandCheck, "skip-command-check", false, "(test) skip the storage-check command preflight")
 
 	if err := fs.Parse(argv[1:]); err != nil {
-		return 2
+		// A bad command line is the same on every attempt; exit 2 is reserved
+		// for safety refusals.
+		return cli.ExitFatalConfigCode
 	}
 	if f.ShowVersion {
 		_, _ = fmt.Fprintln(stdout, cli.Version())
@@ -116,9 +126,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// the combination instead of emitting fiction. The pipeline never passes
 	// --dry-run to this tool.
 	if f.DryRun {
-		errln(stderr, "--dry-run is not supported: storage-check probes are already read-only, "+
-			"and stubbing them would fabricate health verdicts; run without --dry-run")
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "dry-run",
+			"--dry-run is not supported: storage-check probes are already read-only, "+
+				"and stubbing them would fabricate health verdicts; run without --dry-run")
 	}
 
 	logger, err := f.NewLogger(toolName)
@@ -132,8 +142,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	ic, err := installcontext.LoadFile(f.InstallContextPath)
 	if err != nil {
-		errln(stderr, "install-context: %v", err)
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "install-context", "install-context: %v", err)
 	}
 	logger.KV("install_mode", string(ic.InstallMode))
 	if !ic.InstallMode.IsLocal() {
@@ -146,42 +155,39 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		CmdlinePath:       f.CmdlinePath,
 		AllowNonInstaller: f.AllowNonInstaller,
 	}); err != nil {
-		errln(stderr, "%v", err)
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "installer-env", "%v", err)
 	}
 
 	logger.SetStage("command_checks")
 	fsckVfat := "fsck.vfat"
 	if !f.SkipCommandCheck {
+		// A tool missing from the install initramfs (e2fsck, xfs_repair,
+		// fsck.vfat/fsck.fat) is missing on every retry too.
 		if err := sysenv.RequireCommands(sysenv.StorageCheckCommands...); err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			return cli.ExitFatalConfig(stderr, toolName, "missing-command", "%v", err)
 		}
 		chosen, err := sysenv.RequireCommandsWithFallback("fsck.vfat", "fsck.fat")
 		if err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			return cli.ExitFatalConfig(stderr, toolName, "missing-command", "%v", err)
 		}
 		fsckVfat = chosen
 	}
 
+	// The disklayout is the daemon's input for this node: missing, unparsable
+	// or invalid, it is the same on every retry -- park, do not loop.
 	if f.ConfigPath == "" {
-		errln(stderr, "--config is required")
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "config-missing", "--config is required")
 	}
 	logger.SetStage("config_validation")
 	cfg, raw, err := v2.LoadFile(f.ConfigPath)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			errln(stderr, "config not found: %s", f.ConfigPath)
-			return 1
+			return cli.ExitFatalConfig(stderr, toolName, "config-missing", "config not found: %s", f.ConfigPath)
 		}
-		errln(stderr, "%v", err)
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "config-load", "%v", err)
 	}
 	if err := cfg.ValidateRaw(raw); err != nil {
-		errln(stderr, "%v", err)
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "config-validation", "%v", err)
 	}
 	// A selection=discover set names no devices in the config: storage-prepare
 	// picks them from the disk pool and records them in storage-resolved.json
@@ -274,7 +280,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 				"%d persistent set volume(s) unhealthy — operator review required", len(failures))
 		}
 		logger.UserInfo("Storage unhealthy — lpart-storage-prepare required")
-		return 2
+		return cli.ExitSafetyRefusal(stderr, toolName, "unhealthy",
+			"%d volume(s) unhealthy; install_mode=local does not rebuild -- operator review required (install_mode full rebuilds the layout)", len(failures))
 	}
 
 	logger.SetStage("mount")
@@ -292,8 +299,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	})
 	mt, err := mounter.MountSysrootTree(context.Background(), predicted)
 	if err != nil {
-		errln(stderr, "mount: %v", err)
-		return 1
+		// Every set probed healthy, yet the existing layout does not mount: it
+		// is not rebuilt in this mode, so this fails identically on every
+		// retry. Park for an operator, as lpart-storage-prepare does.
+		return cli.ExitSafetyRefusal(stderr, toolName, "mount-existing",
+			"the existing layout cannot be mounted (%v); it is not repartitioned in this mode -- operator review required (install_mode full rebuilds it)", err)
 	}
 
 	// Write storage-check-result.json with the healthy/sets_checked

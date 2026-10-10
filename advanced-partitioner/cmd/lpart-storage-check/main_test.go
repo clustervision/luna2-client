@@ -226,3 +226,44 @@ func TestDiscoverWithoutResolvedIsFatal(t *testing.T) {
 		t.Fatalf("rc=%d stderr=%s", rc, stderr)
 	}
 }
+
+// Deterministic failures exit 3 (park), not 1 (retry every 30 s for ever).
+func TestDeterministicFailuresAreFatal(t *testing.T) {
+	ic := writeConfig(t, `{"install_mode":"local"}`)
+	cases := []struct {
+		name   string
+		args   []string
+		marker string
+	}{
+		{"no config", []string{"--install-context", ic}, "fatal_config=config-missing"},
+		{"config not found", []string{"--install-context", ic, "--config", "/no/such/file.json"}, "fatal_config=config-missing"},
+		{"unparsable config", []string{"--install-context", ic, "--config", writeConfig(t, "{not json")}, "fatal_config=config-load"},
+		{"invalid config", []string{"--install-context", ic, "--config", writeConfig(t, strings.ReplaceAll(validConfig, `"raid": "none"`, `"raid": "7"`))}, "fatal_config=config-validation"},
+		{"dry-run", []string{"--dry-run"}, "fatal_config=dry-run"},
+		{"bad flag", []string{"--no-such-flag"}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stderr, rc := runEnv(t, c.args...)
+			if rc != 3 || !strings.Contains(stderr, c.marker) {
+				t.Fatalf("rc=%d (want 3), stderr=%s", rc, stderr)
+			}
+		})
+	}
+}
+
+// A fsck tool missing from the install initramfs is missing on every retry.
+func TestMissingFsckToolIsFatal(t *testing.T) {
+	tmp := t.TempDir()
+	cmdline := filepath.Join(tmp, "cmdline")
+	if err := os.WriteFile(cmdline, []byte("root=luna rw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir()) // nothing to find
+	var outBuf, errBuf bytes.Buffer
+	rc := run([]string{"lpart-storage-check", "--log-dir", filepath.Join(tmp, "logs"), "--cmdline-path", cmdline,
+		"--install-context", writeConfig(t, `{"install_mode":"local"}`), "--config", writeConfig(t, validConfig)}, &outBuf, &errBuf)
+	if rc != 3 || !strings.Contains(errBuf.String(), "fatal_config=missing-command") {
+		t.Fatalf("rc=%d (want 3), stderr=%s", rc, errBuf.String())
+	}
+}
