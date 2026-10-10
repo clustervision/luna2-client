@@ -4,11 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cleanup"
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/disk/selector"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/diskresolve"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installcontext"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lvm"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lvm/vgselect"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/partition"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sanitize"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/storagehealth"
@@ -27,6 +32,37 @@ func (e *safetyError) Error() string { return e.msg }
 
 func safetyRefusalf(reason, format string, args ...any) error {
 	return &safetyError{reason: reason, msg: fmt.Sprintf(format, args...)}
+}
+
+// fatalConfigError marks a deterministic configuration error: the same layout
+// fails identically on every retry (a missing manual device, a disk too small,
+// a raid count the disks cannot meet). main.run() maps it to the exit-3
+// fatal_config contract (cli.ExitFatalConfig) so the wrapper parks instead of
+// retrying every 30 s -- often re-wiping disks -- for ever.
+type fatalConfigError struct {
+	reason string // short machine-readable class, e.g. "device-missing"
+	msg    string
+}
+
+func (e *fatalConfigError) Error() string { return e.msg }
+
+func fatalConfigf(reason, format string, args ...any) error {
+	return &fatalConfigError{reason: reason, msg: fmt.Sprintf(format, args...)}
+}
+
+// plannedSet is the decided work for one set. Every set is planned -- devices
+// resolved, health probed, data fence applied, deterministic preflights run --
+// BEFORE any set is touched, so a refusal for the second set can no longer
+// come after the first set's disks were wiped.
+type plannedSet struct {
+	set          *v2.Set
+	act          setAction
+	firstInstall bool
+	// disks are the set's devices present on the node, in configured order.
+	disks []selector.Resolved
+	// missing are configured devices absent from the node. Only a redundant
+	// raid set that is mounted (not created) may have any: it runs degraded.
+	missing []string
 }
 
 // runDecision implements the spec section-5 dispatch on install_mode and
@@ -58,6 +94,24 @@ func (sp *setProcessor) runDecision(ctx context.Context, mode installcontext.Mod
 		return sp.runSanitize(ctx, dryRun)
 	}
 
+	// auto/sync/full/local/memboot. With no declared disk layout, auto falls
+	// back to memboot; the other diskful modes require a layout.
+	if !mode.IsMemboot() && (cfg == nil || len(cfg.Sets) == 0) {
+		if mode == installcontext.ModeAuto {
+			sp.logger.UserInfo("auto: no disk layout declared -- falling back to memboot (RAM root)")
+			return sp.runMemboot(ctx, nil, firmware, dryRun, wipe)
+		}
+		return nil, nil, fatalConfigf("no-disklayout", "install_mode=%s requires a disklayout", mode)
+	}
+	// A diskful mode installs the OS onto the os set: without one, every data
+	// set used to be created (wiped) first and then lpart-osimage-install
+	// failed on an unmounted /sysroot, for ever. Refuse before anything.
+	hasOS := cfg != nil && cfg.OSSet() != nil
+	if !hasOS && !mode.IsMemboot() && mode != installcontext.ModeAuto {
+		return nil, nil, fatalConfigf("no-os-set",
+			"install_mode=%s installs the OS to disk, but the disklayout declares no os set (role=os) -- add one, or use install_mode auto or memboot for a RAM OS with these data sets; no disk was touched", mode)
+	}
+
 	// Reserve every manual set's disks up front (persistent sets are
 	// manual-only, enforced by the validator): resolve them to canonical
 	// kernel paths, refuse cross-set aliases, and remove them from the
@@ -70,24 +124,63 @@ func (sp *setProcessor) runDecision(ctx context.Context, mode installcontext.Mod
 	if mode.IsMemboot() {
 		return sp.runMemboot(ctx, cfg, firmware, dryRun, wipe)
 	}
-
-	// auto/sync/full/local. With no declared disk layout, auto falls back to
-	// memboot; the other modes require a layout.
-	if cfg == nil || len(cfg.Sets) == 0 {
-		if mode == installcontext.ModeAuto {
-			sp.logger.UserInfo("auto: no disk layout declared -- falling back to memboot (RAM root)")
-			return sp.runMemboot(ctx, nil, firmware, dryRun, wipe)
-		}
-		return nil, nil, fmt.Errorf("install_mode=%s requires a disklayout", mode)
+	if !hasOS {
+		// auto with a data-only layout: the OS runs from RAM, exactly as with
+		// no layout at all, and the declared data sets follow the auto data
+		// policy (persistent -> mount, blank -> create, broken -> halt).
+		sp.logger.UserInfo("auto: the disklayout declares no os set -- memboot (RAM root) plus the declared data sets")
+		return sp.runMemboot(ctx, cfg, firmware, dryRun, wipe)
 	}
 
-	order := cfg.ExecutionOrder()
-	results := make([]result.StorageResult, 0, len(order))
-	resolved := make([]result.ResolvedSet, 0, len(order))
-	for _, idx := range order {
+	plans, err := sp.planSets(ctx, mode, cfg, false, firmware, dryRun, wipe)
+	if err != nil {
+		return nil, nil, err
+	}
+	return sp.executePlans(ctx, plans, firmware, dryRun)
+}
+
+// planSets plans every set (skipping the os set when skipOS) in execution
+// order, then cross-checks the plans; nothing is touched.
+func (sp *setProcessor) planSets(ctx context.Context, mode installcontext.Mode, cfg *v2.Config, skipOS bool, firmware string, dryRun, wipe bool) ([]plannedSet, error) {
+	var plans []plannedSet
+	for _, idx := range cfg.ExecutionOrder() {
 		set := &cfg.Sets[idx]
-		sp.logger.StageBanner(fmt.Sprintf("Processing set '%s' (install_mode=%s)", set.Name, mode))
-		res, rec, err := sp.applySet(ctx, mode, set, firmware, dryRun, wipe)
+		if skipOS && set.Role == "os" {
+			sp.logger.UserInfo("memboot: ignoring declared os set %q (OS runs from RAM)", set.Name)
+			continue
+		}
+		sp.logger.StageBanner(fmt.Sprintf("Planning set '%s' (install_mode=%s)", set.Name, mode))
+		p, err := sp.planSet(ctx, mode, cfg, set, firmware, dryRun, wipe)
+		if err != nil {
+			return nil, err
+		}
+		plans = append(plans, p)
+	}
+	if err := sp.checkForeignVGs(ctx, plans); err != nil {
+		return nil, err
+	}
+	return plans, nil
+}
+
+// executePlans runs the plans: first the identity re-check and the cleanup of
+// every set that is (re)created, then each set's build or mount in execution
+// order. Cleaning every create set first lets a stale VG named like one set
+// but sitting on another create set's disks be wiped before vgcreate runs.
+func (sp *setProcessor) executePlans(ctx context.Context, plans []plannedSet, firmware string, dryRun bool) ([]result.StorageResult, []result.ResolvedSet, error) {
+	for _, p := range plans {
+		if p.act != actCreate {
+			continue
+		}
+		sp.logger.StageBanner(fmt.Sprintf("Cleaning set '%s'", p.set.Name))
+		if err := sp.prepareCreate(ctx, p, dryRun); err != nil {
+			return nil, nil, err
+		}
+	}
+	results := make([]result.StorageResult, 0, len(plans))
+	resolved := make([]result.ResolvedSet, 0, len(plans))
+	for _, p := range plans {
+		sp.logger.StageBanner(fmt.Sprintf("Processing set '%s' (%s)", p.set.Name, actionName(p.act)))
+		res, rec, err := sp.process(ctx, p, firmware, dryRun)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -97,53 +190,305 @@ func (sp *setProcessor) runDecision(ctx context.Context, mode installcontext.Mod
 	return results, resolved, nil
 }
 
-// applySet enforces the data fence for one set under auto/sync/full/local and
-// then runs process() with the decided action.
-func (sp *setProcessor) applySet(ctx context.Context, mode installcontext.Mode, set *v2.Set, firmware string, dryRun, wipe bool) (result.StorageResult, result.ResolvedSet, error) {
+// planSet decides one set's action under auto/sync/full/local: the data
+// fence, the missing-device rule and the deterministic create preflights.
+func (sp *setProcessor) planSet(ctx context.Context, mode installcontext.Mode, cfg *v2.Config, set *v2.Set, firmware string, dryRun, wipe bool) (plannedSet, error) {
+	p := plannedSet{set: set, firstInstall: wipe && !dryRun}
+
+	if err := sp.missingDeviceError(set); err != nil {
+		return p, err
+	}
+
 	// Persistent sets are hands-off in every normal mode: mount only.
 	if set.Persistent {
 		sp.logger.UserInfo("set %q is persistent -- mount only (never partitioned/formatted)", set.Name)
-		return sp.process(ctx, set, firmware, actMount, dryRun, false)
+		p.act, p.firstInstall = actMount, false
+		p.disks, p.missing = sp.manualDisks[set.Name], sp.missing[set.Name]
+		if err := validateRAIDCount(set); err != nil {
+			return p, err
+		}
+		sp.warnDegraded(set, p.missing)
+		return p, nil
 	}
 
 	// Resolve selection=discover disks from the discovered pool (mutates
-	// set.Devices so process() resolves the same disks). Failure to meet the
+	// set.Devices so the record shows the same disks). Failure to meet the
 	// layout is a halt, never a silent fallback.
 	if set.SelectionMode() == "discover" && set.StorageType() != v2.StorageMemory {
 		if err := sp.resolveDiscover(set); err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("set %q: %w", set.Name, err)
+			return p, err
 		}
 	}
-
-	firstInstall := wipe && !dryRun
+	disks, missing, err := sp.setDisks(ctx, set)
+	if err != nil {
+		return p, err
+	}
+	if err := validateRAIDCount(set); err != nil {
+		return p, err
+	}
 
 	// full and local need no health probe; sync/auto do.
 	var verdict storagehealth.Verdict
 	if mode == installcontext.ModeSync || mode == installcontext.ModeAuto {
-		resolvedDisks, err := sp.selector.ResolveAll(ctx, set.EffectiveDevices())
-		if err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("set %q: resolve: %w", set.Name, err)
-		}
-		verdict, _ = storagehealth.Classify(ctx, sp.runner, sp.checker, set, resolvedDisks, sp.logger)
+		verdict = sp.classify(ctx, set, disks)
 		sp.logger.KV("verdict", set.Name+"="+string(verdict))
 	}
 
 	act, halt := decideAction(mode, set.Role, false, verdict)
+	// A set with absent members may only be MOUNTED, degraded, and only when
+	// the array actually came up (healthy verdict, or local/full which do
+	// not probe). Creating needs every device; a non-healthy degraded set
+	// is the missing disk's fault, so name it: fatal config, exit 3.
+	if len(missing) > 0 && (act != actMount || halt) {
+		return p, fatalConfigf("device-missing",
+			"set %q: device(s) %s not present on this node, and install_mode=%s (verdict %s) cannot mount the set degraded -- it would have to (re)create it, which needs every device; replace the disk or correct the disklayout; no disk was touched",
+			set.Name, strings.Join(missing, ", "), mode, verdictOrNone(verdict))
+	}
 	if halt && verdict == storagehealth.VerdictUnknown {
-		return result.StorageResult{}, result.ResolvedSet{}, safetyRefusalf("health-unknown",
+		return p, safetyRefusalf("health-unknown",
 			"set %q: the health probe could not decide (a filesystem checker did not run) and install_mode=%s neither mounts nor wipes an unverified set; halting -- operator review required",
 			set.Name, mode)
 	}
 	if halt {
-		return result.StorageResult{}, result.ResolvedSet{}, safetyRefusalf("data-fence",
+		return p, safetyRefusalf("data-fence",
 			"set %q is %s and install_mode=%s will not wipe it (data fence); halting -- operator review required",
 			set.Name, verdict, mode)
 	}
-	sp.logger.UserInfo("set %q: mode=%s verdict=%s -> %s", set.Name, mode, verdict, actionName(act))
+	sp.logger.UserInfo("set %q: mode=%s verdict=%s -> %s", set.Name, mode, verdictOrNone(verdict), actionName(act))
 	if act == actMount {
-		firstInstall = false
+		p.firstInstall = false
+		sp.warnDegraded(set, missing)
+	} else if err := sp.preflightCreate(ctx, mode, cfg, set, disks, verdict, firmware); err != nil {
+		return p, err
 	}
-	return sp.process(ctx, set, firmware, act, dryRun, firstInstall)
+	p.act, p.disks, p.missing = act, disks, missing
+	return p, nil
+}
+
+func verdictOrNone(v storagehealth.Verdict) string {
+	if v == "" {
+		return "none"
+	}
+	return string(v)
+}
+
+// classify runs the health probe (test seam: classifyFn).
+func (sp *setProcessor) classify(ctx context.Context, set *v2.Set, disks []selector.Resolved) storagehealth.Verdict {
+	if sp.classifyFn != nil {
+		return sp.classifyFn(ctx, set, disks)
+	}
+	v, _ := storagehealth.Classify(ctx, sp.runner, sp.checker, set, disks, sp.logger)
+	return v
+}
+
+// warnDegraded logs, loudly, every member a mounted raid set runs without.
+func (sp *setProcessor) warnDegraded(set *v2.Set, missing []string) {
+	for _, m := range missing {
+		sp.logger.Warn(fmt.Sprintf("set %s: running degraded, member %s missing; replace the disk and reinstall with install_mode full to rebuild", set.Name, m))
+	}
+}
+
+// validateRAIDCount checks the set's configured member count (spares
+// excluded) against its raid level. Deterministic: exit 3.
+func validateRAIDCount(set *v2.Set) error {
+	if set.StorageType() == v2.StorageMemory {
+		return nil
+	}
+	if err := partition.ValidateRAID(set.RAIDMode(), len(set.EffectiveDevices())-set.SpareCount()); err != nil {
+		return fatalConfigf("raid-count", "set %q: %v (%d device(s), %d spare(s))", set.Name, err, len(set.EffectiveDevices()), set.SpareCount())
+	}
+	return nil
+}
+
+// setDisks returns the set's present devices and the configured ones that
+// are missing. Manual sets were resolved (and their missing devices judged)
+// by reserveManualSets; discover sets resolve the disks the pool gave them.
+func (sp *setProcessor) setDisks(ctx context.Context, set *v2.Set) ([]selector.Resolved, []string, error) {
+	if set.SelectionMode() == "manual" {
+		if d, ok := sp.manualDisks[set.Name]; ok {
+			return d, sp.missing[set.Name], nil
+		}
+	}
+	var disks []selector.Resolved
+	for _, dev := range set.EffectiveDevices() {
+		r, err := sp.resolveForReservation(ctx, []string{dev})
+		if err != nil {
+			if errors.Is(err, selector.ErrNotFound) && set.SelectionMode() == "discover" {
+				// The pool listed it a moment ago: environmental, retry.
+				return nil, nil, fmt.Errorf("set %q: discovered disk %s vanished: %w", set.Name, dev, err)
+			}
+			return nil, nil, classifyResolveErr(set.Name, err)
+		}
+		disks = append(disks, r...)
+	}
+	return disks, nil, nil
+}
+
+// classifyResolveErr maps a device-resolution failure onto the exit contract:
+// a device absent from the node, or one that is not a usable whole disk
+// (read-only, a partition, a bad path), fails identically on every retry --
+// fatal config, exit 3; a mounted disk is a safety refusal, exit 2; a probe
+// error may clear and stays retryable, exit 1.
+func classifyResolveErr(setName string, err error) error {
+	var re *selector.ResolveError
+	if errors.As(err, &re) {
+		switch re.Kind {
+		case selector.KindNotFound:
+			return fatalConfigf("device-missing", "set %q: device %s is not present on this node: %v", setName, re.Device, err)
+		case selector.KindInvalid:
+			return fatalConfigf("device-invalid", "set %q: device %s: %v", setName, re.Device, err)
+		case selector.KindInUse:
+			return safetyRefusalf("device-in-use", "set %q: device %s: %v", setName, re.Device, err)
+		}
+	}
+	return fmt.Errorf("set %q: %w", setName, err)
+}
+
+// missingDeviceError is the fatal config error for a set whose absent
+// devices it cannot run without; nil when nothing is missing or the redundant
+// raid set can still run degraded (planSet then still refuses a create).
+func (sp *setProcessor) missingDeviceError(set *v2.Set) error {
+	missing := sp.missing[set.Name]
+	if len(missing) == 0 {
+		return nil
+	}
+	present := len(sp.manualDisks[set.Name])
+	if degradedRunnable(set, present) {
+		return nil
+	}
+	return fatalConfigf("device-missing",
+		"set %q: device(s) %s not present on this node, and raid %s cannot run without them (%d of %d device(s) present) -- replace the disk or correct the disklayout; no disk was touched",
+		set.Name, strings.Join(missing, ", "), set.Raid, present, len(set.EffectiveDevices()))
+}
+
+// degradedRunnable reports whether a redundant raid set can still run with
+// `present` of its configured devices. Only raid1/5/6/10 can run degraded;
+// for raid10 this is the necessary condition and mdadm --assemble --run makes
+// the final call (it refuses when a whole mirror pair is gone).
+func degradedRunnable(set *v2.Set, present int) bool {
+	active := len(set.EffectiveDevices()) - set.SpareCount()
+	if present < 1 {
+		return false
+	}
+	switch set.RAIDMode() {
+	case "raid1":
+		return true
+	case "raid5":
+		return present >= active-1
+	case "raid6":
+		return present >= active-2
+	case "raid10":
+		return present >= (active+1)/2
+	}
+	return false
+}
+
+// preflightCreate runs the deterministic checks of a set about to be
+// (re)created, before any disk is touched: disk fit, and (auto/sync, on
+// non-blank discovered disks) that the disks do not carry another declared
+// set's array or volume group.
+func (sp *setProcessor) preflightCreate(ctx context.Context, mode installcontext.Mode, cfg *v2.Config, set *v2.Set, disks []selector.Resolved, verdict storagehealth.Verdict, firmware string) error {
+	if err := partition.CheckDiskFit(set, disks, firmware); err != nil {
+		return fatalConfigf("disk-too-small", "set %q: %v -- no disk was touched", set.Name, err)
+	}
+	if set.SelectionMode() == "discover" && verdict != storagehealth.VerdictBlank &&
+		(mode == installcontext.ModeAuto || mode == installcontext.ModeSync) {
+		if err := sp.refuseForeignSetSignatures(ctx, cfg, set, disks); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// refuseForeignSetSignatures refuses to create a discover-selected set on
+// disks that carry an md array or LVM volume group named after ANOTHER
+// declared set: discover picked another set's disks (enumeration changed),
+// and auto would wipe that set's data. A persistent set's signature gets its
+// own reason.
+func (sp *setProcessor) refuseForeignSetSignatures(ctx context.Context, cfg *v2.Config, set *v2.Set, disks []selector.Resolved) error {
+	if cfg == nil {
+		return nil
+	}
+	paths := diskPaths(disks)
+	mdNames := storagehealth.MDNamesOnDisks(ctx, sp.runner, paths)
+	vgs, err := vgselect.OnDisks(ctx, sp.runner, paths)
+	if err != nil {
+		// Cannot tell: never create on uncertainty over disks that are not blank.
+		return fmt.Errorf("set %q: cannot list the volume groups on %v before creating: %w", set.Name, paths, err)
+	}
+	for i := range cfg.Sets {
+		other := &cfg.Sets[i]
+		if other.Name == set.Name {
+			continue
+		}
+		reason := "foreign-set-signature"
+		if other.Persistent {
+			reason = "persistent-signature"
+		}
+		for _, v := range vgs {
+			if v.Name == other.VGName() {
+				return safetyRefusalf(reason,
+					"set %q (selection=discover) picked disk(s) %v that carry volume group %q of set %q -- discover chose another set's disks; refusing to wipe them -- operator review required (pin the sets with selection=manual)",
+					set.Name, paths, v.Name, other.Name)
+			}
+		}
+		names := []string{other.MDName()}
+		if other.Role == "os" {
+			names = append(names, other.MDName()+"-efi", other.MDName()+"-boot")
+		}
+		for _, n := range names {
+			if dev, ok := mdNames[n]; ok {
+				return safetyRefusalf(reason,
+					"set %q (selection=discover) picked disk(s) %v, and %s carries md array %q of set %q -- discover chose another set's disks; refusing to wipe them -- operator review required (pin the sets with selection=manual)",
+					set.Name, paths, dev, n, other.Name)
+			}
+		}
+	}
+	return nil
+}
+
+// checkForeignVGs refuses, before anything is touched, a create whose VG name
+// is taken by a volume group outside the set: vgcreate would fail on it after
+// the set's disks were wiped, and the installer must not remove a VG it does
+// not own. A stale VG that sits entirely on disks of sets this run recreates
+// is fine: their cleanup wipes it before vgcreate (executePlans cleans every
+// create set first).
+func (sp *setProcessor) checkForeignVGs(ctx context.Context, plans []plannedSet) error {
+	var createDisks []string
+	for _, p := range plans {
+		if p.act == actCreate {
+			createDisks = append(createDisks, diskPaths(p.disks)...)
+		}
+	}
+	for _, p := range plans {
+		if p.act != actCreate || p.set.StorageType() != v2.StorageLVM {
+			continue
+		}
+		loc, err := vgselect.Locate(ctx, sp.runner, p.set.VGName(), diskPaths(p.disks))
+		if err != nil || len(loc.Foreign) == 0 {
+			continue // the lvm builder re-checks right before vgcreate
+		}
+		wiped, err := vgselect.StackedKernelNames(ctx, sp.runner, createDisks)
+		if err != nil {
+			wiped = nil
+		}
+		for _, f := range loc.Foreign {
+			if f.OnlyOn(wiped) {
+				continue
+			}
+			return safetyRefusalf("foreign-vg", "set %q: %v; no disk was touched", p.set.Name,
+				&lvm.ForeignVGError{VG: f.Name, UUID: f.UUID, PVs: f.PVs})
+		}
+	}
+	return nil
+}
+
+func diskPaths(disks []selector.Resolved) []string {
+	out := make([]string, 0, len(disks))
+	for _, d := range disks {
+		out = append(out, d.ResolvedPath)
+	}
+	return out
 }
 
 // decideAction is the data fence as a pure function: given the mode, the set's
@@ -208,9 +553,17 @@ func actionName(a setAction) string {
 //     declared manual (and in particular persistent) set.
 //
 // Resolution failure is a halt (fail-closed): an unresolvable manual device
-// means we cannot know which physical disk to protect.
+// means we cannot know which physical disk to protect. A device that is
+// simply ABSENT from the node is recorded in sp.missing; planSet tolerates it
+// only for a redundant raid set that can still run without it AND is mounted,
+// not (re)created (a dead mirror disk must not stop the node from ever
+// booting again). Any other absent device is a fatal config error (exit 3)
+// naming the device, raised while planning -- before any disk is touched.
+// Present disks of a degraded persistent set stay protected.
 func (sp *setProcessor) reserveManualSets(ctx context.Context, cfg *v2.Config) error {
 	sp.protected = map[string]struct{}{}
+	sp.manualDisks = map[string][]selector.Resolved{}
+	sp.missing = map[string][]string{}
 	if cfg == nil {
 		return nil
 	}
@@ -221,11 +574,27 @@ func (sp *setProcessor) reserveManualSets(ctx context.Context, cfg *v2.Config) e
 		if set.SelectionMode() != "manual" || set.StorageType() == v2.StorageMemory {
 			continue
 		}
-		resolved, err := sp.resolveForReservation(ctx, set.EffectiveDevices())
-		if err != nil {
-			return fmt.Errorf("set %q: resolving devices for reservation: %w", set.Name, err)
+		var present []selector.Resolved
+		var missing []string
+		for _, dev := range set.EffectiveDevices() {
+			r, err := sp.resolveForReservation(ctx, []string{dev})
+			if err != nil {
+				if errors.Is(err, selector.ErrNotFound) {
+					missing = append(missing, dev)
+					continue
+				}
+				return classifyResolveErr(set.Name, fmt.Errorf("resolving devices for reservation: %w", err))
+			}
+			present = append(present, r...)
 		}
-		for _, r := range resolved {
+		if len(missing) > 0 {
+			// Judged by planSet (missingDeviceError): a set this run ignores
+			// (the os set under memboot) must not fail on its devices.
+			sp.missing[set.Name] = missing
+			sp.logger.Warn(fmt.Sprintf("set %s: device(s) %s not present on this node", set.Name, strings.Join(missing, ", ")))
+		}
+		sp.manualDisks[set.Name] = present
+		for _, r := range present {
 			p := r.ResolvedPath
 			if prev, dup := owner[p]; dup && prev != set.Name {
 				return safetyRefusalf("device-overlap",
@@ -257,16 +626,21 @@ func (sp *setProcessor) reserveManualSets(ctx context.Context, cfg *v2.Config) e
 }
 
 // resolveDiscover picks the set's disks from the pool by its match filter +
-// raid count, removes them from the pool, and fills set.Devices.
+// raid count, removes them from the pool, and fills set.Devices. A match the
+// pool cannot meet is a fatal config error (exit 3) -- unless the pool itself
+// could not be listed, which may clear on retry (exit 1).
 func (sp *setProcessor) resolveDiscover(set *v2.Set) error {
 	mf := set.MatchFilter()
 	m, err := diskresolve.ParseMatch(mf.Tags, mf.MinSize, mf.MaxSize, mf.Model)
 	if err != nil {
-		return err
+		return fatalConfigf("match-invalid", "set %q: match: %v", set.Name, err)
 	}
 	selected, err := diskresolve.Resolve(sp.pool, m, set.MemberCount(), set.SpareCount(), 0)
 	if err != nil {
-		return err
+		if sp.poolErr != nil {
+			return fmt.Errorf("set %q: %w (device discovery failed: %v)", set.Name, err, sp.poolErr)
+		}
+		return fatalConfigf("discover-unmet", "set %q: %v", set.Name, err)
 	}
 	paths := make([]string, 0, len(selected))
 	chosen := make(map[string]struct{}, len(selected))
@@ -294,7 +668,9 @@ func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.
 		disks = append(disks, d.KernelPath)
 	}
 	if len(disks) == 0 {
-		sp.logger.UserInfo("sanitize: no local disks discovered; nothing to erase")
+		// A diskless node is legitimate (exit 0), but say plainly that
+		// nothing was erased: the node powers off after sanitize.
+		sp.logger.UserInfo("sanitize: no local disks found -- nothing was erased (USB, FC/iSCSI and multipath disks are excluded from sanitize by design)")
 		return nil, nil, nil
 	}
 	sp.logger.UserInfo("sanitize: erasing %d local disk(s): %v", len(disks), disks)
@@ -326,6 +702,7 @@ func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.
 		// park for an operator (safety refusal, exit 2) instead of looping.
 		return nil, nil, safetyRefusalf("sanitize-incomplete", "%v", err)
 	}
+	sp.sanitized = len(disks)
 	return nil, nil, nil
 }
 
@@ -348,36 +725,28 @@ func membootSet() *v2.Set {
 
 // runMemboot synthesizes a tmpfs OS root and applies any declared DATA sets
 // (persistent -> mount; otherwise the auto data-set policy, which never wipes
-// a data set).
+// a data set). The data sets are planned -- and refused -- before anything is
+// mounted or touched.
 func (sp *setProcessor) runMemboot(ctx context.Context, cfg *v2.Config, firmware string, dryRun, wipe bool) ([]result.StorageResult, []result.ResolvedSet, error) {
-	results := make([]result.StorageResult, 0, 2)
-	resolved := make([]result.ResolvedSet, 0, 2)
+	var plans []plannedSet
+	if cfg != nil {
+		var err error
+		// Data sets follow the auto policy: persistent -> mount, blank ->
+		// create, broken -> halt. The data fence guarantees no wipe.
+		plans, err = sp.planSets(ctx, installcontext.ModeAuto, cfg, true, firmware, dryRun, wipe)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
 
 	sp.logger.StageBanner("Processing memboot OS (tmpfs RAM root)")
-	res, rec, err := sp.process(ctx, membootSet(), firmware, actMount, dryRun, true)
+	res, rec, err := sp.process(ctx, plannedSet{set: membootSet(), act: actMount, firstInstall: true}, firmware, dryRun)
 	if err != nil {
 		return nil, nil, fmt.Errorf("memboot tmpfs: %w", err)
 	}
-	results = append(results, res)
-	resolved = append(resolved, rec)
-
-	if cfg != nil {
-		for i := range cfg.Sets {
-			set := &cfg.Sets[i]
-			if set.Role == "os" {
-				sp.logger.UserInfo("memboot: ignoring declared os set %q (OS runs from RAM)", set.Name)
-				continue
-			}
-			sp.logger.StageBanner(fmt.Sprintf("Processing memboot data set '%s'", set.Name))
-			// Data sets follow the auto policy: persistent -> mount, blank ->
-			// create, broken -> halt. The data fence guarantees no wipe.
-			dres, drec, derr := sp.applySet(ctx, installcontext.ModeAuto, set, firmware, dryRun, wipe)
-			if derr != nil {
-				return nil, nil, derr
-			}
-			results = append(results, dres)
-			resolved = append(resolved, drec)
-		}
+	dres, drec, err := sp.executePlans(ctx, plans, firmware, dryRun)
+	if err != nil {
+		return nil, nil, err
 	}
-	return results, resolved, nil
+	return append([]result.StorageResult{res}, dres...), append([]result.ResolvedSet{rec}, drec...), nil
 }

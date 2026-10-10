@@ -116,6 +116,20 @@ func (v VG) onDisks(stacked map[string]struct{}) bool {
 	return false
 }
 
+// OnlyOn reports whether EVERY PV of the VG is one of the stacked devices (a
+// VG with no known PV, or a missing "[unknown]" PV, is not).
+func (v VG) OnlyOn(stacked map[string]struct{}) bool {
+	if len(stacked) == 0 || len(v.PVs) == 0 {
+		return false
+	}
+	for _, pv := range v.PVs {
+		if _, ok := stacked[kernelName(pv)]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
 // OnDisks returns every VG (any name) with at least one PV on the disks.
 func OnDisks(ctx context.Context, runner executor.Runner, disks []string) ([]VG, error) {
 	all, err := List(ctx, runner)

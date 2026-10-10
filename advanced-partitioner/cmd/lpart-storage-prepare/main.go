@@ -6,15 +6,23 @@
 //  2. Load + validate the v2 storage JSON
 //  3. Wipe + host guards
 //  4. Unmount any stale /sysroot tree (once)
-//  5. For each set in OS-first execution order:
-//     - resolve devices via selector
-//     - run safety check (if .safety is present)
-//     - cleanup the selected disks
+//  5. Plan EVERY set in OS-first execution order, touching nothing: resolve
+//     devices, health probe (sync/auto), data fence, missing-device rule,
+//     and the deterministic create preflights (raid count, disk fit,
+//     another set's signature, a foreign same-name VG). Any refusal here
+//     parks the node (exit 2/3) with every disk untouched.
+//  6. Execute: identity re-check + cleanup of every set that is
+//     (re)created, then per set either
 //     - memory: build memory filesystems, mount, assemble result
-//     - disk:   partition -> raid -> lvm -> fs -> mount ->
+//     - create: partition -> raid -> lvm -> fs -> mount ->
 //     RecordBlockUUIDs -> assemble result
-//  6. Emit storage-result.json (single object or multi-set wrapper)
+//     - mount:  activate (md --run, VG by uuid) -> mount -> assemble result
+//  7. Emit storage-result.json (single object or multi-set wrapper)
 //     and storage-resolved.json; capture final inventory state.
+//
+// Exit codes: 0 ok; 1 retryable (environmental: I/O, udev, a probe that may
+// clear); 2 safety refusal and 3 fatal config error -- both deterministic,
+// both park the node for an operator instead of retrying every 30 s.
 package main
 
 import (
@@ -111,7 +119,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&f.SkipFinalInventory, "skip-final-inventory", false, "(test) skip the blkid/pvs/vgs/lvs/mdadm capture")
 
 	if err := fs.Parse(argv[1:]); err != nil {
-		return 2
+		// A bad command line is identical on every retry: park (exit 3).
+		return cli.ExitFatalConfig(stderr, toolName, "usage", "%v", err)
 	}
 	if f.ShowVersion {
 		_, _ = fmt.Fprintln(stdout, cli.Version())
@@ -127,21 +136,23 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.SetStage("startup")
 	logger.StageBanner("Starting lpart-storage-prepare")
 
+	// A missing install-context reads as the defaults; one that exists but
+	// does not parse fails identically on every retry: park (exit 3).
 	ic, err := installcontext.LoadFile(f.InstallContextPath)
 	if err != nil {
-		errln(stderr, "install-context: %v", err)
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "install-context", "%v", err)
 	}
 	logger.KV("install_mode", string(ic.InstallMode))
 
 	// Installer-env guard.
 	logger.SetStage("installer_check")
+	// Outside the Luna installer this tool must never touch a disk; the
+	// condition does not change on retry, so it is a refusal (exit 2).
 	if err := sysenv.RequireInstallerEnv(sysenv.Options{
 		CmdlinePath:       f.CmdlinePath,
 		AllowNonInstaller: f.AllowNonInstaller,
 	}); err != nil {
-		errln(stderr, "%v", err)
-		return 1
+		return cli.ExitSafetyRefusal(stderr, toolName, "not-installer-env", "%v", err)
 	}
 
 	// Command preflight (the FAT tool names come out of this). A tool missing
@@ -186,14 +197,17 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.KV("details", f.Details)
 
 	if !f.DryRun && !f.Wipe {
-		errln(stderr, "--wipe is required for destructive execution")
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "usage", "--wipe is required for destructive execution")
 	}
 	if !f.DryRun {
 		logger.SetStage("expected_host_check")
 		if err := sysenv.RequireExpectedHost(f.ExpectHost, sysenv.Options{
 			Hostname: f.HostnameFunc,
 		}); err != nil {
+			// Wrong node: never touch its disks, and do not retry for ever.
+			if errors.Is(err, sysenv.ErrHostMismatch) {
+				return cli.ExitSafetyRefusal(stderr, toolName, "host-mismatch", "%v", err)
+			}
 			errln(stderr, "%v", err)
 			return 1
 		}
@@ -298,26 +312,26 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	// Discover the disk pool once: selection=discover resolution and sanitize
 	// both draw from it. No size fences — the per-set match does sizing.
-	if pool, derr := discover.ListDevices(context.Background(), discover.Options{
+	mode := ic.InstallMode
+	if pool, derr := listDevices(context.Background(), discover.Options{
 		Runner: runner, Names: discover.NamesKernel,
 	}); derr != nil {
+		// Sanitize erases exactly the pool: an unlisted pool would "succeed"
+		// having erased nothing, and the node would power off as if erased.
+		// That is an error (it may be transient: exit 1), never a success.
+		if mode.IsSanitize() {
+			errln(stderr, "sanitize: device discovery failed, nothing was erased: %v", derr)
+			return 1
+		}
 		logger.Warn("device discovery failed", "err", derr.Error())
+		sp.poolErr = derr
 	} else {
 		sp.pool = pool
 	}
 
-	mode := ic.InstallMode
 	results, resolvedSets, err := sp.runDecision(context.Background(), mode, cfg, detectedFirmware, f.DryRun, f.Wipe && !f.DryRun)
 	if err != nil {
-		// Safety halts (data fence, persistent protection, device overlap)
-		// use the repo's exit-code-2 safety_refusal contract so the wrapper
-		// parks for operator review instead of retrying a permanent refusal.
-		var se *safetyError
-		if errors.As(err, &se) {
-			return cli.ExitSafetyRefusal(stderr, toolName, se.reason, "%s", se.msg)
-		}
-		errln(stderr, "%v", err)
-		return 1
+		return exitForError(stderr, err)
 	}
 
 	logger.SetStage("final_output")
@@ -329,7 +343,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// (FTA v2 BE-Z1 / MCS-18, barrier NB-1). Other modes keep the fail-closed
 	// behaviour: for them an empty result set means something went wrong.
 	if mode.IsSanitize() && len(results) == 0 {
-		logger.UserInfo("sanitize completed: all discovered disks erased; no storage results by design")
+		if sp.sanitized > 0 {
+			logger.UserInfo("sanitize completed: %d local disk(s) erased; no storage results by design", sp.sanitized)
+		} else {
+			logger.UserInfo("sanitize completed: no local disks found -- nothing was erased; no storage results by design")
+		}
 		return 0
 	}
 	if err := result.WriteResolved(f.ResolvedOut, resolvedSets); err != nil {
@@ -373,6 +391,27 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// listDevices enumerates the discover pool; a test seam (the real one runs
+// lsblk against the host the suite runs on).
+var listDevices = discover.ListDevices
+
+// exitForError maps a runDecision failure onto the exit contract: safety halts
+// (data fence, persistent protection, device overlap, ...) exit 2 and
+// deterministic configuration errors exit 3 -- both park the node for an
+// operator -- and only what may clear on retry exits 1.
+func exitForError(stderr io.Writer, err error) int {
+	var se *safetyError
+	if errors.As(err, &se) {
+		return cli.ExitSafetyRefusal(stderr, toolName, se.reason, "%s", se.msg)
+	}
+	var fe *fatalConfigError
+	if errors.As(err, &fe) {
+		return cli.ExitFatalConfig(stderr, toolName, fe.reason, "%s", fe.msg)
+	}
+	errln(stderr, "%v", err)
+	return 1
+}
+
 // setProcessor bundles the per-set module instances so process() reads
 // like a checklist instead of a long stack of constructors.
 type setProcessor struct {
@@ -394,9 +433,19 @@ type setProcessor struct {
 	// independent barrier: no destructive cleanup step may touch these
 	// disks, whatever the selection logic decided.
 	protected map[string]struct{}
-	// resolveFn overrides selector.ResolveAll for reservation; tests inject
-	// it (the real selector needs /dev nodes). nil = use sp.selector.
+	// resolveFn overrides selector.ResolveAll for device resolution; tests
+	// inject it (the real selector needs /dev nodes). nil = use sp.selector.
 	resolveFn func(ctx context.Context, devs []string) ([]selector.Resolved, error)
+	// manualDisks / missing are filled by reserveManualSets: each manual
+	// set's PRESENT devices, and the configured devices absent from the node.
+	manualDisks map[string][]selector.Resolved
+	missing     map[string][]string
+	// classifyFn overrides the storagehealth.Classify health probe (tests).
+	classifyFn func(ctx context.Context, set *v2.Set, disks []selector.Resolved) storagehealth.Verdict
+	// poolErr is the device-discovery failure, when listing the pool failed.
+	poolErr error
+	// sanitized counts the disks sanitize erased.
+	sanitized int
 }
 
 // resolveForReservation resolves a manual set's configured devices to
@@ -417,41 +466,61 @@ const (
 	actMount                   // mount an existing layout, no cleanup/create
 )
 
-// process runs the per-set cascade for the decided action and returns the
-// StorageResult + ResolvedSet that go into the two output JSONs. Device
-// resolution for selection=discover sets is done by the caller (applySet), which
-// fills set.Devices before calling process.
-func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmware string, act setAction, dryRun, firstInstall bool) (result.StorageResult, result.ResolvedSet, error) {
+// prepareCreate is the destructive first half of a create: the pre-write
+// identity re-check and the cleanup of the set's disks. executePlans runs it
+// for every create set before any set is built.
+func (sp *setProcessor) prepareCreate(ctx context.Context, p plannedSet, dryRun bool) error {
+	set := p.set
+	// Identity re-verification first (FTA BR-9/MCS-6, TOCTOU): the serial
+	// captured at resolve time is re-read immediately before the first
+	// destructive step. A udev rescan / hotplug between resolve and here can
+	// re-point a kernel name at a DIFFERENT physical disk; a mismatch is a
+	// halt, not a guess. Disks that report no serial (common on virtio)
+	// verify vacuously — the mount/cleanup guards remain for those.
+	sp.logger.SetStage("identity_check")
+	if !dryRun {
+		for _, d := range p.disks {
+			if err := sp.verifyDiskIdentity(ctx, d); err != nil {
+				return err
+			}
+		}
+	}
+
+	sp.logger.SetStage("cleanup")
+	if _, err := sp.cleaner.CleanupSelectedSet(ctx, cleanup.Set{
+		Name:          set.VGName(),
+		SelectedDisks: diskPaths(p.disks),
+		OwnsSysroot:   set.HasRootVolume(),
+		Persistent:    set.Persistent,
+		Protected:     cleanup.SelectedDisksSet(protectedPaths(sp.protected)),
+	}); err != nil {
+		return cleanupError(set.Name, err)
+	}
+	return nil
+}
+
+// process runs the per-set cascade for the planned action and returns the
+// StorageResult + ResolvedSet that go into the two output JSONs. The plan
+// carries the set's resolved disks (planSet); a create's identity check and
+// cleanup already ran (prepareCreate).
+func (sp *setProcessor) process(ctx context.Context, p plannedSet, detectedFirmware string, dryRun bool) (result.StorageResult, result.ResolvedSet, error) {
+	set := p.set
 	storageType := string(set.StorageType())
 	rmode := set.RAIDMode()
+	selectedDisks := p.disks
 
-	var (
-		selectedDisks []selector.Resolved
-		selectorType  string
-	)
-	if storageType == "memory" {
-		selectorType = "memory"
-	} else {
+	selectorType := "memory"
+	if storageType != "memory" {
 		st, err := set.SelectorType()
 		if err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("selector: %w", err)
+			return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("selector", "set %q: selector: %v", set.Name, err)
 		}
 		selectorType = string(st)
-		sp.logger.SetStage("resolve_set")
-		resolved, err := sp.selector.ResolveAll(ctx, set.EffectiveDevices())
-		if err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, err
-		}
-		selectedDisks = resolved
 		// Serial-audit (BE-N5): an empty or duplicated serial makes the
-		// pre-write identity re-check below vacuous. Warn, never fail —
+		// pre-write identity re-check vacuous. Warn, never fail —
 		// serial-less disks are normal on plain virtio.
-		for _, w := range serialCollisionWarnings(resolved) {
+		for _, w := range serialCollisionWarnings(selectedDisks) {
 			sp.logger.Warn(w)
-		}
-		// Hot spares are selected disks but not array members.
-		if err := partition.ValidateRAID(rmode, len(resolved)-set.SpareCount()); err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, err
 		}
 	}
 
@@ -481,7 +550,7 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		res := result.Assemble(result.AssembleInput{
 			Set: set, FirmwareMode: firmwareMode,
 			Selected: selectedDisks, Filesystems: fs, Mount: mt,
-			FirstInstall: firstInstall,
+			FirstInstall: p.firstInstall,
 		})
 		return res, resolvedRecord, nil
 	}
@@ -490,7 +559,7 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 	// (sync/auto on an existing layout) mount their volumes against the
 	// predicted device paths with no cleanup and no create. first_install
 	// stays false because the layout was not rebuilt.
-	if set.Persistent || act == actMount {
+	if set.Persistent || p.act == actMount {
 		// Activate the existing layout first (FTA D1): event-based LVM
 		// autoactivation is deliberately disabled for the whole install
 		// (EnsureNoLVMAutoActivate), and persistent/local sets skip the
@@ -501,12 +570,18 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		sp.logger.SetStage("activate_existing")
 		sp.activateExisting(ctx, set, rmode, selectedDisks)
 		sp.logger.SetStage("filesystems")
-		var firstDisk string
+		// Raw partition paths are anchored on the first PRESENT disk: a
+		// degraded raid set may be missing its first configured member.
+		var firstDisk, firstConfigured string
 		if len(selectedDisks) > 0 {
 			firstDisk = selectedDisks[0].ResolvedPath
+			firstConfigured = selectedDisks[0].ConfiguredPath
+			if firstConfigured == "" {
+				firstConfigured = firstDisk
+			}
 		}
 		biosBoot := set.Role == "os" && storagehealth.HasBIOSBootPartition(ctx, sp.runner, firstDisk)
-		fs := fsmod.PredictFilesystemsForSet(set, biosBoot)
+		fs := fsmod.PredictFilesystemsOnDisk(set, firstConfigured, biosBoot)
 		sp.logger.SetStage("mounts")
 		mt, err := sp.mount.MountSysrootTree(ctx, fs)
 		if err != nil {
@@ -523,6 +598,11 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 			FirstInstall: false,
 			Persistent:   set.Persistent,
 		})
+		// No Layout was built, so record the boot partition numbers the
+		// builder gave this disk: lpart-bootloader-finalise reads them (BIOS
+		// GRUB refuses without bios_boot_partition; efibootmgr --create needs
+		// the ESP number, which is 2 on a disk laid out under BIOS).
+		res.ESPPartition, res.BIOSBootPartition = existingBootPartitions(set, biosBoot)
 		if !dryRun {
 			if err := result.RecordBlockUUIDs(ctx, sp.runner, &res); err != nil {
 				return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("record uuids: %w", err)
@@ -531,42 +611,15 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		return res, resolvedRecord, nil
 	}
 
-	// Create branch (actCreate): cleanup the selected disks then build the
-	// layout from scratch.
-	//
-	// Identity re-verification first (FTA BR-9/MCS-6, TOCTOU): the serial
-	// captured at resolve time is re-read immediately before the first
-	// destructive step. A udev rescan / hotplug between resolve and here can
-	// re-point a kernel name at a DIFFERENT physical disk; a mismatch is a
-	// halt, not a guess. Disks that report no serial (common on virtio)
-	// verify vacuously — the mount/cleanup guards remain for those.
-	sp.logger.SetStage("identity_check")
-	if !dryRun {
-		for _, d := range selectedDisks {
-			if err := sp.verifyDiskIdentity(ctx, d); err != nil {
-				return result.StorageResult{}, result.ResolvedSet{}, err
-			}
-		}
-	}
-
-	sp.logger.SetStage("cleanup")
-	disks := make([]string, 0, len(selectedDisks))
-	for _, d := range selectedDisks {
-		disks = append(disks, d.ResolvedPath)
-	}
-	if _, err := sp.cleaner.CleanupSelectedSet(ctx, cleanup.Set{
-		Name:          set.VGName(),
-		SelectedDisks: disks,
-		OwnsSysroot:   set.HasRootVolume(),
-		Persistent:    set.Persistent,
-		Protected:     cleanup.SelectedDisksSet(protectedPaths(sp.protected)),
-	}); err != nil {
-		return result.StorageResult{}, result.ResolvedSet{}, cleanupError(set.Name, err)
-	}
-
+	// Create branch (actCreate): the disks were identity-checked and cleaned
+	// by prepareCreate; build the layout from scratch.
 	sp.logger.SetStage("partitioning")
 	layout, err := sp.part.BuildLayout(ctx, set, selectedDisks, firmwareMode)
 	if err != nil {
+		var tooSmall *partition.DiskTooSmallError
+		if errors.As(err, &tooSmall) {
+			return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("disk-too-small", "set %q: %v", set.Name, err)
+		}
 		return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("partition: %w", err)
 	}
 
@@ -606,7 +659,7 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		Set: set, FirmwareMode: firmwareMode,
 		Selected: selectedDisks, Layout: layout, RAID: mdState, LVM: lvmState,
 		Filesystems: fs, Mount: mt,
-		FirstInstall: firstInstall,
+		FirstInstall: p.firstInstall,
 	})
 	if !dryRun {
 		if err := result.RecordBlockUUIDs(ctx, sp.runner, &res); err != nil {
@@ -614,6 +667,26 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		}
 	}
 	return res, resolvedRecord, nil
+}
+
+// existingBootPartitions returns the ESP and BIOS boot partition NUMBERS of an
+// existing os-set layout, as the partition builder numbered them: the BIOS
+// boot partition (EF02) is partition 1 when the disk has one, and the ESP
+// follows it (Set.PartitionNumber). 0 = none.
+func existingBootPartitions(set *v2.Set, biosBoot bool) (esp, bios int) {
+	if set.Role != "os" {
+		return 0, 0
+	}
+	if biosBoot {
+		bios = 1
+	}
+	for _, v := range set.Volumes {
+		if v.Provider == "partition" && v.Mountpoint == "/boot/efi" {
+			esp = set.PartitionNumber(v, biosBoot)
+			break
+		}
+	}
+	return esp, bios
 }
 
 // cleanupError classifies a cleanup failure. A protected-disk barrier refusal

@@ -90,12 +90,11 @@ func TestRunDecisionLegacyErrors(t *testing.T) {
 
 func TestRunDecisionSyncRequiresConfig(t *testing.T) {
 	sp := &setProcessor{logger: silentLogger(t)}
-	if _, _, err := sp.runDecision(context.Background(), installcontext.ModeSync, nil, "uefi", true, false); err == nil {
-		t.Fatal("sync with no disklayout must error")
-	}
-	if _, _, err := sp.runDecision(context.Background(), installcontext.ModeFull, &v2.Config{}, "uefi", true, false); err == nil {
-		t.Fatal("full with empty disklayout must error")
-	}
+	// Deterministic: fatal config (exit 3), not a retry loop.
+	_, _, err := sp.runDecision(context.Background(), installcontext.ModeSync, nil, "uefi", true, false)
+	wantFatal(t, err, "no-disklayout")
+	_, _, err = sp.runDecision(context.Background(), installcontext.ModeFull, &v2.Config{}, "uefi", true, false)
+	wantFatal(t, err, "no-disklayout")
 }
 
 func TestRunSanitizeNoDisks(t *testing.T) {

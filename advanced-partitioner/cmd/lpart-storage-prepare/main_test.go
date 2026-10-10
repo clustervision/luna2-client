@@ -2,11 +2,13 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/discover"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/disk/selector"
 )
 
@@ -35,9 +37,14 @@ func runWithBootEnv(t *testing.T, firmware string, pivots bool, args ...string) 
 	detectFirmware = func() string { return firmware }
 	prevPivots := detectRamdiskPivots
 	detectRamdiskPivots = func() bool { return pivots }
+	// Hermetic pool: never enumerate (or dry-run-sanitize) the disks of the
+	// host the suite runs on.
+	prevList := listDevices
+	listDevices = func(context.Context, discover.Options) ([]discover.Device, error) { return nil, nil }
 	t.Cleanup(func() {
 		detectFirmware = prevDetect
 		detectRamdiskPivots = prevPivots
+		listDevices = prevList
 	})
 	tmp := t.TempDir()
 
@@ -72,12 +79,14 @@ func writeConfig(t *testing.T, body string) string {
 }
 
 // validConfig is a minimal valid v1.4 disklayout (single-disk manual LVM OS
-// set) used by the guard tests, which return before any disk work.
+// set) used by the guard tests, which return before any disk work. The device
+// does not exist on any host, so no test ever probes the disks of the machine
+// the suite runs on (a real, mounted /dev/sda used to be resolved here).
 const validConfig = `{
 	"version": 2,
 	"sets": [
 		{"name": "os", "role": "os", "selection": "manual", "raid": "none",
-		 "devices": ["/dev/sda"],
+		 "devices": ["/dev/disk/by-id/lpart-test-no-such-disk"],
 		 "volumes": [
 		   {"name": "uefi", "mountpoint": "/boot/efi", "fs": "vfat", "provider": "partition", "size": "600M"},
 		   {"name": "root", "mountpoint": "/", "fs": "xfs", "provider": "lvm", "size": "100%"}
@@ -102,8 +111,8 @@ func TestNoConfigAutoFallsBackToMemboot(t *testing.T) {
 func TestRequiresWipeWhenNotDryRun(t *testing.T) {
 	cfg := writeConfig(t, validConfig)
 	_, stderr, rc := runWithEnv(t, "--config", cfg)
-	if rc == 0 {
-		t.Fatalf("expected --wipe required; stderr=%s", stderr)
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=usage") {
+		t.Fatalf("a missing --wipe is a deterministic usage error (exit 3); rc=%d stderr=%s", rc, stderr)
 	}
 	if !strings.Contains(stderr, "--wipe is required") {
 		t.Fatalf("wording wrong: %s", stderr)
@@ -112,9 +121,10 @@ func TestRequiresWipeWhenNotDryRun(t *testing.T) {
 
 // A BIOS/legacy-CSM node partitions and installs like a UEFI node: GRUB, shim
 // and the UEFI boot order are the only parts that are skipped, and the node
-// PXE-boots every time. The run is warned about, never refused. Disk
-// resolution fails in the test sandbox (no real /dev/sda), so the assertion is
-// that the boot preflight let the run through and logged the warning.
+// PXE-boots every time. The run is warned about, never refused. The layout's
+// disk does not exist (fatal config, exit 3, after the boot preflight), so the
+// assertion is that the boot preflight let the run through and logged the
+// warning.
 func TestBIOSDiskOSProceedsWithWarning(t *testing.T) {
 	prev := detectFirmware
 	detectFirmware = func() string { return "bios" }
@@ -219,13 +229,14 @@ func TestBIOSAutoNoLayoutAllowed(t *testing.T) {
 // the ramdisk rule must not fire on BIOS either. Asserted on that reason
 // specifically: a data set with no reachable devices is classified broken, and
 // the data fence then refuses on its own account, which says nothing about the
-// boot policy this test is pinning.
+// boot policy this test is pinning. (The data disk does not exist: the run
+// ends in fatal_config=device-missing, after the boot preflight.)
 func TestBIOSDataOnlyAllowed(t *testing.T) {
 	cfg := writeConfig(t, `{
 	"version": 2,
 	"sets": [
 		{"name": "data", "role": "data", "selection": "manual", "raid": "none",
-		 "devices": ["/dev/sdb"],
+		 "devices": ["/dev/disk/by-id/lpart-test-no-such-data-disk"],
 		 "volumes": [
 		   {"name": "d", "mountpoint": "/data", "fs": "xfs", "provider": "lvm", "size": "100%"}
 		 ]}
@@ -261,8 +272,8 @@ func TestSanitizeWithNoResultsExitsZero(t *testing.T) {
 	if err := os.WriteFile(icPath, []byte(`{"install_mode":"sanitize"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// In the test sandbox device discovery fails -> empty pool -> sanitize
-	// erases nothing and returns zero results: exactly the empty-result shape.
+	// The hermetic pool is empty -> sanitize erases nothing and returns zero
+	// results: exactly the empty-result shape (a diskless node, exit 0).
 	_, stderr, rc := runWithEnv(t,
 		"--install-context", icPath,
 		"--dry-run",

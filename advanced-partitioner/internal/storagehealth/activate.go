@@ -109,6 +109,23 @@ func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string
 	run("mdadm", append([]string{"--assemble", "--run", "/dev/md/" + mdName}, members...)...)
 }
 
+// MDNamesOnDisks maps the md array name in every superblock found on the
+// disks (whole disk and each partition; running or not) to one device that
+// carries it. Read-only (mdadm --examine).
+func MDNamesOnDisks(ctx context.Context, runner executor.Runner, disks []string) map[string]string {
+	out := map[string]string{}
+	for _, d := range disks {
+		for _, dev := range append([]string{d}, partitionsOn(ctx, runner, d)...) {
+			if n := mdSuperblockName(ctx, runner, dev); n != "" {
+				if _, seen := out[n]; !seen {
+					out[n] = dev
+				}
+			}
+		}
+	}
+	return out
+}
+
 // partitionsOn lists the partition device paths on one disk. KNAME, not PATH:
 // the PATH column arrived in util-linux 2.33 and el8 ships 2.32.
 func partitionsOn(ctx context.Context, runner executor.Runner, disk string) []string {

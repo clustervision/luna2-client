@@ -56,7 +56,16 @@ func buildPinnableConfig(orig *v2.Config, resolved []result.ResolvedSet, origin 
 			continue
 		}
 		devices := make([]string, 0, len(rs.SelectedDisks))
+		if src.SelectionMode() == "manual" {
+			// Operator-authored: keep the device list verbatim, including a
+			// member that is absent while the set runs degraded -- the
+			// replacement disk goes back in its place.
+			devices = append(devices, src.Devices...)
+		}
 		for _, d := range rs.SelectedDisks {
+			if src.SelectionMode() == "manual" {
+				break
+			}
 			p := d.ConfiguredPath
 			if p == "" {
 				p = d.ResolvedPath
