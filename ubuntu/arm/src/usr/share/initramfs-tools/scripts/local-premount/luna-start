@@ -187,19 +187,21 @@ luna_finish() {
 # Without luna.ctty: the last console= on the command line (the kernel's
 # /dev/console), else tty1 -- a park shell on tty1 is invisible on a
 # serial-console node. Same rule as 95luna's luna-installer.sh.
+# POSIX sh only (no arrays): initramfs-tools runs `sh -n` (dash) over every
+# boot script while building the initramfs and silently leaves out any
+# script that fails it -- the node then boots to "No init found".
 _get_luna_ctty() {
-    local luna_ctty _o _c="" _args=()
+    local luna_ctty _o _c=""
     luna_ctty=$(getargs luna.ctty=)
     if [ -z "${luna_ctty}" ]; then
-        { read -r -a _args < /proc/cmdline; } 2>/dev/null
-        for _o in "${_args[@]}"; do
+        for _o in $(cat /proc/cmdline 2>/dev/null); do
             case "$_o" in console=*) _c="${_o#console=}"; _c="${_c%%,*}" ;; esac
         done
         [ "$_c" = "tty0" ] && _c=tty1
         [ -n "$_c" ] && [ -c "/dev/${_c#/dev/}" ] && luna_ctty="/dev/${_c#/dev/}"
     fi
     [ -n "${luna_ctty}" ] || luna_ctty="/dev/tty1"
-    echo -n "$luna_ctty"
+    printf '%s' "$luna_ctty"
 }
 
 # lpart writes the failing stage + reason here; the tmpfs survives retries,
@@ -252,12 +254,13 @@ fatal_park() {
 }
 
 # curl --interface with an empty $luna_nic swallowed the next option: bind
-# to the NIC only when one matched luna.mac.
+# to the NIC only when one matched luna.mac. POSIX sh (see _get_luna_ctty).
 luna_curl() {
-    local -a _opts=()
-    [ -n "$INSECURE" ] && _opts+=("$INSECURE")
-    [ -n "$luna_nic" ] && _opts+=(--interface "$luna_nic")
-    curl "${_opts[@]}" "$@"
+    if [ -n "$luna_nic" ]; then
+        curl ${INSECURE:+"$INSECURE"} --interface "$luna_nic" "$@"
+    else
+        curl ${INSECURE:+"$INSECURE"} "$@"
+    fi
 }
 
 get_credentials() {
