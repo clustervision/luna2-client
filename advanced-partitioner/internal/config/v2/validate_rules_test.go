@@ -6,6 +6,7 @@ package v2
 // still pass. A case with want == "" must validate.
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -244,5 +245,57 @@ func TestRulePartitionOrder(t *testing.T) {
 			`(set "os", volume "boot"): the /boot partition needs a fixed size, not 100%`},
 		{"part-on-raid", lay(set(osManual("os", "1", "/dev/sda", "/dev/sdb"), espVol(), vol("root", "/", "xfs", "partition", "40G"))),
 			`direct partition volumes require raid=none (volume "root" is provider=partition`},
+	})
+}
+
+func TestRuleSpares(t *testing.T) {
+	dataVolume := vol("d", "/d", "xfs", "lvm", "100%")
+	data := func(fields string) string { return osLayout(set(fields, dataVolume)) }
+	discover := func(raid string, count, spares int) string {
+		return `"name":"data","role":"data","selection":"discover","raid":"` + raid + `","count":` + strconv.Itoa(count) + `,"spares":` + strconv.Itoa(spares)
+	}
+	withSpares := func(fields string, spares int) string { return fields + `,"spares":` + strconv.Itoa(spares) }
+	osRaid := func(fields string) string { return lay(set(fields, espVol(), bootVol(), rootLV())) }
+	devs := func(n int) []string {
+		out := make([]string, n)
+		for i := range out {
+			out[i] = "/dev/sd" + string(rune('b'+i))
+		}
+		return out
+	}
+	runRuleCases(t, []ruleCase{
+		// raid none / raid 0 have no member a spare could replace.
+		{"spares-raid-none-manual", data(withSpares(dataManual("data", "none", devs(2)...), 1)),
+			`(set "data"): raid=none takes no spares, got spares=1`},
+		{"spares-raid-none-discover", data(withSpares(`"name":"data","role":"data","selection":"discover","raid":"none"`, 1)),
+			`raid=none takes no spares`},
+		{"spares-raid0-discover", data(discover("0", 2, 1)), `(set "data"): raid=0 takes no spares, got spares=1`},
+		{"spares-os-raid-none", osRaid(withSpares(osFields("os"), 1)), `(set "os"): raid=none takes no spares`},
+		// manual: devices[] lists every member, spares included.
+		{"spares-raid1-3dev-1spare-ok", data(withSpares(dataManual("data", "1", devs(3)...), 1)), ""},
+		{"spares-raid1-3dev-no-spare", data(dataManual("data", "1", devs(3)...)), "raid=1 needs exactly 2 device(s), but devices[] lists 3"},
+		{"spares-raid1-4dev-1spare", data(withSpares(dataManual("data", "1", devs(4)...), 1)),
+			`(set "data"): raid=1 needs exactly 2 device(s) active, but devices[] lists 4 with spares=1 (3 active)`},
+		{"spares-raid1-2dev-2spare", data(withSpares(dataManual("data", "1", devs(2)...), 2)),
+			`(set "data"): spares=2 leaves 0 active device(s) of the 2 in devices[]`},
+		{"spares-raid10-5dev-1spare-ok", data(withSpares(dataManual("data", "10", devs(5)...), 1)), ""},
+		{"spares-raid10-6dev-1spare-odd", data(withSpares(dataManual("data", "10", devs(6)...), 1)),
+			"raid=10 needs at least 4 device(s) active, but devices[] lists 6 with spares=1 (5 active)"},
+		{"spares-raid5-5dev-1spare-ok", data(withSpares(dataManual("data", "5", devs(5)...), 1)), ""},
+		{"spares-raid5-4dev-1spare", data(withSpares(dataManual("data", "5", devs(4)...), 1)),
+			"raid=5 needs at least 4 device(s) active, but devices[] lists 4 with spares=1 (3 active)"},
+		{"spares-raid6-6dev-1spare-ok", data(withSpares(dataManual("data", "6", devs(6)...), 1)), ""},
+		{"spares-raid6-5dev-1spare", data(withSpares(dataManual("data", "6", devs(5)...), 1)), "raid=6 needs at least 5 device(s) active"},
+		// discover: count active members, spares resolved on top.
+		{"spares-raid1-discover-ok", data(discover("1", 2, 1)), ""},
+		{"spares-raid10-discover-ok", data(discover("10", 4, 2)), ""},
+		// OS policy counts ACTIVE drives: 1, 2 or 4, spares on top.
+		{"spares-os-raid1-3dev-1spare-ok", osRaid(withSpares(osManual("os", "1", devs(3)...), 1)), ""},
+		{"spares-os-raid10-5dev-1spare-ok", osRaid(withSpares(osManual("os", "10", devs(5)...), 1)), ""},
+		{"spares-os-raid10-discover-ok", osRaid(`"name":"os","role":"os","selection":"discover","raid":"10","count":4,"spares":1`), ""},
+		{"spares-os-raid1-2dev-1spare", osRaid(withSpares(osManual("os", "1", devs(2)...), 1)),
+			`(set "os"): raid=1 needs exactly 2 device(s) active, but devices[] lists 2 with spares=1 (1 active)`},
+		{"spares-os-raid10-7dev-1spare", osRaid(withSpares(osManual("os", "10", devs(7)...), 1)),
+			`(set "os"): the OS set uses exactly 1, 2 or 4 drives (raid none/1/0/10), got 6 active (7 devices minus spares=1)`},
 	})
 }

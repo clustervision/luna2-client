@@ -136,8 +136,10 @@ func (s *Set) MatchFilter() Match {
 	return *s.Match
 }
 
-// MemberCount returns the number of array members the set wants: len(devices)
-// for manual, or count (defaulted to the raid minimum) for discover.
+// MemberCount returns the number of disks the set wants: len(devices) for
+// manual (spares included), or the ACTIVE count (count, defaulted to the raid
+// minimum) for discover, whose spares the resolver takes on top. Either way the
+// array's active members are its disks minus SpareCount().
 func (s *Set) MemberCount() int {
 	if s.Selection == "manual" {
 		return len(s.Devices)

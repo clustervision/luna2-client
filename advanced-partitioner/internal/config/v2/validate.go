@@ -243,12 +243,42 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 		return fmt.Errorf("config_validation: %s.raid %v", pfx, err)
 	}
 
+	if s.Spares < 0 {
+		return fmt.Errorf("config_validation: %s.spares must be >= 0, got: %d", pfx, s.Spares)
+	}
+	// A hot spare only ever replaces a failed member of a redundant array.
+	// raid none has no array and raid0 cannot rebuild a member, so a spare
+	// there is a disk taken from the pool for nothing (and mdadm has no
+	// array to hand it to).
+	if s.Spares > 0 && (r == raidlevel.RaidNone || r == raidlevel.Raid0) {
+		return fmt.Errorf(
+			"config_validation: %s: raid=%s takes no spares, got spares=%d (a hot spare only replaces a failed member of a redundant array: raid 1, 5, 6 or 10)",
+			setRef(idx, s.Name), s.Raid, s.Spares)
+	}
+
+	// Active members = members - spares. A manual set lists every member in
+	// devices[], spares included; a discover set resolves count active members
+	// (0 = the level's minimum) plus spares on top.
+	active := 0
+	switch s.Selection {
+	case "manual":
+		active = len(s.Devices) - s.Spares
+		if len(s.Devices) > 0 && active < 1 {
+			return fmt.Errorf(
+				"config_validation: %s: spares=%d leaves %d active device(s) of the %d in devices[] (devices[] lists every member, spares included)",
+				setRef(idx, s.Name), s.Spares, active, len(s.Devices))
+		}
+	case "discover":
+		active = s.Count
+	}
+
 	// OS-set RAID policy (operator decision 2026-07-16): the OS lives on
-	// exactly 1, 2 or 4 drives -- raid none / raid1 / raid0 / raid10. Parity
-	// RAID (5/6) is REFUSED for the OS role: GRUB cannot reliably boot a
-	// degraded parity array (BE-B10/NB-10 -- only raid1 is degraded-bootable,
-	// so parity on the OS trades real bootability for imagined redundancy).
-	// DATA sets keep the full palette including raid5/6.
+	// exactly 1, 2 or 4 active drives -- raid none / raid1 / raid0 / raid10
+	// (hot spares come on top). Parity RAID (5/6) is REFUSED for the OS role:
+	// GRUB cannot reliably boot a degraded parity array (BE-B10/NB-10 -- only
+	// raid1 is degraded-bootable, so parity on the OS trades real bootability
+	// for imagined redundancy). DATA sets keep the full palette including
+	// raid5/6.
 	if s.Role == "os" {
 		switch r {
 		case raidlevel.Raid5, raidlevel.Raid6:
@@ -256,33 +286,32 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 				"config_validation: %s: raid=%s is not supported for the OS set -- the OS uses 1, 2 or 4 drives with raid none/1/0/10 (parity RAID cannot boot degraded, NB-10); raid%s remains available for data sets",
 				pfx, s.Raid, s.Raid)
 		}
-		osCount := 0
-		switch s.Selection {
-		case "manual":
-			osCount = len(s.Devices)
-		case "discover":
-			osCount = s.Count
-		}
-		switch osCount {
-		case 0, 1, 2, 4: // 0 = discover count unset (defaults per raid mode)
+		switch active {
+		case 0, 1, 2, 4: // 0 = discover count unset (defaults per raid mode), or no devices yet
 		default:
+			if s.Spares > 0 {
+				return fmt.Errorf(
+					"config_validation: %s: the OS set uses exactly 1, 2 or 4 drives (raid none/1/0/10), got %d active (%d devices minus spares=%d)",
+					setRef(idx, s.Name), active, active+s.Spares, s.Spares)
+			}
 			return fmt.Errorf(
 				"config_validation: %s: the OS set uses exactly 1, 2 or 4 drives (raid none/1/0/10), got %d",
-				pfx, osCount)
+				pfx, active)
 		}
 	}
 
-	if s.Spares < 0 {
-		return fmt.Errorf("config_validation: %s.spares must be >= 0, got: %d", pfx, s.Spares)
-	}
-
-	// Member-count rules differ by selection.
+	// Member-count rules differ by selection; they apply to active members.
 	switch s.Selection {
 	case "manual":
 		if len(s.Devices) == 0 {
 			return fmt.Errorf("config_validation: %s.devices[] is required for selection=manual", pfx)
 		}
-		if !r.AllowsCount(len(s.Devices)) {
+		if !r.AllowsCount(active) {
+			if s.Spares > 0 {
+				return fmt.Errorf(
+					"config_validation: %s: raid=%s needs %s active, but devices[] lists %d with spares=%d (%d active)",
+					setRef(idx, s.Name), s.Raid, countSpec(r), len(s.Devices), s.Spares, active)
+			}
 			return fmt.Errorf(
 				"config_validation: %s: raid=%s needs %s, but devices[] lists %d",
 				pfx, s.Raid, countSpec(r), len(s.Devices))

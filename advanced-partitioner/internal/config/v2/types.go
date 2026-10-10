@@ -51,8 +51,10 @@ type Set struct {
 	// "use the raid level's minimum". Ignored for selection=manual (the
 	// member count is len(Devices)).
 	Count int `json:"count,omitempty"`
-	// Spares is the number of hot-spare disks to allocate in addition to
-	// Count (selection=discover only). Zero means none.
+	// Spares is the number of hot-spare disks: for selection=discover they
+	// are resolved in addition to Count; for selection=manual devices[] lists
+	// every member, spares included (active members = len(devices) - spares).
+	// Only redundant levels (1, 5, 6, 10) take spares. Zero means none.
 	Spares int `json:"spares,omitempty"`
 	// Match is the selection=discover disk filter (tags + size range + model).
 	Match *Match `json:"match,omitempty"`
