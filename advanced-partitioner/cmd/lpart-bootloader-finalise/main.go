@@ -10,7 +10,8 @@
 //  4. Write /sysroot/etc/fstab from the filesystem list
 //  5. If clear_uefi_nvram=true on UEFI: bind-mount + ClearUEFINVRAMEntries
 //  6. If boot_method=="none": stop (fstab-only path), after removing any
-//     existing bootloader when the OS set asked for none on UEFI; past that
+//     existing bootloader of a disk OS -- TrinityX NVRAM entries + ESP loaders
+//     on UEFI, MBR boot code + BIOS boot partition on BIOS; past that
 //     point a non-UEFI firmware proceeds only for an OS set that asked for a
 //     bootloader, and only with a BIOS boot partition to install into; else:
 //     bind mounts + family.Prepare → RegenerateInitramfs → Install → Validate
@@ -199,7 +200,19 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		case bctx.StorageResult.StorageType == "memory":
 			logger.UserInfo("No bootloader installed (memory root): fstab written; the node PXE-boots every time")
 		case bctx.FirmwareMode != "uefi":
-			logger.UserInfo("No bootloader installed (firmware is %q: GRUB, shim and the UEFI boot order are UEFI-only): fstab written; the node PXE-boots every time", bctx.FirmwareMode)
+			// Only "first" installs GRUB for BIOS. An earlier "first" left
+			// boot.img in each boot disk's MBR and core.img in the BIOS boot
+			// partition; a BIOS that tries the disk would boot that stale
+			// install, so take it away.
+			logger.UserInfo(`No bootloader installed (firmware is %q and the OS set's bootloader is not "first", the only value that installs GRUB for BIOS): fstab written; the node PXE-boots every time`, bctx.FirmwareMode)
+			logger.SetStage("remove_bootloader")
+			if err := bootloader.RemoveBIOSBootloader(context.Background(), bootloader.RemoveBIOSBootloaderOptions{
+				Runner: runner, Logger: logger, FS: nativeFS,
+				BootDevices: bctx.StorageResult.BootDevices,
+			}); err != nil {
+				errln(stderr, "%v", err)
+				return 1
+			}
 		default:
 			logger.UserInfo(`No bootloader installed (the OS set asks for bootloader "none"): fstab written; the node PXE-boots every time`)
 			logger.SetStage("bind_mounts")
@@ -232,8 +245,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 		// GRUB for BIOS keeps its core image in a BIOS boot partition and
 		// refuses to install without one. Only a layout rebuild creates it, so
-		// say which install mode does that rather than failing mid-install.
-		if bctx.StorageResult.BIOSBootPartition == 0 {
+		// say which install mode does that rather than failing mid-install. A
+		// result that did not record the number (mount-existing) is checked
+		// against the disks themselves.
+		if bctx.StorageResult.BIOSBootPartition == 0 && !allHaveBIOSBootPartition(runner, bctx.StorageResult.BootDevices) {
 			return cli.ExitSafetyRefusal(stderr, toolName, "missing-bios-boot-partition",
 				"GRUB for BIOS needs a BIOS boot partition for its core image and this node's layout has none; reinstall the node with install_mode full so the partition is created -- not running dracut/GRUB")
 		}
@@ -312,6 +327,20 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	logger.UserInfo("Bootloader finalisation completed successfully")
 	return 0
+}
+
+// allHaveBIOSBootPartition reports whether every boot disk carries a BIOS boot
+// (EF02) partition; grub2-install needs one on each disk it installs to.
+func allHaveBIOSBootPartition(runner executor.Runner, disks []string) bool {
+	if len(disks) == 0 {
+		return false
+	}
+	for _, d := range disks {
+		if !bootloader.HasBIOSBootPartition(context.Background(), runner, d) {
+			return false
+		}
+	}
+	return true
 }
 
 // loadStorageResult decodes a storage-result.json file. The bash

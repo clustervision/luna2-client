@@ -279,7 +279,8 @@ func TestDiskRootBootloaderNoneOnBIOS(t *testing.T) {
 		FirmwareMode: "bios", StorageType: "lvm",
 		BootMethod: "none", BootFirmware: "uefi", RegisterNVRAM: "auto",
 		RAIDMode: "none", MountedTargetRoot: sysroot,
-		BootDevices: []string{"/dev/sda"},
+		// never a real disk: the BIOS none path clears the MBR boot code
+		BootDevices: []string{biosDiskImage(t)},
 		Filesystems: []result.Filesystem{
 			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", Options: "defaults", UUID: "root-uuid"},
 			{Mount: "/boot/efi", Device: "/dev/sda1", FS: "vfat", Options: "defaults", UUID: "esp-uuid"},
@@ -396,21 +397,42 @@ func TestDiskRootBootloaderNoneRemovesExistingSetup(t *testing.T) {
 	}
 }
 
-// On BIOS the none message names the firmware, and there is no UEFI boot path
-// to strip: nothing on the ESP is touched and no efibootmgr runs.
-func TestDiskRootBootloaderNoneOnBIOSRemovesNothing(t *testing.T) {
+// biosDiskImage writes a disk image whose MBR carries boot code, as an earlier
+// bootloader "first" install leaves it, and returns its path.
+func biosDiskImage(t *testing.T) string {
+	t.Helper()
+	img := make([]byte, 4096)
+	for i := 0; i < 440; i++ {
+		img[i] = 0xEB
+	}
+	for i := 446; i < 510; i++ {
+		img[i] = 0x11 // partition table stand-in
+	}
+	img[510], img[511] = 0x55, 0xAA
+	p := filepath.Join(t.TempDir(), "disk.img")
+	if err := os.WriteFile(p, img, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// On BIOS the none message names the firmware. There is no UEFI boot path to
+// strip (nothing on the ESP is touched, no efibootmgr runs), but GRUB from an
+// earlier "first" is taken out of the MBR, partition table untouched.
+func TestDiskRootBootloaderNoneOnBIOSClearsBootCode(t *testing.T) {
 	tmp := t.TempDir()
 	sysroot := filepath.Join(tmp, "sysroot")
 	if err := os.MkdirAll(sysroot, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	stageESPLoaders(t, sysroot)
+	disk := biosDiskImage(t)
 	res := result.StorageResult{
 		Version: 2, Name: "os", Role: "os",
 		FirmwareMode: "bios", StorageType: "lvm",
 		BootMethod: "none", BootOrder: "last", BootFirmware: "uefi", RegisterNVRAM: "auto",
 		RAIDMode: "none", MountedTargetRoot: sysroot,
-		BootDevices: []string{"/dev/sda"},
+		BootDevices: []string{disk},
 		Filesystems: []result.Filesystem{
 			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", Options: "defaults", UUID: "root-uuid"},
 		},
@@ -432,6 +454,18 @@ func TestDiskRootBootloaderNoneOnBIOSRemovesNothing(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(sysroot, "boot", "efi", "EFI", "BOOT", "BOOTX64.EFI")); err != nil {
 		t.Errorf("a BIOS node has no UEFI boot path to strip: %v", err)
 	}
+	img, err := os.ReadFile(disk) //nolint:gosec // test artefact
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 440; i++ {
+		if img[i] != 0 {
+			t.Fatalf("MBR boot code byte %d not cleared", i)
+		}
+	}
+	if img[446] != 0x11 || img[510] != 0x55 || img[511] != 0xAA {
+		t.Fatal("partition table or MBR signature changed")
+	}
 }
 
 // biosGRUBResult is what lpart-storage-prepare writes for a BIOS node whose os
@@ -452,7 +486,9 @@ func biosGRUBResult(t *testing.T, biosBootPartition int) string {
 		FirmwareMode: "bios", StorageType: "lvm",
 		BootMethod: "grub", BootOrder: "first", BootFirmware: "uefi", RegisterNVRAM: "auto",
 		RAIDMode: "none", MountedTargetRoot: sysroot,
-		BootDevices:       []string{"/dev/sda"},
+		// not a real disk: with bios_boot_partition 0 finalise looks for an
+		// EF02 partition on it (lsblk), and must find none
+		BootDevices:       []string{filepath.Join(tmp, "no-such-disk")},
 		BIOSBootPartition: biosBootPartition,
 		Filesystems: []result.Filesystem{
 			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", Options: "defaults", UUID: "root-uuid"},

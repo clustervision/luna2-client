@@ -3,6 +3,7 @@ package bootloader
 import (
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,7 +31,8 @@ type RemoveExistingBootloaderOptions struct {
 // The osimage extraction re-creates EFI/BOOT and EFI/<distro> from the image on
 // every sync, so this runs on every none finalise by design.
 //
-// UEFI disk roots only: on BIOS there was never a loader firmware could reach,
+// UEFI disk roots only; a BIOS node goes through RemoveBIOSBootloader (an
+// earlier "first" install left GRUB in the MBR and the BIOS boot partition),
 // and a memory root has no disk to clean.
 func RemoveExistingBootloader(ctx context.Context, opts RemoveExistingBootloaderOptions) error {
 	entries := removeTrinityNVRAMEntries(ctx, opts)
@@ -145,4 +147,196 @@ func removeStagedLoaders(opts RemoveExistingBootloaderOptions) (int, error) {
 		}
 	}
 	return removed, nil
+}
+
+// RemoveBIOSBootloaderOptions configures RemoveBIOSBootloader.
+type RemoveBIOSBootloaderOptions struct {
+	Runner      executor.Runner
+	Logger      *txlog.Logger
+	FS          fsops.FS // only DryRun is used: the writes are raw block I/O
+	BootDevices []string
+}
+
+// mbrBootCodeLen is the boot-code area of the MBR (and of GPT's protective
+// MBR). The disk signature (440-445) and the partition table (446-509) come
+// after it and are never touched.
+const mbrBootCodeLen = 440
+
+// biosBootWipeMax caps how much of a BIOS boot partition is zeroed. GRUB's
+// core.img is well under 1 MiB; the partition is 1 MiB in lpart's layout.
+const biosBootWipeMax = 8 << 20
+
+// RemoveBIOSBootloader takes the local boot path away from a BIOS node whose
+// OS set does not ask for "first" -- the only value that installs GRUB for
+// BIOS. An earlier "first" install left GRUB's boot.img in the MBR of every
+// boot disk and its core.img in the BIOS boot (EF02) partition; with those in
+// place, a BIOS that tries the disk before (or after a failed) PXE boots the
+// stale install instead of asking the controller. So: zero the MBR boot code
+// (the first 440 bytes; the partition table is never touched) and the EF02
+// partition contents. Idempotent (already-zero areas are not rewritten),
+// dry-run aware, and it refuses anything that is not a whole disk.
+func RemoveBIOSBootloader(ctx context.Context, opts RemoveBIOSBootloaderOptions) error {
+	cleared, wiped := 0, 0
+	for _, disk := range opts.BootDevices {
+		did, err := clearMBRBootCode(opts, disk)
+		if err != nil {
+			return err
+		}
+		if did {
+			cleared++
+		}
+		parts, err := biosBootPartitions(ctx, opts.Runner, disk)
+		if err != nil {
+			// The MBR code is what BIOS runs; without it core.img is
+			// unreachable, so a failed listing only costs the belt.
+			if opts.Logger != nil {
+				opts.Logger.Warn(fmt.Sprintf("cannot list partitions of %s (%v): BIOS boot partition not wiped", disk, err))
+			}
+			continue
+		}
+		for _, p := range parts {
+			did, err := wipeBIOSBootPartition(opts, p.Name)
+			if err != nil {
+				return err
+			}
+			if did {
+				wiped++
+			}
+		}
+	}
+	if opts.Logger != nil {
+		if cleared == 0 && wiped == 0 {
+			opts.Logger.UserInfo("no BIOS boot code to remove")
+		} else {
+			opts.Logger.UserInfo("BIOS boot code removed (MBR boot code cleared on %d disk(s), %d BIOS boot partition(s) wiped)", cleared, wiped)
+		}
+	}
+	return nil
+}
+
+// sysClassBlock is where the kernel says whether a block device is a
+// partition; a package variable so tests can point it elsewhere.
+var sysClassBlock = "/sys/class/block"
+
+// openRawTarget opens a whole disk or BIOS boot partition for raw I/O. Block
+// devices and regular files (disk images, tests) only; wantWholeDisk refuses
+// partitions, md and dm devices, whose first sector is filesystem data.
+func openRawTarget(path string, wantWholeDisk, write bool) (*os.File, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return nil, fmt.Errorf("stat %s: %w", path, err)
+	}
+	isBlock := fi.Mode()&os.ModeDevice != 0 && fi.Mode()&os.ModeCharDevice == 0
+	if !isBlock && !fi.Mode().IsRegular() {
+		return nil, configErrorf("not-a-disk", "%s is neither a block device nor a disk image", path)
+	}
+	if isBlock && wantWholeDisk {
+		real, err := filepath.EvalSymlinks(path)
+		if err != nil {
+			return nil, fmt.Errorf("resolve %s: %w", path, err)
+		}
+		name := filepath.Base(real)
+		if _, err := os.Stat(filepath.Join(sysClassBlock, name, "partition")); err == nil ||
+			strings.HasPrefix(name, "md") || strings.HasPrefix(name, "dm-") {
+			return nil, configErrorf("not-a-disk", "boot device %s (%s) is not a whole disk: refusing to clear its first sector", path, name)
+		}
+	}
+	flag := os.O_RDONLY
+	if write {
+		flag = os.O_RDWR
+	}
+	f, err := os.OpenFile(path, flag, 0) //nolint:gosec // boot device from the storage result
+	if err != nil {
+		return nil, fmt.Errorf("open %s: %w", path, err)
+	}
+	return f, nil
+}
+
+// clearMBRBootCode zeroes the MBR boot code of disk and reports whether there
+// was any. A first sector without the 0x55AA signature is no MBR -- BIOS will
+// not boot it either -- and is left alone.
+func clearMBRBootCode(opts RemoveBIOSBootloaderOptions, disk string) (bool, error) {
+	f, err := openRawTarget(disk, true, !opts.FS.DryRun)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	sector := make([]byte, 512)
+	if n, err := f.ReadAt(sector, 0); n < len(sector) {
+		if err == nil || err == io.EOF {
+			return false, nil // smaller than a sector: nothing to clear
+		}
+		return false, fmt.Errorf("read the MBR of %s: %w", disk, err)
+	}
+	if sector[510] != 0x55 || sector[511] != 0xAA {
+		return false, nil
+	}
+	if allZero(sector[:mbrBootCodeLen]) {
+		return false, nil
+	}
+	if opts.FS.DryRun {
+		if opts.Logger != nil {
+			opts.Logger.Info("(dry-run) would clear the MBR boot code of " + disk)
+		}
+		return true, nil
+	}
+	if _, err := f.WriteAt(make([]byte, mbrBootCodeLen), 0); err != nil {
+		return false, fmt.Errorf("clear the MBR boot code of %s: %w", disk, err)
+	}
+	if err := f.Sync(); err != nil {
+		return false, fmt.Errorf("sync %s: %w", disk, err)
+	}
+	if opts.Logger != nil {
+		opts.Logger.UserInfo("cleared the MBR boot code of %s (partition table untouched)", disk)
+	}
+	return true, nil
+}
+
+// wipeBIOSBootPartition zeroes a BIOS boot partition (GRUB's core.img) and
+// reports whether it held anything.
+func wipeBIOSBootPartition(opts RemoveBIOSBootloaderOptions, part string) (bool, error) {
+	f, err := openRawTarget(part, false, !opts.FS.DryRun)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return false, fmt.Errorf("size of %s: %w", part, err)
+	}
+	if size > biosBootWipeMax {
+		size = biosBootWipeMax
+	}
+	buf := make([]byte, size)
+	if n, err := f.ReadAt(buf, 0); int64(n) < size && err != nil && err != io.EOF {
+		return false, fmt.Errorf("read %s: %w", part, err)
+	}
+	if allZero(buf) {
+		return false, nil
+	}
+	if opts.FS.DryRun {
+		if opts.Logger != nil {
+			opts.Logger.Info("(dry-run) would wipe the BIOS boot partition " + part)
+		}
+		return true, nil
+	}
+	if _, err := f.WriteAt(make([]byte, size), 0); err != nil {
+		return false, fmt.Errorf("wipe the BIOS boot partition %s: %w", part, err)
+	}
+	if err := f.Sync(); err != nil {
+		return false, fmt.Errorf("sync %s: %w", part, err)
+	}
+	if opts.Logger != nil {
+		opts.Logger.UserInfo("wiped the BIOS boot partition %s (GRUB core image)", part)
+	}
+	return true, nil
+}
+
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
