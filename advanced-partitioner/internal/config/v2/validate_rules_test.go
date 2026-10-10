@@ -116,6 +116,8 @@ func TestRuleSetAndVolumeNames(t *testing.T) {
 		{"set-name-sda", dataNamed("sda"), `name is reserved: /dev/sda exists`},
 		{"set-name-nvme0n1", dataNamed("nvme0n1"), `name is reserved`},
 		{"set-name-md0", dataNamed("md0"), `name is reserved`},
+		{"set-name-too-long", dataNamed("scratch-nvme-local-2026"), `(set "scratch-nvme-local-2026"): name is 23 characters, at most 22 are allowed`},
+		{"set-name-longest-ok", dataNamed("scratch-nvme-local-202"), ""},
 		{"set-name-ok-underscore", dataNamed("data_1"), ""},
 		{"set-name-ok-hyphen", dataNamed("data-1"), ""},
 		{"set-name-ok-nvme", dataNamed("nvme"), ""},

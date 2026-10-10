@@ -71,6 +71,14 @@ var (
 	}
 )
 
+// maxSetNameLen bounds a set name by its longest md array name. mdadm keeps at
+// most 32 characters of array name in a v1 superblock, and the raid builder's
+// --homehost=any prefixes "any:"; a name that does not fit is stored without
+// the prefix (or truncated), so the array assembles as a foreign /dev/md127
+// instead of /dev/md/<name> and the health probe and cleanup look for it in
+// vain. The longest array is "<set>-boot": 4 + 22 + 5 < 32.
+const maxSetNameLen = 22
+
 // setRef names a set in an operator-facing message: index and name.
 func setRef(idx int, name string) string {
 	return fmt.Sprintf("sets[%d] (set %q)", idx, name)
@@ -92,6 +100,11 @@ func validateSetName(idx int, name string) error {
 	}
 	if strings.HasPrefix(name, "-") {
 		return fmt.Errorf("config_validation: %s: name must not start with '-' (LVM refuses such a volume group name)", ref)
+	}
+	if len(name) > maxSetNameLen {
+		return fmt.Errorf(
+			"config_validation: %s: name is %d characters, at most %d are allowed: the set's md arrays (/dev/md/<name>, <name>-efi, <name>-boot) must fit mdadm's 32-character array name together with the \"any:\" homehost prefix",
+			ref, len(name), maxSetNameLen)
 	}
 	if (&Set{Name: name}).MDName() == "" {
 		return fmt.Errorf(
