@@ -216,48 +216,16 @@ func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selec
 	if set.MirrorsBoot() {
 		layout.MirrorBoot = true
 	}
-	// GRUB for BIOS refuses to install without a BIOS boot partition for its
-	// core image. Only "first" asks for a bootloader on BIOS: "last" is a UEFI
-	// boot-order idea, and on UEFI GRUB is loaded from the ESP instead.
-	needBIOSBoot := set.Role == "os" && firmwareMode != "uefi" &&
-		set.Bootloader == v2.BootloaderFirst
+	needBIOSBoot := needsBIOSBoot(set, firmwareMode)
+	cls := classifyVolumes(set)
+	hasPartitionEFI, hasPartitionBoot := cls.hasEFI, cls.hasBoot
+	lvmCount, genericPartCount := cls.lvm, cls.generic
 
-	// Classify volumes once.
-	var (
-		hasPartitionEFI  bool
-		hasPartitionBoot bool
-		lvmCount         int
-		genericPartCount int
-	)
-	for _, v := range set.Volumes {
-		switch v.Provider {
-		case "lvm":
-			lvmCount++
-		case "partition":
-			switch v.Mountpoint {
-			case "/boot/efi":
-				hasPartitionEFI = true
-			case "/boot":
-				hasPartitionBoot = true
-			default:
-				genericPartCount++
-			}
-		}
-	}
-
-	// Disk-fit preflight (BE-G6): refuse a disk that cannot hold the
-	// fixed-size partitions before any sgdisk runs. Without this a
-	// too-small disk surfaces only as the generic 30s "timed out waiting
-	// for partitions" after the table has already been zapped.
-	need := requiredDiskBytes(set, needBIOSBoot, hasPartitionEFI, hasPartitionBoot,
-		lvmCount > 0 || (set.Role == "data" && genericPartCount == 0))
-	for _, d := range resolved {
-		// SizeBytes == 0 means discovery didn't capture a size (test
-		// fixtures, exotic paths); skip rather than fail on unknown.
-		if d.SizeBytes > 0 && d.SizeBytes < need {
-			return Layout{}, fmt.Errorf("disk %s too small for layout: need >= %d bytes, have %d bytes",
-				d.ResolvedPath, need, d.SizeBytes)
-		}
+	// Disk-fit preflight (BE-G6), repeated here as a belt: callers run
+	// CheckDiskFit BEFORE cleanup wipes anything, so a too-small disk parks
+	// the node untouched instead of being zapped first.
+	if err := CheckDiskFit(set, resolved, firmwareMode); err != nil {
+		return Layout{}, err
 	}
 
 	for _, d := range resolved {
@@ -354,16 +322,115 @@ func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selec
 	return layout, nil
 }
 
+// needsBIOSBoot: GRUB for BIOS refuses to install without a BIOS boot
+// partition for its core image. Only "first" asks for a bootloader on BIOS:
+// "last" is a UEFI boot-order idea, and on UEFI GRUB is loaded from the ESP
+// instead.
+func needsBIOSBoot(set *v2.Set, firmwareMode string) bool {
+	return set.Role == "os" && firmwareMode != "uefi" && set.Bootloader == v2.BootloaderFirst
+}
+
+type volumeClasses struct {
+	hasEFI, hasBoot bool
+	lvm, generic    int
+}
+
+func classifyVolumes(set *v2.Set) volumeClasses {
+	var c volumeClasses
+	for _, v := range set.Volumes {
+		switch v.Provider {
+		case "lvm":
+			c.lvm++
+		case "partition":
+			switch v.Mountpoint {
+			case "/boot/efi":
+				c.hasEFI = true
+			case "/boot":
+				c.hasBoot = true
+			default:
+				c.generic++
+			}
+		}
+	}
+	return c
+}
+
+// DiskTooSmallError is the disk-fit refusal: deterministic (the disk does not
+// grow on retry), so callers treat it as a fatal configuration error.
+type DiskTooSmallError struct {
+	Disk       string
+	Need, Have int64
+}
+
+func (e *DiskTooSmallError) Error() string {
+	return fmt.Sprintf("disk %s too small for layout: need >= %d bytes, have %d bytes", e.Disk, e.Need, e.Have)
+}
+
+// CheckDiskFit is the disk-fit preflight (BE-G6): it refuses a disk that
+// cannot hold the set's layout -- the fixed-size partitions AND the fixed-size
+// LVs that must fit in the storage partition (or array) -- with a
+// *DiskTooSmallError. It touches nothing, so lpart-storage-prepare runs it
+// before cleanup; without it a too-small disk surfaced as the generic 30s
+// "timed out waiting for partitions" (or a failing lvcreate) after the disk
+// had already been wiped. resolved disks of unknown size (SizeBytes 0) are
+// skipped.
+func CheckDiskFit(set *v2.Set, resolved []selector.Resolved, firmwareMode string) error {
+	if set == nil {
+		return nil
+	}
+	cls := classifyVolumes(set)
+	hasStorage := cls.lvm > 0 || (set.Role == "data" && cls.generic == 0)
+	active := len(resolved) - set.SpareCount()
+	if active < 1 {
+		active = 1
+	}
+	need := requiredDiskBytes(set, needsBIOSBoot(set, firmwareMode), cls.hasEFI, cls.hasBoot, hasStorage, active)
+	for _, d := range resolved {
+		// SizeBytes == 0 means discovery didn't capture a size (test
+		// fixtures, exotic paths); skip rather than fail on unknown.
+		if d.SizeBytes > 0 && d.SizeBytes < need {
+			return &DiskTooSmallError{Disk: d.ResolvedPath, Need: need, Have: d.SizeBytes}
+		}
+	}
+	return nil
+}
+
+// dataDisks is how many members' worth of capacity an array of `active`
+// members exposes (raid1 mirrors: one; raid5 loses one to parity; ...).
+func dataDisks(raidMode string, active int) int {
+	n := 1
+	switch raidMode {
+	case "raid0":
+		n = active
+	case "raid5":
+		n = active - 1
+	case "raid6":
+		n = active - 2
+	case "raid10":
+		n = active / 2
+	}
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
 // requiredDiskBytes computes the minimum per-disk size for the set's
 // layout (BE-G6): the sum of every fixed-size partition BuildLayout will
 // create, plus 4MiB alignment slack per partition and 1MiB for the GPT
-// itself. Rest-of-disk partitions (100% volumes, the STORAGE partition)
-// contribute only their slack. A size string ParseSize cannot read
-// contributes nothing — sgdisk rejects it later with its own error.
-func requiredDiskBytes(set *v2.Set, hasBIOSBoot, hasPartitionEFI, hasPartitionBoot, hasStorage bool) int64 {
+// itself, plus this disk's share of the fixed-size LVs (they live in the
+// STORAGE partition, or in the md array built across `active` members'
+// STORAGE partitions, which also reserves its superblock/data offset).
+// Rest-of-disk partitions and 100% LVs contribute only their slack. A size
+// string ParseSize cannot read contributes nothing — sgdisk or lvcreate
+// rejects it later with its own error.
+func requiredDiskBytes(set *v2.Set, hasBIOSBoot, hasPartitionEFI, hasPartitionBoot, hasStorage bool, active int) int64 {
 	const (
-		gptOverhead    = 1 << 20 // primary + backup GPT headers/tables
-		alignmentSlack = 4 << 20 // per-partition 1MiB alignment + sgdisk rounding
+		gptOverhead    = 1 << 20   // primary + backup GPT headers/tables
+		alignmentSlack = 4 << 20   // per-partition 1MiB alignment + sgdisk rounding
+		pvOverhead     = 1 << 20   // LVM PV label + metadata area
+		extentSlack    = 4 << 20   // per-LV rounding up to a 4MiB extent
+		mdDataOffset   = 129 << 20 // md 1.2 superblock + data offset (mdadm 4.x default ~128MiB)
 	)
 	var need int64
 	parts := 0
@@ -396,6 +463,25 @@ func requiredDiskBytes(set *v2.Set, hasBIOSBoot, hasPartitionEFI, hasPartitionBo
 	}
 	if hasStorage {
 		parts++
+		var lvBytes int64
+		lvs := 0
+		for _, v := range set.LVMVolumes() {
+			lvs++
+			if v.Size == "100%" {
+				continue
+			}
+			if b, err := diskresolve.ParseSize(v.Size); err == nil {
+				lvBytes += b
+			}
+		}
+		if lvs > 0 {
+			lvBytes += pvOverhead + int64(lvs)*extentSlack
+			share := int64(dataDisks(set.RAIDMode(), active))
+			need += (lvBytes + share - 1) / share
+		}
+		if rm := set.RAIDMode(); rm != "" && rm != "none" {
+			need += mdDataOffset
+		}
 	}
 	return need + int64(parts)*alignmentSlack + gptOverhead
 }
