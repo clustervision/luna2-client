@@ -337,35 +337,13 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 		}
 	}
 
-	// Direct-partition cross-volume rules. A set using generic direct
-	// partition volumes (anything other than /boot or /boot/efi) must be a
-	// single, un-RAIDed disk; at most one of them may take size=100%, and
-	// it may not be mixed with a 100% LVM volume.
-	genericPart, genericPartHundred, lvmHundred := 0, 0, 0
-	for _, v := range s.Volumes {
-		if v.Provider == "lvm" && v.Size == "100%" {
-			lvmHundred++
-		}
-		if v.Provider != "partition" {
-			continue
-		}
-		if v.Mountpoint == "/boot" || v.Mountpoint == "/boot/efi" {
-			continue
-		}
-		genericPart++
-		if v.Size == "100%" {
-			genericPartHundred++
-		}
+	if err := s.validatePartitionOrder(idx, r); err != nil {
+		return err
 	}
-	if genericPart > 0 {
-		if r != raidlevel.RaidNone {
-			return fmt.Errorf("config_validation: %s: direct partition volumes require raid=none", pfx)
-		}
-		if genericPartHundred > 1 {
-			return fmt.Errorf("config_validation: %s: at most one direct partition volume may use size=100%%", pfx)
-		}
-		if lvmHundred > 0 && genericPartHundred > 0 {
-			return fmt.Errorf("config_validation: %s: direct partition size=100%% cannot be mixed with lvm volumes in the same set", pfx)
+	lvmHundred := 0
+	for _, v := range s.Volumes {
+		if v.Provider == "lvm" && v.Size == sizeRest {
+			lvmHundred++
 		}
 	}
 	if lvmHundred > 1 {

@@ -207,3 +207,42 @@ func TestRuleVolumeSizes(t *testing.T) {
 	}
 	runRuleCases(t, cases)
 }
+
+func TestRulePartitionOrder(t *testing.T) {
+	os1 := osManual("os", "none", "/dev/sda")
+	rootPart := vol("root", "/", "xfs", "partition", "100%")
+	swapPart := vol("swap", "swap", "swap", "partition", "2G")
+	runRuleCases(t, []ruleCase{
+		// The reported triggers: a 100% root followed by another partition,
+		// and a 100% root next to an lvm volume (which needs a storage
+		// partition after the direct partitions).
+		{"part-100pct-then-swap", lay(set(os1, espVol(), bootVol(), rootPart, swapPart)),
+			`(set "os", volume "root"): size=100% takes the rest of the disk, but direct partition "swap" is created after it (partition order: uefi (/boot/efi, 600M) -> boot (/boot, 1G) -> root (/, 100%) -> swap (swap, 2G))`},
+		{"part-100pct-plus-lvm", lay(set(os1, espVol(), bootVol(), rootPart, vol("var", "/var", "xfs", "lvm", "20G"))),
+			`(set "os", volume "root"): size=100% takes the rest of the disk, but lvm volume(s) "var" need a storage partition after the direct partitions`},
+		{"part-100pct-plus-lvm-100pct", lay(set(os1, espVol(), rootPart, vol("var", "/var", "xfs", "lvm", "100%"))),
+			`but lvm volume(s) "var" need a storage partition`},
+		{"part-two-100pct", osLayout(set(dataManual("data", "none", "/dev/sdb"),
+			vol("a", "/a", "xfs", "partition", "100%"), vol("b", "/b", "xfs", "partition", "100%"))),
+			`(set "data", volume "a"): size=100% takes the rest of the disk, but direct partition "b" is created after it`},
+		{"part-data-100pct-plus-lvm", osLayout(set(dataManual("data", "none", "/dev/sdb"),
+			vol("a", "/a", "xfs", "partition", "100%"), vol("b", "/b", "xfs", "lvm", "10G"))),
+			`(set "data", volume "a"): size=100% takes the rest of the disk, but lvm volume(s) "b"`},
+		// The os set's ESP and /boot are created first whatever their JSON
+		// position, so a 100% root listed before them is still last.
+		{"part-100pct-last-ok", lay(set(os1, espVol(), bootVol(), swapPart, rootPart)), ""},
+		{"part-100pct-json-first-swap-after", lay(set(os1, rootPart, swapPart, espVol(), bootVol())),
+			`size=100% takes the rest of the disk, but direct partition "swap" is created after it (partition order: uefi (/boot/efi, 600M) -> boot (/boot, 1G) -> root (/, 100%) -> swap (swap, 2G))`},
+		{"part-100pct-json-first-boot-after-ok", lay(set(os1, rootPart, espVol(), bootVol())), ""},
+		{"part-fixed-plus-lvm-ok", lay(set(os1, espVol(), bootVol(), vol("root", "/", "xfs", "partition", "40G"), vol("var", "/var", "xfs", "lvm", "100%"))), ""},
+		{"part-data-fixed-plus-lvm-ok", osLayout(set(dataManual("data", "none", "/dev/sdb"),
+			vol("a", "/a", "xfs", "partition", "100G"), vol("b", "/b", "xfs", "lvm", "100%"))), ""},
+		// ESP and /boot are created with sgdisk +<size>: 100% is not a size.
+		{"esp-100pct", lay(set(os1, vol("uefi", "/boot/efi", "vfat", "partition", "100%"), rootLV())),
+			`(set "os", volume "uefi"): the /boot/efi partition needs a fixed size, not 100%`},
+		{"boot-100pct", lay(set(os1, espVol(), vol("boot", "/boot", "xfs", "partition", "100%"), rootLV())),
+			`(set "os", volume "boot"): the /boot partition needs a fixed size, not 100%`},
+		{"part-on-raid", lay(set(osManual("os", "1", "/dev/sda", "/dev/sdb"), espVol(), vol("root", "/", "xfs", "partition", "40G"))),
+			`direct partition volumes require raid=none (volume "root" is provider=partition`},
+	})
+}
