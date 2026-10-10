@@ -49,7 +49,12 @@ func Resolve(pool []discover.Device, m Match, count, spares, tolerancePct int) (
 	return selected, nil
 }
 
-// filter applies a Match to a pool and returns survivors sorted smallest-first.
+// filter applies a Match to a pool and returns survivors sorted smallest-first,
+// equal sizes by the disk's stable identity (WWN / serial / by-path slot), NOT
+// by kernel name: kernel names follow enumeration order, so equal disks used
+// to swap between sets whenever enumeration changed (a disk added, a slow
+// controller), and auto then saw another set's disks as "broken" and wiped
+// them.
 func filter(pool []discover.Device, m Match) []discover.Device {
 	out := make([]discover.Device, 0, len(pool))
 	for _, d := range pool {
@@ -57,7 +62,12 @@ func filter(pool []discover.Device, m Match) []discover.Device {
 			out = append(out, d)
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Size < out[j].Size })
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Size != out[j].Size {
+			return out[i].Size < out[j].Size
+		}
+		return out[i].IdentityKey() < out[j].IdentityKey()
+	})
 	return out
 }
 

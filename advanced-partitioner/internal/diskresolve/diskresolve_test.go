@@ -177,3 +177,34 @@ func TestResolveTagFilterExcludes(t *testing.T) {
 		t.Fatalf("nvme match should select only the nvme disk, got %+v", got)
 	}
 }
+
+// Equal disks are chosen by stable identity, not kernel name: the SAME
+// physical disk (WWN) is picked first whichever kernel name it got this
+// boot, so a discover set can never swap disks with another set when
+// enumeration changes.
+func TestResolveOrdersEqualDisksByIdentityNotKernelName(t *testing.T) {
+	const size = 960 << 30
+	bootA := []discover.Device{
+		{Name: "sda", Path: "/dev/sda", Size: size, WWN: "0x5000000000000002"},
+		{Name: "sdb", Path: "/dev/sdb", Size: size, WWN: "0x5000000000000001"},
+	}
+	// Next boot the controller enumerates the other way round.
+	bootB := []discover.Device{
+		{Name: "sda", Path: "/dev/sda", Size: size, WWN: "0x5000000000000001"},
+		{Name: "sdb", Path: "/dev/sdb", Size: size, WWN: "0x5000000000000002"},
+	}
+	for i, pool := range [][]discover.Device{bootA, bootB} {
+		got, err := Resolve(pool, Match{}, 1, 0, 0)
+		if err != nil {
+			t.Fatalf("boot %d: %v", i, err)
+		}
+		if got[0].WWN != "0x5000000000000001" {
+			t.Fatalf("boot %d picked WWN %s (%s), want the same disk 0x...01 every boot", i, got[0].WWN, got[0].Name)
+		}
+	}
+	// Size still comes first.
+	small := append([]discover.Device{{Name: "sdz", Path: "/dev/sdz", Size: size / 2, WWN: "0x5000000000000009"}}, bootA...)
+	if got, _ := Resolve(small, Match{}, 1, 0, 0); got[0].Name != "sdz" {
+		t.Fatalf("smallest disk first, got %s", got[0].Name)
+	}
+}

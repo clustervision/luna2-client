@@ -43,8 +43,13 @@ const DefaultByPathDir = "/dev/disk/by-path"
 // including it makes el8 (2.32) error the whole call ("lsblk: exit
 // status 1" -> 0 eligible devices, install fails). The kernel path is
 // derived from NAME instead (/dev/<name>), which is identical for whole
-// disks (-d) across every lsblk version we target (>= 2.27).
-const lsblkDiscoverColumns = "NAME,TYPE,SIZE,ROTA,TRAN,MODEL"
+// disks (-d) across every lsblk version we target (>= 2.27). SERIAL and WWN
+// (the disk's stable identity, used to order equal disks) exist on 2.32.
+const lsblkDiscoverColumns = "NAME,TYPE,SIZE,ROTA,TRAN,MODEL,SERIAL,WWN"
+
+// DefaultSysBlockDir is where the kernel lists block devices and their
+// holders (the multipath-member probe).
+const DefaultSysBlockDir = "/sys/block"
 
 // NamesMode selects how Device.Path is rendered.
 type NamesMode string
@@ -88,6 +93,32 @@ type Device struct {
 	// ByPathMissing is true when NamesByPath was requested but no
 	// /dev/disk/by-path symlink resolved to this device.
 	ByPathMissing bool
+	// Serial and WWN are the disk's identity as lsblk reports it (may be
+	// empty, e.g. virtio without serial=).
+	Serial string
+	WWN    string
+	// ByPath is the /dev/disk/by-path link of the disk (its slot), whatever
+	// the Names mode; "" when udev made none.
+	ByPath string
+}
+
+// IdentityKey is a stable identity for ordering disks that are otherwise
+// equal (same size): WWN, else serial, else the by-path slot, and only as a
+// last resort the kernel name. Kernel names follow enumeration order, which
+// changes between boots (a disk added, a controller probed later); ordering
+// equal disks by name let a selection=discover set swap disks with another
+// set when enumeration changed, and auto then wiped the other set's data.
+func (d Device) IdentityKey() string {
+	switch {
+	case d.WWN != "":
+		return "wwn:" + d.WWN
+	case d.Serial != "":
+		return "serial:" + d.Serial
+	case d.ByPath != "":
+		return "path:" + d.ByPath
+	default:
+		return "name:" + d.Name
+	}
 }
 
 // DeriveTags returns the auto media tags for a device given its rotational
@@ -133,12 +164,18 @@ type Options struct {
 	// Timeout for the underlying lsblk call. Zero leaves it to the
 	// context.
 	Timeout time.Duration
+	// SysBlockDir defaults to DefaultSysBlockDir; tests inject a tempdir.
+	SysBlockDir string
 }
 
-// ListDevices enumerates eligible disks. Eligibility mirrors
-// intent_list_devices in lib/intent.sh: type=disk, transport!=usb,
-// not loop/ram/zram, size>0, size in [MinBytes, MaxBytes] when set.
-// The returned slice is sorted by Path for stable order.
+// ListDevices enumerates eligible LOCAL disks. Eligibility mirrors
+// intent_list_devices in lib/intent.sh: type=disk, transport not usb, fc or
+// iscsi, not a path of a device-mapper multipath map, not loop/ram/zram,
+// size>0, size in [MinBytes, MaxBytes] when set. USB disks are excluded by
+// design (install media, keys); FC/iSCSI LUNs and multipath paths are shared
+// SAN storage, never a node's own disk -- and every path of a multipath LUN
+// is the same LUN. The returned slice is sorted by Path for display; the
+// discover resolver orders equal disks by IdentityKey.
 func ListDevices(ctx context.Context, opts Options) ([]Device, error) {
 	if opts.Runner == nil {
 		return nil, errors.New("discover.ListDevices: Runner is required")
@@ -148,6 +185,9 @@ func ListDevices(ctx context.Context, opts Options) ([]Device, error) {
 	}
 	if opts.ByPathDir == "" {
 		opts.ByPathDir = DefaultByPathDir
+	}
+	if opts.SysBlockDir == "" {
+		opts.SysBlockDir = DefaultSysBlockDir
 	}
 
 	res, err := opts.Runner.Run(ctx, executor.CommandSpec{
@@ -173,8 +213,9 @@ func ListDevices(ctx context.Context, opts Options) ([]Device, error) {
 		if e.Type != "disk" {
 			continue
 		}
-		// exclude USB
-		if e.Tran == "usb" {
+		// exclude USB (by design), and SAN LUNs: Fibre Channel, iSCSI
+		switch e.Tran {
+		case "usb", "fc", "iscsi":
 			continue
 		}
 		// exclude loop, ram, zram by kernel name
@@ -190,6 +231,10 @@ func ListDevices(ctx context.Context, opts Options) ([]Device, error) {
 			continue
 		}
 		if opts.MaxBytes > 0 && e.Size > opts.MaxBytes {
+			continue
+		}
+		// a path of a multipath map: the LUN is reached through the map
+		if isMultipathMember(opts.SysBlockDir, e.Name) {
 			continue
 		}
 
@@ -209,6 +254,11 @@ func ListDevices(ctx context.Context, opts Options) ([]Device, error) {
 			Transport:  e.Tran,
 			Model:      strings.TrimSpace(e.Model),
 			Tags:       DeriveTags(e.Name, e.Tran, e.Rota),
+			Serial:     strings.TrimSpace(e.Serial),
+			WWN:        strings.TrimSpace(e.WWN),
+		}
+		if bp, err := cache.lookup(kpath); err == nil {
+			dev.ByPath = bp
 		}
 
 		switch opts.Names {
@@ -265,6 +315,29 @@ func TransportLabel(name, tran string) string {
 	}
 }
 
+// isMultipathMember reports whether a disk is one path of a device-mapper
+// multipath map: one of its holders is a dm device whose dm uuid starts with
+// "mpath-" (multipathd's naming). Unreadable sysfs reads as "not a member".
+func isMultipathMember(sysBlockDir, name string) bool {
+	holders, err := os.ReadDir(filepath.Join(sysBlockDir, name, "holders"))
+	if err != nil {
+		return false
+	}
+	for _, h := range holders {
+		if !strings.HasPrefix(h.Name(), "dm-") {
+			continue
+		}
+		uuid, err := os.ReadFile(filepath.Join(sysBlockDir, h.Name(), "dm", "uuid")) //nolint:gosec // sysfs path built from kernel names
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(strings.TrimSpace(string(uuid)), "mpath-") {
+			return true
+		}
+	}
+	return false
+}
+
 // isExcludedKernelName matches names that the Bash validator drops
 // unconditionally: loop*, ram*, zram*.
 func isExcludedKernelName(name string) bool {
@@ -279,13 +352,15 @@ func isExcludedKernelName(name string) bool {
 // rota and size are decoded with a flexible type because lsblk versions
 // vary in whether they emit bool/number or string.
 type lsblkEntry struct {
-	Name  string
-	Path  string
-	Type  string
-	Size  int64
-	Rota  bool
-	Tran  string
-	Model string
+	Name   string
+	Path   string
+	Type   string
+	Size   int64
+	Rota   bool
+	Tran   string
+	Model  string
+	Serial string
+	WWN    string
 }
 
 type lsblkRoot struct {
@@ -312,13 +387,15 @@ func parseLsblkJSON(in []byte) ([]lsblkEntry, error) {
 func decodeLsblkEntry(raw json.RawMessage) (lsblkEntry, error) {
 	// Use a flexible intermediate to absorb scalar-type drift.
 	var loose struct {
-		Name  json.RawMessage `json:"name"`
-		Path  json.RawMessage `json:"path"`
-		Type  json.RawMessage `json:"type"`
-		Size  json.RawMessage `json:"size"`
-		Rota  json.RawMessage `json:"rota"`
-		Tran  json.RawMessage `json:"tran"`
-		Model json.RawMessage `json:"model"`
+		Name   json.RawMessage `json:"name"`
+		Path   json.RawMessage `json:"path"`
+		Type   json.RawMessage `json:"type"`
+		Size   json.RawMessage `json:"size"`
+		Rota   json.RawMessage `json:"rota"`
+		Tran   json.RawMessage `json:"tran"`
+		Model  json.RawMessage `json:"model"`
+		Serial json.RawMessage `json:"serial"`
+		WWN    json.RawMessage `json:"wwn"`
 	}
 	if err := json.Unmarshal(raw, &loose); err != nil {
 		return lsblkEntry{}, err
@@ -331,6 +408,8 @@ func decodeLsblkEntry(raw json.RawMessage) (lsblkEntry, error) {
 	e.Size = asInt64(loose.Size)
 	e.Rota = asBool(loose.Rota)
 	e.Model = asString(loose.Model)
+	e.Serial = asString(loose.Serial)
+	e.WWN = asString(loose.WWN)
 	return e, nil
 }
 
