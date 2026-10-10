@@ -39,20 +39,20 @@ func (a *debianAdapter) Prepare(_ context.Context) error {
 	// pack the 95luna netboot initramfs). Accept either — RegenerateInitramfs
 	// dispatches on whichever is present.
 	if !a.hasUpdateInitramfs() && !a.hasDracut() {
-		return fmt.Errorf("missing required command: update-initramfs or dracut")
+		return imageErrorf("image-missing-tool", "missing required command: update-initramfs or dracut")
 	}
 	if !anyExist(sysroot, "usr/sbin/update-grub", "usr/bin/update-grub") {
-		return fmt.Errorf("missing required command: update-grub")
+		return imageErrorf("image-missing-tool", "missing required command: update-grub")
 	}
 	if len(a.deps.BootContext.StorageResult.BootDevices) == 0 {
-		return fmt.Errorf("storage-result boot_devices must contain at least one disk")
+		return configErrorf("no-boot-devices", "storage-result boot_devices must contain at least one disk")
 	}
 	if a.deps.BootContext.FirmwareMode == "uefi" {
 		if _, err := os.Stat(filepath.Join(sysroot, "boot", "efi")); err != nil {
-			return fmt.Errorf("missing EFI mount directory: %s/boot/efi", sysroot)
+			return configErrorf("missing-esp-mount", "missing EFI mount directory: %s/boot/efi", sysroot)
 		}
 	}
-	return nil
+	return requireBIOSGRUB(a.deps.BootContext, "grub-install", "grub2-common", "grub-pc-bin", "usr/lib/grub/i386-pc")
 }
 
 func (a *debianAdapter) hasUpdateInitramfs() bool {
@@ -102,7 +102,7 @@ func (a *debianAdapter) Install(ctx context.Context) error {
 	}
 	if a.deps.BootContext.FirmwareMode != "uefi" {
 		if !a.deps.BootContext.BIOSGRUBRequested() {
-			return fmt.Errorf("unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
+			return configErrorf("firmware-not-uefi", "unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
 		}
 		return a.installBIOS(ctx)
 	}

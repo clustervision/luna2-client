@@ -91,7 +91,7 @@ func fstabLineFor(fs result.Filesystem) (string, error) {
 		return fmt.Sprintf("tmpfs %s tmpfs %s 0 0", fs.Mount, opts), nil
 	}
 	if fs.UUID == "" {
-		return "", fmt.Errorf("missing UUID for mount %s", fs.Mount)
+		return "", configErrorf("fstab-missing-uuid", "missing UUID for mount %s", fs.Mount)
 	}
 	switch fs.Mount {
 	case "swap":

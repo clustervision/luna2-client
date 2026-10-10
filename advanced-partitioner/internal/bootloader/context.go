@@ -38,7 +38,6 @@
 package bootloader
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
@@ -143,7 +142,7 @@ func BuildBootContext(in result.StorageResult, arch, osReleasePath string) (Boot
 func DetectFamily(osReleasePath string) (Family, error) {
 	body, err := os.ReadFile(osReleasePath) //nolint:gosec // operator-controlled path
 	if err != nil {
-		return "", fmt.Errorf("missing %s: %w", osReleasePath, err)
+		return "", imageErrorf("image-missing-os-release", "missing %s: %v", osReleasePath, err)
 	}
 	id, idLike := "", ""
 	for _, line := range strings.Split(string(body), "\n") {
@@ -163,7 +162,7 @@ func DetectFamily(osReleasePath string) (Family, error) {
 	case containsAny(combined, "sles", "opensuse", "suse"):
 		return FamilySUSE, nil
 	default:
-		return "", fmt.Errorf(
+		return "", imageErrorf("unsupported-os-family",
 			"unsupported target OS family from os-release: id=%q id_like=%q",
 			id, idLike)
 	}
@@ -179,7 +178,7 @@ func ArchToUEFITarget(arch string) (string, error) {
 	case "aarch64", "arm64":
 		return "arm64-efi", nil
 	default:
-		return "", fmt.Errorf("unsupported UEFI architecture target: %s", arch)
+		return "", configErrorf("unsupported-architecture", "unsupported UEFI architecture target: %s", arch)
 	}
 }
 
@@ -194,7 +193,7 @@ func ArchToUEFIFallbackLoader(arch string) (string, error) {
 	case "aarch64", "arm64":
 		return `\EFI\BOOT\BOOTAA64.EFI`, nil
 	default:
-		return "", fmt.Errorf("unsupported UEFI fallback loader architecture: %s", arch)
+		return "", configErrorf("unsupported-architecture", "unsupported UEFI fallback loader architecture: %s", arch)
 	}
 }
 

@@ -27,20 +27,20 @@ func (a *rhelAdapter) Family() Family { return FamilyRHEL }
 func (a *rhelAdapter) Prepare(_ context.Context) error {
 	sysroot := a.deps.BootContext.Sysroot
 	if !anyExist(sysroot, "usr/bin/dracut", "usr/sbin/dracut") {
-		return fmt.Errorf("missing required command: dracut")
+		return imageErrorf("image-missing-tool", "missing required command: dracut")
 	}
 	if !anyExist(sysroot, "usr/sbin/grub2-mkconfig", "usr/bin/grub2-mkconfig") {
-		return fmt.Errorf("missing required command: grub2-mkconfig")
+		return imageErrorf("image-missing-tool", "missing required command: grub2-mkconfig")
 	}
 	if len(a.deps.BootContext.StorageResult.BootDevices) == 0 {
-		return fmt.Errorf("storage-result boot_devices must contain at least one disk")
+		return configErrorf("no-boot-devices", "storage-result boot_devices must contain at least one disk")
 	}
 	if a.deps.BootContext.FirmwareMode == "uefi" {
 		if _, err := os.Stat(filepath.Join(sysroot, "boot", "efi")); err != nil {
-			return fmt.Errorf("missing EFI mount directory: %s/boot/efi", sysroot)
+			return configErrorf("missing-esp-mount", "missing EFI mount directory: %s/boot/efi", sysroot)
 		}
 	}
-	return nil
+	return requireBIOSGRUB(a.deps.BootContext, "grub2-install", "grub2-tools", "grub2-pc-modules", "usr/lib/grub/i386-pc")
 }
 
 // RegenerateInitramfs runs `dracut -f --omit luna --kver <version>` via chroot
@@ -233,7 +233,7 @@ func (a *rhelAdapter) Install(ctx context.Context) error {
 	}
 	if a.deps.BootContext.FirmwareMode != "uefi" {
 		if !a.deps.BootContext.BIOSGRUBRequested() {
-			return fmt.Errorf("unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
+			return configErrorf("firmware-not-uefi", "unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
 		}
 		return a.installBIOS(ctx)
 	}

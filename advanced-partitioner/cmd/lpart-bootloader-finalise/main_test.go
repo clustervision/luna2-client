@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/bootloader"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
 )
 
@@ -531,5 +534,133 @@ func TestBIOSGRUBWithBootPartitionPassesTheGate(t *testing.T) {
 		if strings.Contains(stderr, unwanted) {
 			t.Fatalf("unexpected refusal %q; stderr=%s", unwanted, stderr)
 		}
+	}
+}
+
+// classSysroot stages a sysroot with the given os-release and image files and
+// returns it with a storage-result path describing a grub install on it.
+func classSysroot(t *testing.T, osRelease string, files []string, mutate func(*result.StorageResult)) (string, string) {
+	t.Helper()
+	tmp := t.TempDir()
+	sysroot := filepath.Join(tmp, "sysroot")
+	for _, rel := range append([]string{"etc/os-release"}, files...) {
+		p := filepath.Join(sysroot, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		body := ""
+		if rel == "etc/os-release" {
+			body = osRelease
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(sysroot, "boot", "efi"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	res := result.StorageResult{
+		Version: 2, Name: "os", Role: "os",
+		FirmwareMode: "uefi", StorageType: "lvm",
+		BootMethod: "grub", BootOrder: "last", BootFirmware: "uefi", RegisterNVRAM: "auto",
+		RAIDMode: "none", MountedTargetRoot: sysroot,
+		BootDevices: []string{filepath.Join(tmp, "no-such-disk")},
+		Filesystems: []result.Filesystem{
+			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", UUID: "root-uuid"},
+			{Mount: "/boot", Device: "/dev/sda2", FS: "xfs", UUID: "boot-uuid"},
+			{Mount: "/boot/efi", Device: "/dev/sda1", FS: "vfat", UUID: "esp-uuid"},
+		},
+	}
+	if mutate != nil {
+		mutate(&res)
+	}
+	body, _ := json.Marshal(res)
+	p := filepath.Join(tmp, "storage-result.json")
+	if err := os.WriteFile(p, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return sysroot, p
+}
+
+var rhelTools = []string{"usr/sbin/dracut", "usr/sbin/grub2-mkconfig"}
+
+// Review finding 9: deterministic failures park (exit 3, fatal_config=<reason>)
+// instead of exit 1, which the wrapper retries every 30 s for ever -- in full
+// mode re-wiping the disks and downloading the image each time. None of these
+// may reach the bind mounts (non-dry-run: a mount attempt as a normal user
+// would turn them into exit 1).
+func TestDeterministicFailuresExit3(t *testing.T) {
+	for _, tc := range []struct {
+		name, osRelease string
+		files           []string
+		mutate          func(*result.StorageResult)
+		reason          string
+	}{
+		{"unsupported OS family", "ID=gentoo\n", nil, nil, "unsupported-os-family"},
+		{"image without dracut", "ID=rocky\n", []string{"usr/sbin/grub2-mkconfig"}, nil, "image-missing-tool"},
+		{"image without grub2-mkconfig", "ID=rocky\n", []string{"usr/sbin/dracut"}, nil, "image-missing-tool"},
+		{"debian image without update-grub", "ID=ubuntu\n", []string{"usr/sbin/update-initramfs"}, nil, "image-missing-tool"},
+		{"fstab entry without UUID", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.Filesystems[1].UUID = ""
+		}, "fstab-missing-uuid"},
+		{"no boot devices", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.BootDevices = []string{}
+		}, "no-boot-devices"},
+		{"BIOS first without grub2-install", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.FirmwareMode, r.BootOrder, r.BIOSBootPartition = "bios", "first", 1
+		}, "image-missing-bios-grub"},
+		{"BIOS first without the i386-pc modules", "ID=rocky\n", append([]string{"usr/sbin/grub2-install"}, rhelTools...), func(r *result.StorageResult) {
+			r.FirmwareMode, r.BootOrder, r.BIOSBootPartition = "bios", "first", 1
+		}, "image-missing-bios-grub"},
+		{"debian BIOS first without grub-install", "ID=ubuntu\n", []string{"usr/sbin/update-initramfs", "usr/sbin/update-grub"}, func(r *result.StorageResult) {
+			r.FirmwareMode, r.BootOrder, r.BIOSBootPartition = "bios", "first", 1
+		}, "image-missing-bios-grub"},
+		{"mirrored boot without efibootmgr", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.BootDevices = append(r.BootDevices, r.BootDevices[0]+"-b")
+		}, "image-missing-efibootmgr"},
+		{"clear_uefi_nvram without efibootmgr", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.ClearUEFINVRAM = true
+		}, "image-missing-efibootmgr"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, resPath := classSysroot(t, tc.osRelease, tc.files, tc.mutate)
+			stderr, rc := runEnv(t, "--result", resPath)
+			if rc != 3 || !strings.Contains(stderr, "fatal_config="+tc.reason) {
+				t.Fatalf("want exit 3 fatal_config=%s; rc=%d stderr=%s", tc.reason, rc, stderr)
+			}
+		})
+	}
+}
+
+func TestInvalidStorageResultExit3(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "storage-result.json")
+	if err := os.WriteFile(p, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stderr, rc := runEnv(t, "--result", p)
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=storage-result-invalid") {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+	_, resPath := classSysroot(t, "ID=rocky\n", rhelTools, nil)
+	sysroot := filepath.Dir(resPath) + "/sysroot"
+	if err := os.Remove(filepath.Join(sysroot, "etc", "os-release")); err != nil {
+		t.Fatal(err)
+	}
+	if stderr, rc := runEnv(t, "--result", resPath); rc != 3 || !strings.Contains(stderr, "fatal_config=image-missing-os-release") {
+		t.Fatalf("missing os-release: rc=%d stderr=%s", rc, stderr)
+	}
+}
+
+// fail maps the typed error, not the message: a transient command failure is
+// a retry (exit 1) whatever it says.
+func TestFailClassification(t *testing.T) {
+	var buf bytes.Buffer
+	if rc := fail(&buf, "", errors.New("efibootmgr --create /dev/sda: exit status 5 (missing UUID)")); rc != 1 {
+		t.Fatalf("transient failure: rc=%d", rc)
+	}
+	wrapped := fmt.Errorf("StageSignedShim: %w", &bootloader.FatalError{Kind: "image", Reason: "image-no-signed-shim", Err: errors.New("no shim")})
+	buf.Reset()
+	if rc := fail(&buf, "", wrapped); rc != 3 || !strings.Contains(buf.String(), "fatal_config=image-no-signed-shim") {
+		t.Fatalf("wrapped FatalError: rc=%d out=%s", rc, buf.String())
 	}
 }

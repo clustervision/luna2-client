@@ -380,7 +380,7 @@ func archShimAndGrub(arch string) (shim string, grub string, err error) {
 	case "aarch64", "arm64":
 		return "shimaa64.efi", "grubaa64.efi", nil
 	default:
-		return "", "", fmt.Errorf("unsupported UEFI shim architecture: %s", arch)
+		return "", "", configErrorf("unsupported-architecture", "unsupported UEFI shim architecture: %s", arch)
 	}
 }
 
@@ -530,7 +530,7 @@ func archMokManager(arch string) (string, error) {
 	case "aarch64", "arm64":
 		return "mmaa64.efi", nil
 	default:
-		return "", fmt.Errorf("unsupported UEFI shim architecture: %s", arch)
+		return "", configErrorf("unsupported-architecture", "unsupported UEFI shim architecture: %s", arch)
 	}
 }
 

@@ -77,13 +77,10 @@ func ClearUEFINVRAMEntries(ctx context.Context, runner executor.Runner, sysroot,
 	if firmwareMode != "uefi" {
 		return nil
 	}
-	eb := efibootmgrChrootPath(sysroot)
-	if eb == "" {
-		return fmt.Errorf(
-			"clear_uefi_nvram requested but efibootmgr is not available in %s -- "+
-				"osimage must be installed before calling lpart-bootloader-finalise",
-			sysroot)
+	if err := RequireEfibootmgr(sysroot, "clear_uefi_nvram"); err != nil {
+		return err
 	}
+	eb := efibootmgrChrootPath(sysroot)
 	res, err := runner.Run(ctx, executor.CommandSpec{
 		Path: eb, Chroot: sysroot,
 		CaptureStdout: true, CaptureStderr: true,
@@ -566,4 +563,32 @@ func signedShimLoaderPath(sysroot, arch string) (string, bool) {
 		return "", false
 	}
 	return `\EFI\` + filepath.Base(sel.dir) + `\` + shimName, true
+}
+
+// RequireEfibootmgr returns an image FatalError when the image has no
+// efibootmgr although why needs one. Every NVRAM change runs the image's
+// efibootmgr in the chroot (the install initramfs has none), so retrying
+// cannot help.
+func RequireEfibootmgr(sysroot, why string) error {
+	if efibootmgrChrootPath(sysroot) != "" {
+		return nil
+	}
+	return imageErrorf("image-missing-efibootmgr",
+		"%s needs efibootmgr, but the OS image in %s has none -- add the efibootmgr package to the image", why, sysroot)
+}
+
+// RequireNVRAMTooling is the preflight for the NVRAM work an install cannot do
+// without: a UEFI install with more than one boot disk (a mirrored boot set)
+// needs one NVRAM entry per disk -- that IS its failover -- so an image without
+// efibootmgr would only fail VerifyAndReport at the very end, on every retry.
+// register_nvram=no is the deliberate opt-out. A single disk boots through the
+// removable fallback and is not refused.
+func RequireNVRAMTooling(bc BootContext) error {
+	if !strings.EqualFold(bc.FirmwareMode, "uefi") || bc.Family == FamilyNone ||
+		bc.RegisterNVRAM == "no" || len(bc.StorageResult.BootDevices) <= 1 {
+		return nil
+	}
+	return RequireEfibootmgr(bc.Sysroot, fmt.Sprintf(
+		"this %d-disk mirrored-boot install (one NVRAM boot entry per disk; set register_nvram=no to accept fallback-only boot)",
+		len(bc.StorageResult.BootDevices)))
 }

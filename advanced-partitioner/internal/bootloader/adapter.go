@@ -2,7 +2,6 @@ package bootloader
 
 import (
 	"context"
-	"fmt"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fsops"
@@ -68,8 +67,30 @@ func New(deps AdapterDeps) (Adapter, error) {
 	case FamilyNone:
 		return &noopAdapter{deps: deps}, nil
 	default:
-		return nil, fmt.Errorf("unsupported bootloader family: %s", deps.BootContext.Family)
+		return nil, configErrorf("unsupported-bootloader-family", "unsupported bootloader family: %s", deps.BootContext.Family)
 	}
+}
+
+// requireBIOSGRUB is the Prepare preflight of a BIOS GRUB install (bootloader
+// "first" on non-UEFI firmware): the image must carry the installer and the
+// i386-pc platform modules it copies into /boot. Without them grub*-install
+// fails the same way on every attempt, so this is an image FatalError (exit 3)
+// rather than a mid-install exit 1 that retries for ever.
+func requireBIOSGRUB(bc BootContext, installer, installerPkg, modulesPkg string, moduleDirs ...string) error {
+	if !bc.BIOSGRUBRequested() {
+		return nil
+	}
+	if !anyExist(bc.Sysroot, "usr/sbin/"+installer, "usr/bin/"+installer, "sbin/"+installer) {
+		return imageErrorf("image-missing-bios-grub",
+			"BIOS GRUB requested (bootloader first on %q firmware) but the image has no %s (package %s)",
+			bc.FirmwareMode, installer, installerPkg)
+	}
+	if !anyExist(bc.Sysroot, moduleDirs...) {
+		return imageErrorf("image-missing-bios-grub",
+			"BIOS GRUB requested (bootloader first on %q firmware) but the image has no i386-pc GRUB modules (/%s; package %s)",
+			bc.FirmwareMode, moduleDirs[0], modulesPkg)
+	}
+	return nil
 }
 
 // noopAdapter is the FamilyNone path: every step returns nil. Used by

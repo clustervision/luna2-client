@@ -72,6 +72,7 @@ func TestRHELRebuildsEveryKernelAndSetsDefault(t *testing.T) {
 			}
 			stageKernels(t, sysroot, []string{kOld, kNew}, kLeftover)
 			mustWriteFile(t, filepath.Join(sysroot, "etc", "default", "grub"), "GRUB_DEFAULT=saved\n")
+			mustWriteFile(t, filepath.Join(sysroot, "usr", "bin", "grub2-editenv"), "")
 			f := executor.NewFakeRunner(executor.FakeResponse{})
 			a := &rhelAdapter{deps: AdapterDeps{Runner: f, BootContext: biosBootContext(sysroot, "/dev/sda")}}
 			if err := a.RegenerateInitramfs(context.Background()); err != nil {
@@ -201,5 +202,19 @@ func TestRegenerateInitramfsRemovesImageLVMDevicesFile(t *testing.T) {
 				t.Errorf("%s: dry-run removed %s", fam, lvmDevicesFile)
 			}
 		}
+	}
+}
+
+// An image without grub2-editenv keeps its own saved_entry rather than failing
+// the install on a command that can never succeed.
+func TestSetDefaultBootEntryWithoutEditenv(t *testing.T) {
+	sysroot := t.TempDir()
+	stageKernels(t, sysroot, []string{kNew})
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	if err := setDefaultBootEntry(context.Background(), AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot}}, kNew); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.Calls()) != 0 {
+		t.Fatalf("no command expected, got %v", f.Calls())
 	}
 }

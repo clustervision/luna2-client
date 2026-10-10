@@ -150,6 +150,12 @@ func setDefaultBootEntry(ctx context.Context, deps AdapterDeps, kver string) err
 		}
 		return nil
 	}
+	if !anyExist(sysroot, "usr/bin/grub2-editenv", "usr/sbin/grub2-editenv") {
+		if deps.Logger != nil {
+			deps.Logger.Warn("the image has no grub2-editenv: saved_entry not set, the default boot entry is the image's")
+		}
+		return nil
+	}
 	if _, err := deps.Runner.Run(ctx, executor.CommandSpec{
 		Path: "/usr/bin/env", Chroot: sysroot,
 		Args:          []string{"grub2-editenv", "-", "set", "saved_entry=" + id},
