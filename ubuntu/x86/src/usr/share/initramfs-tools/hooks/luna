@@ -46,6 +46,10 @@ copy_exec /usr/sbin/mkdosfs /usr/sbin
 copy_exec /usr/sbin/dosfslabel /usr/sbin
 copy_exec /usr/sbin/fatlabel /usr/sbin
 copy_exec /usr/sbin/mdadm /usr/sbin
+# lpart's lvm builder makes LV nodes itself (--noudevsync): vgmknodes, then dmsetup mknodes
+for _d in /usr/sbin /sbin; do
+    if [ -e "$_d/vgmknodes" ]; then copy_exec "$_d/vgmknodes" /usr/sbin; break; fi
+done
 copy_exec /usr/bin/top /usr/bin
 copy_exec /usr/sbin/fdisk /usr/sbin
 copy_exec /usr/bin/lspci /usr/bin

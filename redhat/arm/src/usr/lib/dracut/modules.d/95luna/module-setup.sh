@@ -73,6 +73,10 @@ install() {
     # (either will do), fsck.ext4 is e2fsck's alias.
     dracut_install e2fsck xfs_repair
     inst_multiple -o fsck.ext4 fsck.fat fsck.vfat
+    # lpart's lvm builder creates LVs with --noudevsync and then makes the
+    # device nodes itself (vgmknodes, then dmsetup mknodes); dracut's lvm
+    # module does not ship vgmknodes (an lvm symlink).
+    inst_multiple -o vgmknodes
     if ! type -P fsck.fat >/dev/null 2>&1 && ! type -P fsck.vfat >/dev/null 2>&1; then
         derror "95luna: neither fsck.fat nor fsck.vfat found (dosfstools): lpart-storage-check cannot run"
     fi
