@@ -212,7 +212,7 @@ func (a *debianAdapter) generateGrubConfig(ctx context.Context) error {
 	// GRUB resolves non-deterministically when a mirror leg is missing —
 	// dropping the mduuid set/hints forces the fs-uuid scan that finds a raw
 	// metadata-1.0 member. No-op on non-RAID layouts (no mduuid references).
-	makeGrubCfgDegradedSafeAt(
+	makeGrubCfgDegradedSafeAt(a.deps.FS,
 		filepath.Join(sysroot, "boot", "grub", "grub.cfg"),
 		filepath.Join(sysroot, "boot", "grub2", "grub.cfg"),
 	)

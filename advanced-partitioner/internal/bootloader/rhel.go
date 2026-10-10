@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fsops"
 )
 
 // rhelAdapter ports lib/bootloader_rhel.sh. The family covers RHEL,
@@ -276,7 +277,7 @@ func (a *rhelAdapter) installBIOS(ctx context.Context) error {
 // bootloader_rhel_write_grub_default.
 func (a *rhelAdapter) writeGrubDefault() error {
 	path := filepath.Join(a.deps.BootContext.Sysroot, "etc", "default", "grub")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // sysroot defaults
+	if err := a.deps.FS.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("mkdir parent of %s: %w", path, err)
 	}
 	lines := []string{
@@ -289,8 +290,7 @@ func (a *rhelAdapter) writeGrubDefault() error {
 		GrubCmdlineValue(a.deps.BootContext.KernelArgs),
 	}
 	body := strings.Join(lines, "\n") + "\n"
-	//nolint:gosec // /etc/default/grub default perms
-	return os.WriteFile(path, []byte(body), 0o644)
+	return a.deps.FS.WriteFile(path, []byte(body), 0o644)
 }
 
 func (a *rhelAdapter) installUEFI(ctx context.Context) error {
@@ -403,8 +403,7 @@ func (a *rhelAdapter) normalizeBLSEntries() {
 				out = append(out, line)
 			}
 		}
-		//nolint:gosec // sysroot file, default perms
-		_ = os.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644)
+		_ = a.deps.FS.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644)
 	}
 }
 
@@ -521,7 +520,7 @@ func anyExist(sysroot string, rel ...string) bool {
 // No-op on non-RAID layouts (grub2-mkconfig emits no mduuid references) and
 // best-effort: a missing/unreadable grub.cfg just leaves it untouched.
 func (a *rhelAdapter) makeGrubCfgDegradedSafe() {
-	makeGrubCfgDegradedSafeAt(
+	makeGrubCfgDegradedSafeAt(a.deps.FS,
 		filepath.Join(a.deps.BootContext.Sysroot, "boot", "grub2", "grub.cfg"))
 }
 
@@ -530,7 +529,8 @@ func (a *rhelAdapter) makeGrubCfgDegradedSafe() {
 // Debian used to keep the mduuid-based grub.cfg — the non-deterministic
 // degraded assembly — that the RHEL fix above removed). Best-effort: a
 // missing/unreadable path is skipped, an unchanged body is not rewritten.
-func makeGrubCfgDegradedSafeAt(paths ...string) {
+// Writes go through fs, so --dry-run leaves grub.cfg alone.
+func makeGrubCfgDegradedSafeAt(fs fsops.FS, paths ...string) {
 	for _, path := range paths {
 		body, err := os.ReadFile(path) //nolint:gosec // sysroot file
 		if err != nil {
@@ -540,8 +540,7 @@ func makeGrubCfgDegradedSafeAt(paths ...string) {
 		if out == string(body) {
 			continue
 		}
-		//nolint:gosec // grub.cfg default perms
-		_ = os.WriteFile(path, []byte(out), 0o644)
+		_ = fs.WriteFile(path, []byte(out), 0o644)
 	}
 }
 
