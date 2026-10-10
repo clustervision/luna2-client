@@ -153,9 +153,12 @@ luna_start() {
 }
 
 luna_finish() {
+    # -P 514: without a port logger resolves the service name "syslog", which
+    # needs /etc/services -- absent from the initramfs, so every forward
+    # failed ("Servname not supported") and the controller never saw this log
     luna_loghost=$(getargs luna.loghost=)
     if [ "$luna_loghost" ]; then
-        cat /tmp/luna_install.log | logger -d -n $luna_loghost
+        logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
     else
         echo "Luna2: loghost not defined, cannot forward logs."
     fi
@@ -220,7 +223,7 @@ luna_sanitize_stop() {
         echo "Luna2:   (no report was written -- check the install log)"
     fi
     echo "Luna2: install_mode=sanitize stops the node: powering off in 10 s (install.sh rc=$1)."
-    [ "$luna_loghost" ] && logger -d -n "$luna_loghost" < /tmp/luna_install.log
+    [ "$luna_loghost" ] && logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
     sync
     sleep 10
     poweroff -f 2>/dev/null
@@ -242,7 +245,7 @@ fatal_park() {
     fi
     echo "Luna2: Exit 2 and 3 are non-retryable: the node is parked. 'poweroff' stops it;"
     echo "Luna2: exiting the shell re-opens it (no retry)."
-    [ "$luna_loghost" ] && logger -d -n "$luna_loghost" < /tmp/luna_install.log
+    [ "$luna_loghost" ] && logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
     while true; do
         if { exec 9<>"$luna_ctty"; } 2>/dev/null; then
             exec 9<&-
@@ -356,7 +359,7 @@ if [ "x$ROOT" = "xluna" ]; then
                 fatal_park "$rc"           # never returns
             fi
             if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
-                cat /tmp/luna_install.log | logger -d -n $luna_loghost
+                logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
                 echo -n '' > /tmp/luna_install.log
             fi
             sleep 10
