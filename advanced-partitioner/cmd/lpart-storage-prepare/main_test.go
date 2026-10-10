@@ -413,3 +413,24 @@ func TestSerialCollisionWarnings(t *testing.T) {
 		t.Fatalf("distinct serials must not warn: %v", warns)
 	}
 }
+
+// An invalid disklayout is deterministic: it must park (exit 3), not return the
+// retryable exit 1 (lab 10 October 2026: a raid1 data set with a direct
+// partition volume retried every 30 s for ever).
+func TestInvalidConfigIsFatalNotRetryable(t *testing.T) {
+	tmp := t.TempDir()
+	ic := filepath.Join(tmp, "install-context.json")
+	if err := os.WriteFile(ic, []byte(`{"install_mode":"full"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := filepath.Join(tmp, "storage.json")
+	bad := `{"version":2,"sets":[{"name":"os","role":"os","selection":"manual","raid":"none","devices":["/dev/vda"],"volumes":[{"name":"uefi","mountpoint":"/boot/efi","fs":"vfat","provider":"partition","size":"600M"},{"name":"boot","mountpoint":"/boot","fs":"xfs","provider":"partition","size":"2G"},{"name":"root","mountpoint":"/","fs":"xfs","provider":"lvm","size":"100%"}]},` +
+		`{"name":"data","role":"data","selection":"manual","raid":"1","devices":["/dev/vde","/dev/vdf"],"volumes":[{"name":"data","mountpoint":"/data","fs":"xfs","provider":"partition","size":"100%"}]}]}`
+	if err := os.WriteFile(cfg, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, stderr, rc := runWithBootEnv(t, "uefi", true, "--install-context", ic, "--config", cfg, "--dry-run")
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=config-validation") {
+		t.Fatalf("invalid config: want rc=3 with fatal_config marker, got rc=%d stderr=%s", rc, stderr)
+	}
+}

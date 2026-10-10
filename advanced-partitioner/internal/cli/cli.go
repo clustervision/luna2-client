@@ -175,3 +175,17 @@ func ExitSafetyRefusal(stderr io.Writer, tool, reason, format string, args ...an
 	_, _ = fmt.Fprintf(stderr, "%s: safety_refusal=%s %s\n", tool, reason, msg)
 	return 2
 }
+
+// ExitFatalConfigCode is the exit code of a non-retryable configuration
+// error: the same input fails identically on every attempt (an invalid
+// disklayout, an unparsable filter). lpart-node-installer maps it, like 2, to
+// its own exit 3 so the install wrapper parks instead of retrying every 30 s.
+const ExitFatalConfigCode = 3
+
+// ExitFatalConfig logs a non-retryable configuration error with the
+// fatal_config=<reason> marker and returns ExitFatalConfigCode.
+func ExitFatalConfig(stderr io.Writer, tool, reason, format string, args ...any) int {
+	msg := fmt.Sprintf(format, args...)
+	_, _ = fmt.Fprintf(stderr, "%s: fatal_config=%s %s\n", tool, reason, msg)
+	return ExitFatalConfigCode
+}

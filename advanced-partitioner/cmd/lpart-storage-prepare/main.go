@@ -167,12 +167,13 @@ func run(argv []string, stdout, stderr io.Writer) int {
 				errln(stderr, "config not found: %s", f.ConfigPath)
 				return 1
 			}
-			errln(stderr, "%v", lerr)
-			return 1
+			// Unparsable layout: identical on every retry -> park, do not loop.
+			return cli.ExitFatalConfig(stderr, toolName, "config-load", "%v", lerr)
 		}
 		if verr := loaded.ValidateRaw(raw); verr != nil {
-			errln(stderr, "%v", verr)
-			return 1
+			// An invalid disklayout fails identically on every retry: park for
+			// an operator (exit 3) instead of retrying every 30 s for ever.
+			return cli.ExitFatalConfig(stderr, toolName, "config-validation", "%v", verr)
 		}
 		cfg = loaded
 	}
