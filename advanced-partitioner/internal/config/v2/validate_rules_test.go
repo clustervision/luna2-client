@@ -440,3 +440,30 @@ func TestBootMirrorDeviceOnlyForDeclaredBootVolume(t *testing.T) {
 		t.Errorf("raid0 /boot = %q, want \"\" (raid0 does not mirror the boot chain)", got)
 	}
 }
+
+// A layout without an os set stays valid at config level: memboot nodes use
+// data-only layouts. The diskful modes refuse it at runtime, where the
+// install mode is known.
+func TestRuleDataOnlyLayoutStaysValid(t *testing.T) {
+	runRuleCases(t, []ruleCase{
+		{"data-only-manual", lay(set(dataManual("data", "none", "/dev/sdb"), vol("d", "/data", "xfs", "lvm", "100%"))), ""},
+		{"data-only-discover-raid1", lay(set(`"name":"scratch","role":"data","selection":"discover","raid":"1","count":2,"spares":1`,
+			vol("s", "/scratch", "xfs", "lvm", "100%"))), ""},
+		{"data-only-two-sets", lay(
+			set(dataManual("a", "none", "/dev/sdb"), vol("x", "/a", "xfs", "partition", "100%")),
+			set(dataManual("b", "0", "/dev/sdc", "/dev/sdd"), vol("y", "/b", "xfs", "lvm", "100%"))), ""},
+	})
+}
+
+// bootloader is a property of the os set; every spelling is refused on a
+// data set (it would silently do nothing there).
+func TestRuleBootloaderOsSetOnly(t *testing.T) {
+	var cases []ruleCase
+	for _, v := range []string{`"first"`, `"last"`, `"none"`, `true`, `false`, `"grub"`} {
+		cases = append(cases,
+			ruleCase{"data-" + v, osLayout(set(dataManual("data", "none", "/dev/sdb")+`,"bootloader":`+v, vol("d", "/d", "xfs", "lvm", "100%"))),
+				"sets[1]: bootloader is valid on the os set only"},
+			ruleCase{"os-" + v, lay(set(osFields("os")+`,"bootloader":`+v, espVol(), bootVol(), rootLV())), ""})
+	}
+	runRuleCases(t, cases)
+}
