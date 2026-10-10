@@ -50,6 +50,9 @@ type Options struct {
 	// (FTA D9); with the bound it becomes a normal, retryable failure.
 	// Defaults to 2h — generous enough for a slow image extract plus
 	// filesystem work, far below "operator finds the node next morning".
+	// A sanitize run's storage-prepare gets a bound derived from the disk
+	// sizes instead (sanitizeTimeout): zero-filling is bounded by the disks'
+	// write speed, not by this default.
 	StepTimeout time.Duration
 }
 
@@ -111,6 +114,7 @@ type Pipeline struct {
 
 	resultMu sync.Mutex
 	result   Result
+	finished chan struct{} // closed when run() has returned
 }
 
 // Result returns the terminal outcome recorded by run(). Callers decide the
@@ -180,7 +184,7 @@ func New(ctx context.Context, opts Options) *Pipeline {
 	if opts.StepTimeout <= 0 {
 		opts.StepTimeout = 2 * time.Hour
 	}
-	return &Pipeline{opts: opts, ctx: ctx, events: make(chan engine.InstallerEvent, 1024)}
+	return &Pipeline{opts: opts, ctx: ctx, events: make(chan engine.InstallerEvent, 1024), finished: make(chan struct{})}
 }
 
 // Events returns the read-only event channel, closed when the phase ends.
@@ -196,7 +200,13 @@ func (p *Pipeline) Start() error {
 	return nil
 }
 
+// Wait blocks until the phase goroutine has returned: every step it started,
+// with its whole process group, is gone by then. The caller must keep
+// draining Events() meanwhile (the step output forward blocks on it).
+func (p *Pipeline) Wait() { <-p.finished }
+
 func (p *Pipeline) run() {
+	defer close(p.finished)
 	defer close(p.events)
 	// Clear the previous attempt's failure file: the boot wrapper prints
 	// whatever is there, so a stale one would be read as this attempt's reason.
@@ -317,7 +327,18 @@ func (p *Pipeline) runPart() error {
 	if fileHasContent(p.rt("storage.json")) {
 		args = append(args, "--config", p.rt("storage.json"))
 	}
-	if err := p.runStep("storage-prepare", p.bin("lpart-storage-prepare"), args...); err != nil {
+	timeout := p.opts.StepTimeout
+	if mode.IsSanitize() {
+		// Zero-filling runs at the disks' write speed, one disk after the
+		// other: a fixed 2 h bound killed it part-way on large HDDs, and the
+		// retry started again from the first disk.
+		timeout = sanitizeTimeout(lsblkDisks(p.ctx), p.opts.StepTimeout)
+		if timeout > 0 {
+			p.info("sanitize: storage-prepare may take up to " + timeout.String() + " (local disk sizes at 50 MB/s)")
+		}
+	}
+	err = p.runStepTimeout("storage-prepare", timeout, append([]string{p.bin("lpart-storage-prepare")}, args...))
+	if err != nil {
 		p.stageFail("storage-prepare", err.Error())
 		return err
 	}
@@ -463,7 +484,18 @@ func (p *Pipeline) runStep(stage, path string, args ...string) error {
 // non-zero exit is returned as a typed stepError so the numeric code (and
 // with it the retry-vs-park class) survives to the process exit.
 func (p *Pipeline) runStepArgv(stage string, argv []string) error {
-	ctx, cancel := context.WithTimeout(p.ctx, p.opts.StepTimeout)
+	return p.runStepTimeout(stage, p.opts.StepTimeout, argv)
+}
+
+// runStepTimeout is runStepArgv with an explicit bound; timeout <= 0 means
+// none. On a timeout or a cancelled phase the step's whole process group is
+// killed (engine.RunCommand), so no mkfs/tar/blkdiscard outlives it.
+func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []string) error {
+	ctx, cancel := context.WithCancel(p.ctx)
+	if timeout > 0 {
+		cancel()
+		ctx, cancel = context.WithTimeout(p.ctx, timeout)
+	}
 	defer cancel()
 	// Mirror the step's stderr on its way to the renderers so a failure can
 	// name the cause in the failure file. The forward stays blocking, so the
@@ -488,7 +520,10 @@ func (p *Pipeline) runStepArgv(stage string, argv []string) error {
 	close(mirror)
 	mirrored.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("%s: step exceeded the %s timeout and was killed", filepath.Base(argv[0]), p.opts.StepTimeout)
+		return fmt.Errorf("%s: step exceeded the %s timeout and was killed with its child processes", filepath.Base(argv[0]), timeout)
+	}
+	if p.ctx.Err() != nil {
+		return fmt.Errorf("%s: install interrupted; the step was killed with its child processes", filepath.Base(argv[0]))
 	}
 	// A non-zero child exit is reported by RunCommand as BOTH a numeric code
 	// AND a non-nil err (the exec.ExitError echoing that code). Build the

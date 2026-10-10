@@ -13,6 +13,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 
@@ -121,6 +122,11 @@ func run() error {
 		QuietConsole: *quietConsole,
 		StrictExit:   true,
 	})
+	// The renderer can return while the phase is still mid-step: a render
+	// error, the operator quitting (q / Ctrl+C), a signal. Exiting then left
+	// the running step's children (mkfs, tar, sgdisk, blkdiscard) writing to
+	// the disks into the next install attempt. Stop the phase and wait for it.
+	stopPipeline(cancel, pl, os.Stderr)
 	if err != nil {
 		return err
 	}
@@ -153,6 +159,30 @@ func run() error {
 		os.Exit(1)
 	}
 	return nil
+}
+
+// phase is the part of *pipeline.Pipeline that stopPipeline needs.
+type phase interface {
+	Result() pipeline.Result
+	Events() <-chan engine.InstallerEvent
+	Wait()
+}
+
+// stopPipeline makes sure the phase goroutine has returned before the process
+// exits. An unfinished phase is cancelled: its running step is killed with
+// its whole process group (engine.RunCommand). The events are drained
+// meanwhile, since the step output forward blocks on them once the renderer
+// has stopped reading.
+func stopPipeline(cancel context.CancelFunc, pl phase, stderr io.Writer) {
+	if !pl.Result().Done {
+		_, _ = fmt.Fprintln(stderr, "lpart-node-installer: stopping the unfinished phase and its child processes")
+		cancel()
+	}
+	go func() {
+		for range pl.Events() {
+		}
+	}()
+	pl.Wait()
 }
 
 // legacyRefusal returns a fatal message if install_mode=legacy reached the
