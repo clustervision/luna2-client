@@ -299,3 +299,35 @@ func TestRuleSpares(t *testing.T) {
 			`(set "os"): the OS set uses exactly 1, 2 or 4 drives (raid none/1/0/10), got 6 active (7 devices minus spares=1)`},
 	})
 }
+
+func TestRuleDevicePathStyle(t *testing.T) {
+	osOn := func(devs ...string) string {
+		raid := "none"
+		if len(devs) == 2 {
+			raid = "1"
+		}
+		return lay(set(osManual("os", raid, devs...), espVol(), bootVol(), rootLV()))
+	}
+	dataOn := func(dev string) string {
+		return osLayout(set(dataManual("data", "none", dev), vol("d", "/d", "xfs", "lvm", "100%")))
+	}
+	runRuleCases(t, []ruleCase{
+		// A whole disk's by-uuid link disappears once the disk is
+		// partitioned: the second boot always fails "device not found".
+		{"by-uuid-os", osOn("/dev/disk/by-uuid/0b6c1f9e-4d0a-4c4e-9a43-6f5d7c2b1a10"),
+			`(set "os"): device "/dev/disk/by-uuid/0b6c1f9e-4d0a-4c4e-9a43-6f5d7c2b1a10" is a by-uuid link`},
+		{"by-uuid-data", dataOn("/dev/disk/by-uuid/1234-ABCD"), `(set "data"): device "/dev/disk/by-uuid/1234-ABCD" is a by-uuid link`},
+		{"by-uuid-raid1", osOn("/dev/disk/by-uuid/a", "/dev/disk/by-uuid/b"), `is a by-uuid link`},
+		{"by-label", dataOn("/dev/disk/by-label/scratch"), `is a /dev/disk/by-label link`},
+		{"by-partuuid", dataOn("/dev/disk/by-partuuid/5e1c-01"), `is a /dev/disk/by-partuuid link`},
+		{"by-partlabel", dataOn("/dev/disk/by-partlabel/DATA"), `is a /dev/disk/by-partlabel link`},
+		{"by-diskseq", dataOn("/dev/disk/by-diskseq/7"), `is a /dev/disk/by-diskseq link`},
+		{"by-id-ok", osOn("/dev/disk/by-id/ata-Samsung_SSD_870_S5Y1NX0R123456"), ""},
+		{"by-id-raid1-ok", osOn("/dev/disk/by-id/wwn-0x5002538e40a1b2c3", "/dev/disk/by-id/wwn-0x5002538e40a1b2c4"), ""},
+		{"by-path-ok", osOn("/dev/disk/by-path/pci-0000:00:1f.2-ata-1"), ""},
+		{"kernel-sd-ok", osOn("/dev/sda"), ""},
+		{"kernel-vd-ok", osOn("/dev/vda"), ""},
+		{"kernel-nvme-ok", osOn("/dev/nvme0n1"), ""},
+		{"mixed-styles", osOn("/dev/sda", "/dev/disk/by-id/wwn-0x1"), "all paths must use the same style (/dev/..., by-id, by-path)"},
+	})
+}

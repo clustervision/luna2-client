@@ -506,6 +506,10 @@ func (v *Volume) validate(setIdx, volIdx int, raw json.RawMessage) error {
 // validateDevicesConsistent enforces that every device path in a manual set
 // is a supported style and that all paths in a set share one style.
 //
+// Supported styles are the kernel name (/dev/sdX, /dev/vdX, /dev/nvme*) and
+// the whole-disk udev links /dev/disk/by-id and /dev/disk/by-path; every other
+// /dev/disk link is refused (see checkDiskLinkStyle).
+//
 // Device-mapper / multipath paths (/dev/mapper/*, /dev/dm-*) are REFUSED as
 // set devices: partition naming on dm devices has no reliable convention
 // (kpartx emits mpathap1, multipathd setups vary, /dev/dm-N partitions get
@@ -522,6 +526,9 @@ func (s *Set) validateDevicesConsistent(idx int) error {
 				"config_validation: sets[%d].devices: device-mapper/multipath path %q is not supported as a set device (dm partition naming has no reliable convention); use the underlying disk's by-id, by-path, or kernel name",
 				idx, d)
 		}
+		if err := checkDiskLinkStyle(idx, s.Name, d); err != nil {
+			return err
+		}
 		st, err := selectorTypeOf(d)
 		if err != nil {
 			return fmt.Errorf("config_validation: %w", err)
@@ -532,9 +539,35 @@ func (s *Set) validateDevicesConsistent(idx int) error {
 		}
 		if st != styleOf {
 			return fmt.Errorf(
-				"config_validation: sets[%d].devices: all paths must use the same style (/dev/..., by-id, by-path, by-uuid)",
+				"config_validation: sets[%d].devices: all paths must use the same style (/dev/..., by-id, by-path)",
 				idx)
 		}
 	}
 	return nil
+}
+
+// checkDiskLinkStyle refuses /dev/disk links that do not name a whole disk
+// stably across the install. A by-uuid (or by-label) link of a whole disk
+// names the filesystem ON it: partitioning destroys that filesystem, so the
+// link is gone and every later boot fails "device not found". by-partuuid and
+// by-partlabel name a partition, which the installer would zap; by-diskseq
+// changes on every boot. Only by-id and by-path name the disk itself.
+func checkDiskLinkStyle(idx int, setName, dev string) error {
+	rest, ok := strings.CutPrefix(dev, "/dev/disk/")
+	if !ok {
+		return nil
+	}
+	dir, _, _ := strings.Cut(rest, "/")
+	switch dir {
+	case "by-id", "by-path":
+		return nil
+	case "by-uuid":
+		return fmt.Errorf(
+			"config_validation: %s: device %q is a by-uuid link, which names the filesystem on the disk, not the disk: partitioning removes it, so the next boot fails \"device not found\"; use the disk's /dev/disk/by-id or /dev/disk/by-path link or its kernel name",
+			setRef(idx, setName), dev)
+	default:
+		return fmt.Errorf(
+			"config_validation: %s: device %q is a /dev/disk/%s link, which does not name the whole disk stably across partitioning and reboots; use the disk's /dev/disk/by-id or /dev/disk/by-path link or its kernel name",
+			setRef(idx, setName), dev, dir)
+	}
 }
