@@ -213,6 +213,15 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 		return fmt.Errorf("config_validation: %s.save is only valid on a selection=discover set", pfx)
 	}
 
+	// persistent is a data-set guarantee. The osimage install wipes and
+	// rewrites the os root on every install while excluding /boot, so a
+	// "persistent" os set was neither protected nor rebuilt consistently.
+	if s.Persistent && s.Role != "data" {
+		return fmt.Errorf(
+			"config_validation: %s: persistent=true is only valid on a role=data set (the os set's root is rewritten by every osimage install, so it cannot be hands-off)",
+			setRef(idx, s.Name))
+	}
+
 	// A persistent set must be pinned to explicit devices: "hands-off" is a
 	// guarantee about specific disks, and a discover set has no devices to
 	// guarantee anything about until an installer run picks some. (Pin a

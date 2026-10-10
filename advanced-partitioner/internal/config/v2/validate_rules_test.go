@@ -372,3 +372,16 @@ func TestRuleDataSetMountpoints(t *testing.T) {
 		{"data-boot-like-path-ok", data(vol("d", "/boot-images", "xfs", "lvm", "100%")), ""},
 	})
 }
+
+func TestRulePersistentDataOnly(t *testing.T) {
+	runRuleCases(t, []ruleCase{
+		{"persistent-os-set", lay(set(osManual("os", "none", "/dev/sda")+`,"persistent":true`, espVol(), bootVol(), rootLV())),
+			`sets[0] (set "os"): persistent=true is only valid on a role=data set`},
+		{"persistent-os-set-raid1", lay(set(osManual("os", "1", "/dev/sda", "/dev/sdb")+`,"persistent":true`, espVol(), bootVol(), rootLV())),
+			`persistent=true is only valid on a role=data set`},
+		{"persistent-data-ok", osLayout(set(dataManual("data", "none", "/dev/sdb")+`,"persistent":true`, vol("d", "/d", "xfs", "lvm", "100%"))), ""},
+		{"persistent-data-only-layout-ok", lay(set(dataManual("data", "none", "/dev/sdb")+`,"persistent":true`, vol("d", "/d", "xfs", "lvm", "100%"))), ""},
+		{"persistent-data-discover", lay(set(`"name":"data","role":"data","selection":"discover","raid":"none","persistent":true`, vol("d", "/d", "xfs", "lvm", "100%"))),
+			"persistent=true requires selection=manual"},
+	})
+}
