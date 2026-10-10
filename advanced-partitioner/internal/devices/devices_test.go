@@ -15,6 +15,17 @@ func TestPartitionPath(t *testing.T) {
 		{"/dev/mmcblk0", "3"}:  "/dev/mmcblk0p3",
 		{"/dev/loop0", "1"}:    "/dev/loop0p1",
 		{"/dev/md0", "1"}:      "/dev/md0p1",
+		// The kernel rule (name ends in a digit -> "p"), for transports the
+		// old prefix list missed: they used to come out as nbd01, pmem01.
+		{"/dev/md127", "1"}: "/dev/md127p1",
+		{"/dev/nbd0", "1"}:  "/dev/nbd0p1",
+		{"/dev/pmem0", "2"}: "/dev/pmem0p2",
+		{"/dev/rbd0", "1"}:  "/dev/rbd0p1",
+		{"/dev/sdp", "1"}:   "/dev/sdp1",
+		{"/dev/sdaa", "3"}:  "/dev/sdaa3",
+		// udev's /dev/md/<name> partition links follow the same rule.
+		{"/dev/md/os", "1"}:    "/dev/md/os1",
+		{"/dev/md/data2", "1"}: "/dev/md/data2p1",
 		// udev persistent-name symlinks use a "-part<N>" suffix. Regression
 		// pin: appending a bare number produced "…pci-0000:03:00.02" which
 		// does not exist and broke single-disk manual-by-path OS mounts.

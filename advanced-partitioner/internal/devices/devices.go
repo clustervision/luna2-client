@@ -3,10 +3,12 @@
 // platform-specific drift between partition / raid / lvm / fs callers.
 //
 // Cross-platform notes:
-//   - Partition naming differs by transport. SCSI/SATA/virtio/IDE/Xen
-//     append a bare partition number (sda1, vda2, hda5). NVMe, MMC,
-//     loop, and md devices append `p<N>` (nvme0n1p1, mmcblk0p3, md0p1,
-//     loop3p1). PartitionPath covers both.
+//   - Partition naming follows the kernel's one rule (block/partitions/
+//     core.c, disk_name()): when the disk name ends in a digit the
+//     partition is "<disk>p<N>" (nvme0n1p1, mmcblk0p3, md127p1, loop3p1,
+//     nbd0p1, pmem0p1, rbd0p1), otherwise "<disk><N>" (sda1, vda2,
+//     hda5). PartitionPath implements that rule rather than a list of
+//     driver prefixes, so a transport nobody listed still gets it right.
 //   - LVM device-mapper names double any hyphen in the VG/LV name to
 //     disambiguate the dash that separates VG from LV. /dev/mapper/foo-bar
 //     could either be VG=foo + LV=bar or VG=foo-bar; LVM doubles internal
@@ -21,15 +23,17 @@ import "strings"
 //	PartitionPath("/dev/sda", 2)         -> "/dev/sda2"
 //	PartitionPath("/dev/nvme0n1", 1)     -> "/dev/nvme0n1p1"
 //	PartitionPath("/dev/mmcblk0", 3)     -> "/dev/mmcblk0p3"
-//	PartitionPath("/dev/md0", 1)         -> "/dev/md0p1"
-//	PartitionPath("/dev/loop3", 1)       -> "/dev/loop3p1"
+//	PartitionPath("/dev/md127", 1)       -> "/dev/md127p1"
+//	PartitionPath("/dev/nbd0", 1)        -> "/dev/nbd0p1"
+//	PartitionPath("/dev/pmem0", 1)       -> "/dev/pmem0p1"
 //	PartitionPath("/dev/vda", 1)         -> "/dev/vda1"
 //	PartitionPath("/dev/disk/by-path/pci-0000:03:00.0", 2)
 //	                                     -> "/dev/disk/by-path/pci-0000:03:00.0-part2"
 //	PartitionPath("/dev/disk/by-id/wwn-0x5000c50…", 1)
 //	                                     -> "/dev/disk/by-id/wwn-0x5000c50…-part1"
 //
-// Mirrors partition_path in /root/NEWTREE/lib/common.sh.
+// Mirrors partition_path in /root/NEWTREE/lib/common.sh, with the kernel's
+// digit rule in place of its driver list.
 func PartitionPath(disk string, n int) string {
 	// udev persistent-name symlinks (/dev/disk/by-path, by-id, by-uuid,
 	// by-partlabel, …) name partitions with a "-part<N>" suffix — never a
@@ -48,21 +52,21 @@ func PartitionPath(disk string, n int) string {
 	return disk + suffix + itoa(n)
 }
 
-// needsPPrefix returns true for device names that historically append
-// the partition number after a literal "p". Covered: nvme, mmcblk, loop,
-// md.
+// needsPPrefix applies the kernel rule: a disk whose name ends in a digit
+// separates the partition number with a literal "p", so the two numbers stay
+// apart (nvme0n1 + 1 = nvme0n1p1, not nvme0n11). The same rule names the
+// udev /dev/md/<name> partition links (63-md-raid-arrays.rules).
 //
 // Device-mapper paths (/dev/mapper/*, /dev/dm-*) are deliberately NOT
-// handled: dm partition naming has no reliable convention, so the v2
-// config validator refuses them as set devices before they can reach
-// this chokepoint (FTA v2 BE-N3 / CCF-8, barrier NB-4).
+// special-cased: dm partition naming has no reliable convention, so the v2
+// config validator refuses them as set devices before they can reach this
+// chokepoint (FTA v2 BE-N3 / CCF-8, barrier NB-4).
 func needsPPrefix(disk string) bool {
-	for _, prefix := range []string{"/dev/nvme", "/dev/mmcblk", "/dev/loop", "/dev/md"} {
-		if strings.HasPrefix(disk, prefix) {
-			return true
-		}
+	if disk == "" {
+		return false
 	}
-	return false
+	last := disk[len(disk)-1]
+	return last >= '0' && last <= '9'
 }
 
 // VGLVPath returns the /dev/mapper/ path for one LVM logical volume.

@@ -32,10 +32,11 @@ var (
 	// xvd[a-z]+ followed by a bare partition number.
 	scsiPartRE = regexp.MustCompile(`^(sd[a-z]+|vd[a-z]+|hd[a-z]+|xvd[a-z]+)(\d+)$`)
 
-	// NVMe / MMC / md / loop: <name><digits>(n<digits>)? followed by
-	// p<digits>. The optional `n<digits>` block covers nvme namespaces
-	// (nvme0n1) so partitions like nvme0n1p2 resolve to the right disk.
-	nvmePartRE = regexp.MustCompile(`^((?:nvme|mmcblk|md|loop)\d+(?:n\d+)?)p(\d+)$`)
+	// Any disk whose name ends in a digit takes a "p<N>" partition suffix
+	// (the kernel rule devices.PartitionPath implements): nvme0n1p2,
+	// mmcblk0p1, md127p1, loop3p1, nbd0p1, pmem0p1, rbd0p1. The digit
+	// before the "p" is what tells "sdp1" (partition 1 of sdp) apart.
+	nvmePartRE = regexp.MustCompile(`^([a-z][a-z0-9]*[0-9])p(\d+)$`)
 )
 
 // DiskBasename returns the whole-disk basename for a partition path:
