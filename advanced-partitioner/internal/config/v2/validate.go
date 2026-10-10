@@ -86,6 +86,9 @@ func (c *Config) validateRaw(raw []byte) error {
 			return err
 		}
 	}
+	if err := c.validateSetNameCollisions(); err != nil {
+		return err
+	}
 
 	// Cross-set device exclusivity (literal level). No device path may
 	// appear in more than one set: a duplicated device means one set's
@@ -176,6 +179,9 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 
 	if s.Name == "" {
 		return fmt.Errorf("config_validation: %s.name is required", pfx)
+	}
+	if err := validateSetName(idx, s.Name); err != nil {
+		return err
 	}
 
 	switch s.Role {
@@ -304,6 +310,13 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 		if err := s.Volumes[j].validate(idx, j, volRaw); err != nil {
 			return err
 		}
+		v := &s.Volumes[j]
+		if err := validateVolumeName(idx, s.Name, j, v.Name, v.Provider == "lvm"); err != nil {
+			return err
+		}
+	}
+	if err := s.validateVolumeNamesUnique(idx); err != nil {
+		return err
 	}
 
 	// volumes[].raid is not a thing — raid is a set property.
