@@ -289,6 +289,9 @@ function luna_finish () {
     # kill shell on tty2
     ps h t tty2 o pid | while read pid; do kill -9 $pid; done
 
+    # The pre-pivot guard (luna-pivot-guard.sh) boots /sysroot only when this
+    # exists: the installer reached its end, the root is complete.
+    : > /run/luna-install-finished
 }
 
 # The console the kernel uses last: the last console= on the command line is

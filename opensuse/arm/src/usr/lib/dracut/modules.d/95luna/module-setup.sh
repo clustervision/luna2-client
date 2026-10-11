@@ -155,4 +155,19 @@ install() {
 
     inst_hook cmdline 99 "$moddir/luna-parse-cmdline.sh"
     inst_hook initqueue/finished 99 "$moddir/luna2-start.sh"
+
+    # The installer runs inside dracut-initqueue.service on a systemd initramfs.
+    # systemd's default OOMPolicy=stop (v243+) stops that whole service as soon
+    # as the kernel OOM killer kills ANY of its processes -- in practice the
+    # decompressor of a memboot extract -- and the boot then goes on and
+    # switches root into the half-written /sysroot (Ubuntu 26.04 lab node, 11
+    # Oct 2026: a partly extracted RAM root booted with dbus and rsyslog
+    # failing). With continue the killed step fails like any other and the
+    # installer decides. systemd 239 (el8) ignores the unknown key.
+    mkdir -p "$initdir/etc/systemd/system/dracut-initqueue.service.d"
+    printf '[Service]\nOOMPolicy=continue\n' \
+        > "$initdir/etc/systemd/system/dracut-initqueue.service.d/luna-oom.conf"
+    # Last line of defence: never switch root into a /sysroot the installer
+    # did not finish (installer killed, or its service stopped).
+    inst_hook pre-pivot 00 "$moddir/luna-pivot-guard.sh"
 }
