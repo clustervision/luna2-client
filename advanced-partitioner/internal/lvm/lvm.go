@@ -138,6 +138,21 @@ func (b *Builder) Build(ctx context.Context, set *v2.Set, layout partition.Layou
 		CaptureStdout: true, CaptureStderr: true,
 	})
 
+	// Zero the start of the new PV device. A new md array or partition can
+	// start in the middle of what an earlier layout left on the disks: on
+	// the lab node a raid0 created over the members of a former raid6 began
+	// with fragments of the old LVM label, mda header and metadata text.
+	// blkid does not recognise those (so wipefs leaves them), but lvm2
+	// 2.03.14 (el8) parses them and crashes (SIGSEGV) in every pvcreate,
+	// pvs and vgchange -- the node retried for ever. LVM looks for its label
+	// in the first sectors only; 4 MiB also clears the old metadata area.
+	if _, err := b.o.Runner.Run(ctx, executor.CommandSpec{
+		Path: "dd", Args: []string{"if=/dev/zero", "of=" + pvDevice, "bs=1M", "count=4", "conv=fsync"},
+		CaptureStdout: true, CaptureStderr: true,
+	}); err != nil && b.o.Logger != nil {
+		b.o.Logger.Warn(fmt.Sprintf("zeroing the start of %s before pvcreate failed: %v", pvDevice, err))
+	}
+
 	if _, err := b.o.Runner.Run(ctx, executor.CommandSpec{
 		Path: "pvcreate", Args: []string{"-ff", "-y", pvDevice},
 		CaptureStdout: true, CaptureStderr: true,

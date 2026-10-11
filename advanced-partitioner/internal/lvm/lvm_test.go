@@ -61,11 +61,13 @@ func TestBuildHappyPathNoRAID(t *testing.T) {
 	}
 	// Verify order: defensive superblock clear (FTA D7 - a stale md 1.2
 	// superblock inside the re-created partition would otherwise be
-	// re-assembled by udev and hold the device busy), then pvcreate,
+	// re-assembled by udev and hold the device busy), the first 4 MiB
+	// zeroed (old LVM remnants crash lvm2 2.03.14), then pvcreate,
 	// vgcreate, fixed-size LVs in JSON order, 100% LV last.
 	want := []string{
 		"mdadm --zero-superblock /dev/sda3",
 		"wipefs -a /dev/sda3",
+		"dd if=/dev/zero of=/dev/sda3 bs=1M count=4 conv=fsync",
 		"pvcreate -ff -y /dev/sda3",
 		"pvs --noheadings -o vg_uuid,vg_name,pv_name",
 		"vgcreate os /dev/sda3",

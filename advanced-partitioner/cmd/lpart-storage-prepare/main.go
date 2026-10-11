@@ -408,8 +408,28 @@ func exitForError(stderr io.Writer, err error) int {
 	if errors.As(err, &fe) {
 		return cli.ExitFatalConfig(stderr, toolName, fe.reason, "%s", fe.msg)
 	}
+	if tool := lvmCrashed(err); tool != "" {
+		return cli.ExitSafetyRefusal(stderr, toolName, "lvm-crashed",
+			"%s was killed by a signal (%v): lvm2 itself crashed while reading the disks, which usually means damaged LVM metadata remnants on one of them (an lvm2 bug); it crashes the same way on every attempt -- find the device with `pvs -vvvv`, wipe its first MiBs, then retry; no further disk was touched", tool, err)
+	}
 	errln(stderr, "%v", err)
 	return 1
+}
+
+// lvmCrashed returns the lvm tool named in err when that tool was killed by a
+// signal (SIGSEGV, SIGABRT), or "". A crashing lvm2 crashes again on the next
+// attempt with the same disks, so retrying for ever helps nobody.
+func lvmCrashed(err error) string {
+	msg := err.Error()
+	if !strings.Contains(msg, "signal: ") {
+		return ""
+	}
+	for _, tool := range []string{"pvcreate", "vgcreate", "lvcreate", "vgchange", "vgremove", "pvremove", "lvremove", "pvs", "vgs", "lvs"} {
+		if strings.Contains(msg, tool+" ") || strings.Contains(msg, tool+":") {
+			return tool
+		}
+	}
+	return ""
 }
 
 // setProcessor bundles the per-set module instances so process() reads
