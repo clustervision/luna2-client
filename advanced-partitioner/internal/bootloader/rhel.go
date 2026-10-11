@@ -96,7 +96,9 @@ func detectKernelVersion(sysroot string) (string, error) {
 		if !e.IsDir() {
 			continue
 		}
-		all = append(all, e.Name())
+		if looksLikeKernelRelease(e.Name()) {
+			all = append(all, e.Name())
+		}
 		if hasKernelImage(sysroot, e.Name()) {
 			installed = append(installed, e.Name())
 		}
@@ -112,6 +114,16 @@ func detectKernelVersion(sysroot string) (string, error) {
 		return picked, nil
 	}
 	return "", fmt.Errorf("unable to determine target kernel version in %s/lib/modules", sysroot)
+}
+
+// looksLikeKernelRelease reports whether a /lib/modules entry can be a kernel
+// release (uname -r form: it starts with a digit). kernel-abi-stablelists
+// installs kabi-rhel90 ... kabi-rhelNN and a kabi-current link there, and
+// vendor kmod packages add similar trees; none is a kernel. Without a kernel
+// image to go by, the fallback used to rank those names with the real ones,
+// and dracut --kver kabi-rhel97 failed the UEFI finalisation.
+func looksLikeKernelRelease(name string) bool {
+	return name != "" && name[0] >= '0' && name[0] <= '9'
 }
 
 // runningKernelVersion is the version the installer itself is running. Package var
