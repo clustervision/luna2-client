@@ -19,12 +19,16 @@
 # finished. The installer runs in the initqueue (luna2-start.sh); when it stops
 # early -- killed (out of memory), or its service stopped by systemd -- dracut
 # carries on and would boot whatever /sysroot holds at that moment: a half
-# extracted image, or disks the installer was still writing. luna_finish
-# leaves /run/luna-install-finished as its last step. Without it the node
-# reports why and reboots for a new attempt (the next boot starts the
-# installer again; the controller log shows every such attempt).
+# extracted image, or disks the installer was still writing. The installer
+# leaves /run/luna-install-started when an install begins (root=luna) and
+# luna_finish /run/luna-install-finished as its last step. Started without
+# finished: the node reports why and reboots for a new attempt (the next boot
+# starts the installer again; the controller log shows every such attempt).
+# Any other boot -- an installed system whose own initramfs carries this
+# module, e.g. after a kernel update that ran dracut without --omit luna --
+# is left alone.
 
-if [ ! -e /run/luna-install-finished ]; then
+if [ -e /run/luna-install-started ] && [ ! -e /run/luna-install-finished ]; then
     luna_guard_msg() {
         echo "Luna2: ============================================================"
         echo "Luna2: INSTALL INCOMPLETE -- the installer stopped before it finished"

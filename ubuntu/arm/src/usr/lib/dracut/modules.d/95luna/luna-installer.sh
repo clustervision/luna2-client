@@ -630,6 +630,9 @@ function run_install_sh () {
 # exports it as $ROOT. Normalise so the same guard works under both frameworks.
 root="${root:-$ROOT}"
 if [ "x$root" = "xluna" ]; then
+    # An install starts in this boot: from now on the pre-pivot guard boots
+    # /sysroot only after luna_finish (luna-pivot-guard.sh).
+    : > /run/luna-install-started
     luna_init
     luna_start
     luna_ctty=$(_get_luna_ctty)
