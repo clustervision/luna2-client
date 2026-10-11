@@ -449,14 +449,17 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		},
 	}
 
+	// The kernel's OOM-kill count before the transfer: a download or extract
+	// the OOM killer stopped is told apart from a transient failure.
+	oom0 := oomKills()
+
 	// Classic path downloads NOW — payload in hand before the sysroot wipe.
 	// Streaming defers the transfer into the extract pipe below.
 	var cachePath string
 	if !streamWanted {
 		cachePath, err = osimage.Download(context.Background(), dopts)
 		if err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			return downloadFailure(stderr, err, oom0, fstype)
 		}
 	}
 
@@ -488,7 +491,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			if errors.As(serr, &ve) || strings.Contains(serr.Error(), "operator review required") {
 				return cli.ExitSafetyRefusal(stderr, toolName, "sync", "%v", serr)
 			}
-			return extractFailure(stderr, serr)
+			return extractFailure(stderr, serr, oom0, fstype, cachePath)
 		}
 		logger.KV("sync_members", res.Members)
 		logger.KV("sync_removed", res.Removed)
@@ -535,6 +538,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			ACLs:        acls,
 		})
 		if serr != nil {
+			if outOfMemory(oom0) {
+				// the classic path needs more RAM than the stream that ran out
+				return oomFailure(stderr, serr, fstype, "")
+			}
 			// Fall back to the classic path: PrepareSysroot is re-entrant and
 			// tar overwrites the partial tree, so a failed stream costs one
 			// full download, never a broken install.
@@ -554,8 +561,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			}
 			cachePath, err = osimage.Download(context.Background(), dopts)
 			if err != nil {
-				errln(stderr, "%v", err)
-				return 1
+				return downloadFailure(stderr, err, oom0, fstype)
 			}
 			streamWanted = false
 		}
@@ -570,7 +576,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			ACLs:        acls,
 			RemoveAfter: true,
 		}); err != nil {
-			return extractFailure(stderr, err)
+			return extractFailure(stderr, err, oom0, fstype, cachePath)
 		}
 	}
 
@@ -585,15 +591,91 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
-// extractFailure classifies a tar/sync failure: a full os filesystem fails the
-// same way on every retry (park, exit 3); anything else (a corrupt or
-// truncated download, a transient I/O error) may succeed on the next attempt.
-func extractFailure(stderr io.Writer, err error) int {
+// extractFailure classifies a tar/sync failure: a full os filesystem, or an
+// extract the kernel OOM killer stopped, fails the same way on every retry
+// (park, exit 3); anything else (a corrupt or truncated download, a transient
+// I/O error) may succeed on the next attempt.
+func extractFailure(stderr io.Writer, err error, oomBefore int64, fstype, cachePath string) int {
 	if strings.Contains(err.Error(), "No space left on device") {
 		return cli.ExitFatalConfig(stderr, toolName, "no-space", "%v -- the os filesystem is too small for the image (make the os set larger, or remove preserved data)", err)
 	}
+	if outOfMemory(oomBefore) {
+		return oomFailure(stderr, err, fstype, cachePath)
+	}
 	errln(stderr, "%v", err)
 	return 1
+}
+
+// downloadFailure: a download the OOM killer stopped (the tarball lands in
+// /tmp, which is RAM in the initramfs) parks; any other download failure is
+// retryable.
+func downloadFailure(stderr io.Writer, err error, oomBefore int64, fstype string) int {
+	if outOfMemory(oomBefore) {
+		return oomFailure(stderr, err, fstype, "")
+	}
+	errln(stderr, "%v", err)
+	return 1
+}
+
+// Kernel counters read by the out-of-memory classification (test seams).
+var (
+	procVmstat  = "/proc/vmstat"
+	procMeminfo = "/proc/meminfo"
+)
+
+// oomKills returns the number of processes the kernel OOM killer has killed
+// since boot (/proc/vmstat oom_kill, Linux 4.13+), or -1 when unknown.
+func oomKills() int64 {
+	return procField(procVmstat, "oom_kill")
+}
+
+// outOfMemory reports whether the OOM killer struck after before was read.
+func outOfMemory(before int64) bool {
+	return before >= 0 && oomKills() > before
+}
+
+// procField reads "<key> <number>" (vmstat) or "<key>: <number> kB"
+// (meminfo) from a /proc file; -1 when the file or the key is missing.
+func procField(path, key string) int64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || strings.TrimSuffix(f[0], ":") != key {
+			continue
+		}
+		var n int64
+		if _, err := fmt.Sscan(f[1], &n); err == nil {
+			return n
+		}
+	}
+	return -1
+}
+
+// oomFailure parks the node (exit 3): the same image on the same RAM runs out
+// of memory the same way on every attempt, so a retry loop only repeats the
+// download. On a systemd initramfs the killed step used to stop the whole
+// installer service, after which the node booted the half-written root; the
+// 95luna module now keeps the service running (OOMPolicy=continue), so the
+// failure reaches this classification.
+func oomFailure(stderr io.Writer, err error, fstype, cachePath string) int {
+	mem := ""
+	if kb := procField(procMeminfo, "MemTotal"); kb > 0 {
+		mem = fmt.Sprintf("; node RAM %d MiB", kb/1024)
+	}
+	if cachePath != "" {
+		if st, serr := os.Stat(cachePath); serr == nil {
+			mem += fmt.Sprintf(", tarball %d MiB in /tmp (RAM)", st.Size()>>20)
+		}
+	}
+	advice := "give the node more RAM, or use a smaller image"
+	if fstype == "tmpfs" {
+		advice = "memboot holds the whole extracted image in RAM, and with torrent as provision method the tarball as well until the extract ends: give the node more RAM, set provision_method http (memboot then streams the image without a copy in RAM), or use a smaller image"
+	}
+	return cli.ExitFatalConfig(stderr, toolName, "out-of-memory",
+		"%v -- the kernel ran out of memory and its OOM killer stopped the step%s; this fails the same way on every attempt: %s", err, mem, advice)
 }
 
 // findmntTargets returns a closure that runs `findmnt -rn -o TARGET`.
