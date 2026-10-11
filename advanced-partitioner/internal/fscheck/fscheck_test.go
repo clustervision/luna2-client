@@ -92,6 +92,9 @@ func assertNeverRepairsDestructively(t *testing.T, calls []executor.CommandSpec)
 		if c.Path != "xfs_repair" && c.Path != "e2fsck" && c.Path != "fsck.vfat" && c.Path != "fsck.fat" {
 			continue
 		}
+		if c.Path == "xfs_repair" && len(c.Args) == 1 && c.Args[0] == "-V" {
+			continue // version query: names no device, touches nothing
+		}
 		var checkOnly bool
 		for _, a := range c.Args {
 			if a == "-L" || a == "-y" || a == "-a" {
@@ -112,7 +115,7 @@ func assertNeverRepairsDestructively(t *testing.T, calls []executor.CommandSpec)
 // replay, which preserves committed data), never by xfs_repair -L.
 func TestCheckXFSDirtyLogReplaysJournalSafely(t *testing.T) {
 	s := &seqRunner{responses: map[string][]executor.FakeResponse{
-		"xfs_repair -n": {stubExit(2), stubExit(0)}, // dirty, then clean after replay
+		"xfs_repair -n": {stubExit(0)}, // clean once mount+umount replayed the log
 		"mount -t":      {stubExit(0)},
 		"umount":        {stubExit(0)},
 	}}
@@ -137,7 +140,7 @@ func TestCheckXFSDirtyLogReplaysJournalSafely(t *testing.T) {
 
 func TestCheckXFSUncleanAfterReplayIsUnhealthy(t *testing.T) {
 	s := &seqRunner{responses: map[string][]executor.FakeResponse{
-		"xfs_repair -n": {stubExit(2), stubExit(2)}, // dirty before AND after replay
+		"xfs_repair -n": {stubExit(2)}, // still unclean after the replay
 		"mount -t":      {stubExit(0)},
 		"umount":        {stubExit(0)},
 	}}

@@ -61,7 +61,6 @@ import (
 	"errors"
 	"fmt"
 	iofs "io/fs"
-	"os"
 	"os/exec"
 	"regexp"
 	"strings"
@@ -187,64 +186,66 @@ func (c *Checker) checkExt(ctx context.Context, device, fs string) Result {
 	}
 }
 
-// checkXFS runs xfs_repair -n (check only, no writes). A non-zero result
-// after a crash usually just means a dirty log; the SAFE recovery is the
-// filesystem's own journal replay — mount + umount — after which the check
-// is repeated. `xfs_repair -L` (zero the log) is deliberately absent: it
-// discards committed transactions and must never be a side effect of a
-// health probe (FTA BR-7 / MCS-4).
+// checkXFS replays the XFS log first (mount + umount, the filesystem's own
+// recovery, which keeps every committed transaction) and only then runs
+// xfs_repair -n (check only, no writes) on a filesystem whose log is clean.
+//
+// The other order failed on the lab nodes after a hard reset of a running
+// node (dirty log on the root LV): xfs_repair -n reads metadata the log
+// would still change and warns about "spurious inconsistencies"; el8 and
+// Ubuntu 22.04 xfsprogs crashed on them (SIGABRT, SIGSEGV), el9 xfsprogs hung
+// without output until the install step timed out. On a clean log the
+// mount + umount changes nothing.
+//
+// `xfs_repair -L` (zero the log) is deliberately absent: it discards
+// committed transactions and must never be a side effect of a health probe
+// (FTA BR-7 / MCS-4).
 func (c *Checker) checkXFS(ctx context.Context, device string) Result {
+	// a checker that cannot run must not cause a mount: probe the binary first
+	if res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
+		Path: "xfs_repair", Args: []string{"-V"},
+		CaptureStdout: true, CaptureStderr: true,
+	}); checkerUnavailable(res, err) {
+		return unavailable(device, "xfs", "xfs_repair", err)
+	}
+	mnt, err := c.replayMountDir()
+	if err != nil {
+		return Result{Device: device, FS: "xfs", OK: false,
+			Reason: fmt.Sprintf("no journal-replay mountpoint for %s: %v", device, err)}
+	}
+	_, mountErr := c.o.Runner.Run(ctx, executor.CommandSpec{
+		Path: "mount", Args: []string{"-t", "xfs", device, mnt},
+		CaptureStdout: true, CaptureStderr: true,
+	})
+	if mountErr == nil {
+		_, _ = c.o.Runner.Run(ctx, executor.CommandSpec{
+			Path: "umount", Args: []string{mnt},
+			CaptureStdout: true, CaptureStderr: true,
+		})
+	}
 	res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
 		Path: "xfs_repair", Args: []string{"-n", device},
 		CaptureStdout: true, CaptureStderr: true,
 	})
-	rc := exitCode(res, err)
 	if checkerUnavailable(res, err) {
-		// xfs_repair -n on a filesystem with a dirty log (a running node
-		// that was hard reset) reads metadata the log would still change and
-		// can crash on those "spurious inconsistencies" it warns about itself
-		// (lab: SIGABRT on el8 xfsprogs 5.0, SIGSEGV on Ubuntu 5.13). That
-		// crash is not "checker unavailable": the log is the cause, so replay
-		// it exactly as for rc 1 and check again.
-		if rc != -1 || !dirtyXFSLog(res) {
-			return unavailable(device, "xfs", "xfs_repair", err)
+		if mountErr != nil && exitCode(res, err) == -1 && dirtyXFSLog(res) {
+			// the log could not be replayed (the mount failed) and the
+			// check crashed on it: this filesystem does not come up
+			return Result{Device: device, FS: "xfs", OK: false,
+				Reason: fmt.Sprintf("%s does not mount (journal replay failed: %v) and xfs_repair -n crashed on its dirty log (NOT running xfs_repair -L -- operator decision)", device, mountErr)}
 		}
-		c.warn("xfs_repair -n crashed on %s while the log was dirty (%v)", device, err)
-	} else if rc == 0 {
-		c.log("xfs_repair -n OK: %s", device)
-		return Result{Device: device, FS: "xfs", OK: true}
-	}
-
-	// Journal replay via mount/umount, then re-check once.
-	c.warn("xfs_repair -n rc=%d on %s; attempting safe journal replay (mount+umount)", rc, device)
-	mnt, err := c.replayMountDir()
-	if err != nil {
-		return Result{Device: device, FS: "xfs", OK: false,
-			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s and no replay mountpoint: %v", rc, device, err)}
-	}
-	if _, err := c.o.Runner.Run(ctx, executor.CommandSpec{
-		Path: "mount", Args: []string{"-t", "xfs", device, mnt},
-		CaptureStdout: true, CaptureStderr: true,
-	}); err != nil {
-		return Result{Device: device, FS: "xfs", OK: false,
-			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s; journal-replay mount failed: %v (NOT running xfs_repair -L — operator decision)", rc, device, err)}
-	}
-	_, _ = c.o.Runner.Run(ctx, executor.CommandSpec{
-		Path: "umount", Args: []string{mnt},
-		CaptureStdout: true, CaptureStderr: true,
-	})
-	res, err = c.o.Runner.Run(ctx, executor.CommandSpec{
-		Path: "xfs_repair", Args: []string{"-n", device},
-		CaptureStdout: true, CaptureStderr: true,
-	})
-	if checkerUnavailable(res, err) {
 		return unavailable(device, "xfs", "xfs_repair", err)
 	}
-	if rc2 := exitCode(res, err); rc2 != 0 {
+	rc := exitCode(res, err)
+	switch {
+	case mountErr != nil:
 		return Result{Device: device, FS: "xfs", OK: false,
-			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s after journal replay (NOT running xfs_repair -L — operator decision)", rc2, device)}
+			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s; journal-replay mount failed: %v (NOT running xfs_repair -L -- operator decision)", rc, device, mountErr)}
+	case rc != 0:
+		return Result{Device: device, FS: "xfs", OK: false,
+			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s after journal replay (NOT running xfs_repair -L -- operator decision)", rc, device)}
 	}
-	c.log("xfs journal replayed, xfs_repair -n OK: %s", device)
+	c.log("xfs journal replayed (mount+umount), xfs_repair -n OK: %s", device)
 	return Result{Device: device, FS: "xfs", OK: true}
 }
 
@@ -286,8 +287,13 @@ func (c *Checker) replayMountDir() (string, error) {
 	if c.o.MountDir != "" {
 		return c.o.MountDir, nil
 	}
+	// created through the runner like every other command (the replay now
+	// runs on every XFS check, so the fake runners of the tests must see it)
 	dir := "/run/lpart-fscheck-replay"
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if _, err := c.o.Runner.Run(context.Background(), executor.CommandSpec{
+		Path: "mkdir", Args: []string{"-p", "-m", "0700", dir},
+		CaptureStdout: true, CaptureStderr: true,
+	}); err != nil {
 		return "", err
 	}
 	return dir, nil
