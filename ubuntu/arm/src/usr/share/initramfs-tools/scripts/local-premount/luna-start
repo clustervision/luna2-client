@@ -181,7 +181,9 @@ luna_finish() {
                 ip link set dev $iface down
             done
     fi
-    mv /tmp/luna_install.log /sysroot/var/log/
+    # initramfs-tools mounts the new root at $rootmnt (/root), not /sysroot:
+    # the move to /sysroot failed on every node and the log was lost
+    mv /tmp/luna_install.log "${rootmnt:-/root}/var/log/"
     # kill shell on tty2
     ps h t tty2 o pid | while read pid; do kill -9 $pid; done
 
