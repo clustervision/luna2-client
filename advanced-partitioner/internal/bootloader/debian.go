@@ -33,11 +33,11 @@ func (a *debianAdapter) Family() Family { return FamilyDebian }
 func (a *debianAdapter) Prepare(_ context.Context) error {
 	sysroot := a.deps.BootContext.Sysroot
 	// Initramfs generator: update-initramfs (initramfs-tools) OR dracut. Which
-	// one an Ubuntu image carries depends on the release: 26.04/resolute keeps
-	// initramfs-tools-core alongside dracut, but 24.04/noble's `dracut` package
-	// Conflicts initramfs-tools and removes it (dracut installed so luna can
-	// pack the 95luna netboot initramfs). Accept either — RegenerateInitramfs
-	// dispatches on whichever is present.
+	// one an Ubuntu image carries depends on the release: 22.04 and 24.04
+	// images use initramfs-tools; on 26.04/resolute dracut is the generator and
+	// its package ships an update-initramfs wrapper (initramfs-tools is not
+	// installed). Accept either — RegenerateInitramfs dispatches on which
+	// generator the image really uses.
 	if !a.hasUpdateInitramfs() && !a.hasDracut() {
 		return imageErrorf("image-missing-tool", "missing required command: update-initramfs or dracut")
 	}
@@ -63,20 +63,27 @@ func (a *debianAdapter) hasDracut() bool {
 	return anyExist(a.deps.BootContext.Sysroot, "usr/bin/dracut", "usr/sbin/dracut")
 }
 
-// RegenerateInitramfs regenerates the INSTALLED system's initramfs with
-// whichever generator the image ships: `update-initramfs -u -k all`
-// (initramfs-tools, Debian-native) when present, else `dracut -f --omit luna
-// --kver <kver>` for every bootable kernel — identical to the RHEL/SUSE path —
-// for dracut-only images
-// (e.g. Ubuntu 24.04, whose dracut package displaced initramfs-tools). Omit
-// the luna module: it is only for the netboot install initramfs, never the
-// installed system's.
+// hasInitramfsTools: the image's generator is initramfs-tools itself
+// (initramfs-tools-core always ships hook-functions; dracut's update-initramfs
+// wrapper does not).
+func (a *debianAdapter) hasInitramfsTools() bool {
+	return anyExist(a.deps.BootContext.Sysroot, "usr/share/initramfs-tools/hook-functions")
+}
+
+// RegenerateInitramfs regenerates the INSTALLED system's initramfs with the
+// generator the image uses: `update-initramfs -u -k all` for initramfs-tools
+// (or an image without dracut), else `dracut -f --omit luna --kver <kver>` for
+// every bootable kernel — identical to the RHEL/SUSE path. Omit the luna
+// module: it is only for the netboot install initramfs, never the installed
+// system's. On Ubuntu 26.04 update-initramfs is dracut's wrapper, which builds
+// without --omit luna: the installed system's initramfs then carried the Luna
+// install module (with the controller's ssh key and the lpart tools).
 func (a *debianAdapter) RegenerateInitramfs(ctx context.Context) error {
 	sysroot := a.deps.BootContext.Sysroot
 	if err := removeImageLVMDevicesFile(a.deps); err != nil {
 		return err
 	}
-	if a.hasUpdateInitramfs() {
+	if a.hasUpdateInitramfs() && (a.hasInitramfsTools() || !a.hasDracut()) {
 		if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
 			Path: "/usr/bin/env", Chroot: sysroot,
 			Args:          []string{"update-initramfs", "-u", "-k", "all"},
@@ -86,7 +93,7 @@ func (a *debianAdapter) RegenerateInitramfs(ctx context.Context) error {
 		}
 		return nil
 	}
-	// dracut-only image: every bootable kernel, as on RHEL. GRUB_DEFAULT=0 is
+	// dracut image: every bootable kernel, as on RHEL. GRUB_DEFAULT=0 is
 	// update-grub's newest entry, so the default is the newest kernel here.
 	_, err := dracutAllKernels(ctx, a.deps, false)
 	return err

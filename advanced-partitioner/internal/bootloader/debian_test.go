@@ -452,3 +452,40 @@ func TestEnsureSignedPairStagedMissingSources(t *testing.T) {
 		t.Fatalf("rhel: pre-stage must not error (empty source row): %v", err)
 	}
 }
+
+// Ubuntu 26.04: dracut is the generator and its package ships an
+// update-initramfs wrapper, initramfs-tools is not installed. The wrapper
+// builds without --omit luna, so the installed system's initramfs carried the
+// Luna install module; lpart now calls dracut itself, with --omit luna.
+func TestDebianRegenerateInitramfsDracutWrapper(t *testing.T) {
+	sysroot := stageDebianSysroot(t, false) // has usr/sbin/update-initramfs
+	mustWriteFile(t, filepath.Join(sysroot, "usr/bin/dracut"), "")
+	if err := os.MkdirAll(filepath.Join(sysroot, "lib/modules/7.0.0-14-generic"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	a := &debianAdapter{deps: AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot}}}
+	if err := a.RegenerateInitramfs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.Calls()
+	if len(calls) != 1 || strings.Join(calls[0].Args, " ") != "dracut -f --omit luna --kver 7.0.0-14-generic" {
+		t.Fatalf("calls = %+v", calls)
+	}
+}
+
+// An image with initramfs-tools AND dracut keeps using initramfs-tools.
+func TestDebianRegenerateInitramfsPrefersInitramfsTools(t *testing.T) {
+	sysroot := stageDebianSysroot(t, false)
+	mustWriteFile(t, filepath.Join(sysroot, "usr/bin/dracut"), "")
+	mustWriteFile(t, filepath.Join(sysroot, "usr/share/initramfs-tools/hook-functions"), "")
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	a := &debianAdapter{deps: AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot}}}
+	if err := a.RegenerateInitramfs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.Calls()
+	if len(calls) != 1 || strings.Join(calls[0].Args, " ") != "update-initramfs -u -k all" {
+		t.Fatalf("calls = %+v", calls)
+	}
+}
