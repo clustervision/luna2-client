@@ -610,7 +610,7 @@ func (sp *setProcessor) process(ctx context.Context, p plannedSet, detectedFirmw
 			// damaged disk looped "retrying in 30s" for ever). Park for an
 			// operator: safety refusal, exit 2.
 			return result.StorageResult{}, result.ResolvedSet{}, safetyRefusalf("mount-existing",
-				"set %q: the existing layout cannot be mounted (%v); it is not repartitioned in this mode -- operator review required (install_mode full rebuilds the set)", set.Name, err)
+				"set %q: the existing layout cannot be mounted (%v); %s", set.Name, err, mountExistingAdvice(set))
 		}
 		res := result.Assemble(result.AssembleInput{
 			Set: set, FirmwareMode: firmwareMode,
@@ -693,6 +693,17 @@ func (sp *setProcessor) process(ctx context.Context, p plannedSet, detectedFirmw
 // existing os-set layout, as the partition builder numbered them: the BIOS
 // boot partition (EF02) is partition 1 when the disk has one, and the ESP
 // follows it (Set.PartitionNumber). 0 = none.
+// mountExistingAdvice is the operator hint of a mount-existing refusal. A
+// persistent set is never repartitioned or formatted, in any mode: pointing
+// at install_mode full (which the node may already run) sent the operator in
+// a circle.
+func mountExistingAdvice(set *v2.Set) string {
+	if set.Persistent {
+		return "a persistent set is never repartitioned or formatted, in any install_mode -- operator review required: check its disks and that the layout names the disks that hold it, or remove \"persistent\" from the set so install_mode full recreates it (its data is then lost)"
+	}
+	return "it is not repartitioned in this mode -- operator review required (install_mode full rebuilds the set)"
+}
+
 func existingBootPartitions(set *v2.Set, biosBoot bool) (esp, bios int) {
 	if set.Role != "os" {
 		return 0, 0
