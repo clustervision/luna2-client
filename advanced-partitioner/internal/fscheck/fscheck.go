@@ -198,11 +198,19 @@ func (c *Checker) checkXFS(ctx context.Context, device string) Result {
 		Path: "xfs_repair", Args: []string{"-n", device},
 		CaptureStdout: true, CaptureStderr: true,
 	})
-	if checkerUnavailable(res, err) {
-		return unavailable(device, "xfs", "xfs_repair", err)
-	}
 	rc := exitCode(res, err)
-	if rc == 0 {
+	if checkerUnavailable(res, err) {
+		// xfs_repair -n on a filesystem with a dirty log (a running node
+		// that was hard reset) reads metadata the log would still change and
+		// can crash on those "spurious inconsistencies" it warns about itself
+		// (lab: SIGABRT on el8 xfsprogs 5.0, SIGSEGV on Ubuntu 5.13). That
+		// crash is not "checker unavailable": the log is the cause, so replay
+		// it exactly as for rc 1 and check again.
+		if rc != -1 || !dirtyXFSLog(res) {
+			return unavailable(device, "xfs", "xfs_repair", err)
+		}
+		c.warn("xfs_repair -n crashed on %s while the log was dirty (%v)", device, err)
+	} else if rc == 0 {
 		c.log("xfs_repair -n OK: %s", device)
 		return Result{Device: device, FS: "xfs", OK: true}
 	}
@@ -238,6 +246,13 @@ func (c *Checker) checkXFS(ctx context.Context, device string) Result {
 	}
 	c.log("xfs journal replayed, xfs_repair -n OK: %s", device)
 	return Result{Device: device, FS: "xfs", OK: true}
+}
+
+// dirtyXFSLog reports whether xfs_repair's output says the log holds
+// changes it ignored because of -n (the filesystem was not unmounted).
+func dirtyXFSLog(res executor.CommandResult) bool {
+	out := string(res.Stderr) + string(res.Stdout)
+	return strings.Contains(out, "metadata changes in a log")
 }
 
 // checkVfat runs the chosen FAT checker with -n (check only). rc 0 is
