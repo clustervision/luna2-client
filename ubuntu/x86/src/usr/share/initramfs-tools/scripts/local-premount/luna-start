@@ -241,6 +241,42 @@ fetch_token() {
     fi
 }
 
+# lpart leaves the reason for a refused or failed install here. The dracut hook
+# (95luna/luna-installer.sh) prints the same file in the same words; keep them in step.
+LUNA_FAILURE_FILE=/tmp/install_files/logs/last-failure.txt
+LUNA_FATAL_RC=3   # keep in sync with lpart-node-installer exitFatalConfig
+LUNA_SAFETY_RC=2  # keep in sync with internal/cli ExitSafetyRefusal
+
+print_failure_reason() {
+    [ -s "$LUNA_FAILURE_FILE" ] || return 0
+    echo "Luna2: Reason:"
+    head -n 15 "$LUNA_FAILURE_FILE" | sed 's/^/Luna2:   /'
+}
+
+# A safety refusal or a configuration error recurs on every attempt, so the node is
+# parked in a shell on the console instead of reinstalling in a loop. Never returns.
+fatal_park() {
+    local rc="$1"
+    echo ""
+    echo "Luna2: ============================================================"
+    echo "Luna2: INSTALL FAILED FATALLY (exit ${rc}) -- NOT retrying."
+    print_failure_reason
+    if [ "$rc" = "$LUNA_SAFETY_RC" ]; then
+        echo "Luna2: Exit ${rc} is a safety refusal: lpart declined to touch the disk;"
+        echo "Luna2: the reason is above. Fix the layout or the node's data, then boot."
+    else
+        echo "Luna2: Exit ${rc} is a non-retryable configuration or safety error from an"
+        echo "Luna2: install step; the reason is above. It would recur on every attempt,"
+        echo "Luna2: so the node is parked instead of reinstalling in a loop."
+    fi
+    echo "Luna2: Logs: /tmp/luna_install.log"
+    echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
+    echo "Luna2: ============================================================"
+    while true; do
+        setsid -c /bin/sh -i -l 0<>$luna_ctty 1<>$luna_ctty 2<>$luna_ctty
+    done
+}
+
 if [ "x$ROOT" = "xluna" ]; then
     luna_init
     luna_start
@@ -273,11 +309,20 @@ if [ "x$ROOT" = "xluna" ]; then
                     sleep 10
                 fi
             done
-            /bin/bash /lunatmp/install.sh && RES="success"
-            echo "Luna2: install.sh exit status: $RES"
+            /bin/bash /lunatmp/install.sh
+            rc=$?
+            [ "$rc" = "0" ] && RES="success"
+            echo "Luna2: install.sh exit status: $RES (rc=$rc)"
             if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
                 cat /tmp/luna_install.log | logger -d -n $luna_loghost
                 echo -n '' > /tmp/luna_install.log
+            fi
+            if [ "$RES" != "success" ]; then
+                if [ "$rc" = "$LUNA_FATAL_RC" ] || [ "$rc" = "$LUNA_SAFETY_RC" ]; then
+                    fatal_park "$rc"   # never returns
+                fi
+                print_failure_reason
+                echo "Luna2: Exit ${rc}: a retryable failure; the reason is above. Retrying in 10s."
             fi
             sleep 10
         done
