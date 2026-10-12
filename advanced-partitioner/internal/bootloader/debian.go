@@ -34,10 +34,10 @@ func (a *debianAdapter) Prepare(_ context.Context) error {
 	sysroot := a.deps.BootContext.Sysroot
 	// Initramfs generator: update-initramfs (initramfs-tools) OR dracut. Which
 	// one an Ubuntu image carries depends on the release: 22.04 and 24.04
-	// images use initramfs-tools; on 26.04/resolute dracut is the generator and
-	// its package ships an update-initramfs wrapper (initramfs-tools is not
-	// installed). Accept either — RegenerateInitramfs dispatches on which
-	// generator the image really uses.
+	// images use initramfs-tools; on 26.04/resolute dracut is the generator --
+	// initramfs-tools-core stays installed, but update-initramfs itself is the
+	// dracut package's wrapper. Accept either — RegenerateInitramfs dispatches
+	// on which generator the image really uses.
 	if !a.hasUpdateInitramfs() && !a.hasDracut() {
 		return imageErrorf("image-missing-tool", "missing required command: update-initramfs or dracut")
 	}
@@ -63,11 +63,19 @@ func (a *debianAdapter) hasDracut() bool {
 	return anyExist(a.deps.BootContext.Sysroot, "usr/bin/dracut", "usr/sbin/dracut")
 }
 
-// hasInitramfsTools: the image's generator is initramfs-tools itself
-// (initramfs-tools-core always ships hook-functions; dracut's update-initramfs
-// wrapper does not).
-func (a *debianAdapter) hasInitramfsTools() bool {
-	return anyExist(a.deps.BootContext.Sysroot, "usr/share/initramfs-tools/hook-functions")
+// updateInitramfsIsDracut: the image's update-initramfs is the dracut
+// package's wrapper (Ubuntu 26.04: "adapted for dracut", it runs dracut). The
+// initramfs-tools script never mentions dracut. Package ownership is no
+// signal: 26.04 keeps initramfs-tools-core (hook-functions, mkinitramfs)
+// installed next to dracut.
+func (a *debianAdapter) updateInitramfsIsDracut() bool {
+	for _, rel := range []string{"usr/sbin/update-initramfs", "usr/bin/update-initramfs"} {
+		b, err := os.ReadFile(filepath.Join(a.deps.BootContext.Sysroot, rel))
+		if err == nil {
+			return strings.Contains(string(b), "dracut")
+		}
+	}
+	return false
 }
 
 // RegenerateInitramfs regenerates the INSTALLED system's initramfs with the
@@ -83,7 +91,7 @@ func (a *debianAdapter) RegenerateInitramfs(ctx context.Context) error {
 	if err := removeImageLVMDevicesFile(a.deps); err != nil {
 		return err
 	}
-	if a.hasUpdateInitramfs() && (a.hasInitramfsTools() || !a.hasDracut()) {
+	if a.hasUpdateInitramfs() && !(a.hasDracut() && a.updateInitramfsIsDracut()) {
 		if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
 			Path: "/usr/bin/env", Chroot: sysroot,
 			Args:          []string{"update-initramfs", "-u", "-k", "all"},

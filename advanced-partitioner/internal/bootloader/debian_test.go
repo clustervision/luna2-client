@@ -453,13 +453,16 @@ func TestEnsureSignedPairStagedMissingSources(t *testing.T) {
 	}
 }
 
-// Ubuntu 26.04: dracut is the generator and its package ships an
-// update-initramfs wrapper, initramfs-tools is not installed. The wrapper
+// Ubuntu 26.04: dracut is the generator; initramfs-tools-core (hook-functions)
+// stays installed, but update-initramfs is the dracut package's wrapper, which
 // builds without --omit luna, so the installed system's initramfs carried the
-// Luna install module; lpart now calls dracut itself, with --omit luna.
+// Luna install module. lpart now calls dracut itself, with --omit luna.
 func TestDebianRegenerateInitramfsDracutWrapper(t *testing.T) {
-	sysroot := stageDebianSysroot(t, false) // has usr/sbin/update-initramfs
+	sysroot := stageDebianSysroot(t, false)
+	mustWriteFile(t, filepath.Join(sysroot, "usr/sbin/update-initramfs"),
+		"#!/bin/sh\n# Taken from initramfs-tools and adapted for dracut by Benjamin Drung.\ndracut ${OPTS} --force \"${initramfs}\" \"${version}\"\n")
 	mustWriteFile(t, filepath.Join(sysroot, "usr/bin/dracut"), "")
+	mustWriteFile(t, filepath.Join(sysroot, "usr/share/initramfs-tools/hook-functions"), "")
 	if err := os.MkdirAll(filepath.Join(sysroot, "lib/modules/7.0.0-14-generic"), 0o750); err != nil {
 		t.Fatal(err)
 	}
@@ -474,11 +477,13 @@ func TestDebianRegenerateInitramfsDracutWrapper(t *testing.T) {
 	}
 }
 
-// An image with initramfs-tools AND dracut keeps using initramfs-tools.
+// initramfs-tools' own update-initramfs keeps being used, also when dracut
+// (or only dracut-install, as on the 24.04 lab image) is present too.
 func TestDebianRegenerateInitramfsPrefersInitramfsTools(t *testing.T) {
 	sysroot := stageDebianSysroot(t, false)
+	mustWriteFile(t, filepath.Join(sysroot, "usr/sbin/update-initramfs"),
+		"#!/bin/sh\n# Copyright (C) 2005-2011 maximilian attems\nmkinitramfs -o \"${initramfs}\" \"${version}\"\n")
 	mustWriteFile(t, filepath.Join(sysroot, "usr/bin/dracut"), "")
-	mustWriteFile(t, filepath.Join(sysroot, "usr/share/initramfs-tools/hook-functions"), "")
 	f := executor.NewFakeRunner(executor.FakeResponse{})
 	a := &debianAdapter{deps: AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot}}}
 	if err := a.RegenerateInitramfs(context.Background()); err != nil {
