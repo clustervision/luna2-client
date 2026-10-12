@@ -17,29 +17,33 @@ func calls(f *executor.FakeRunner) []string {
 	return out
 }
 
-// stubBlank pins the read-back seam for a test and restores it after.
+// stubBlank pins both read-back seams (whole device after a discard, samples
+// after a zero-out) for a test and restores them after.
 func stubBlank(t *testing.T, blank bool, err error) {
 	t.Helper()
-	orig := readBlankFn
+	origS, origW := readBlankFn, readWholeFn
 	readBlankFn = func(string) (bool, error) { return blank, err }
-	t.Cleanup(func() { readBlankFn = orig })
+	readWholeFn = func(context.Context, string, func(string, ...any)) (bool, error) { return blank, err }
+	t.Cleanup(func() { readBlankFn, readWholeFn = origS, origW })
 }
 
 // stubBlankSeq returns the given read-back results in order (discard check,
-// then zero-out check).
+// then zero-out check), whichever seam asks.
 func stubBlankSeq(t *testing.T, results ...bool) {
 	t.Helper()
-	orig := readBlankFn
+	origS, origW := readBlankFn, readWholeFn
 	i := 0
-	readBlankFn = func(string) (bool, error) {
+	next := func() bool {
 		r := results[len(results)-1]
 		if i < len(results) {
 			r = results[i]
 		}
 		i++
-		return r, nil
+		return r
 	}
-	t.Cleanup(func() { readBlankFn = orig })
+	readBlankFn = func(string) (bool, error) { return next(), nil }
+	readWholeFn = func(context.Context, string, func(string, ...any)) (bool, error) { return next(), nil }
+	t.Cleanup(func() { readBlankFn, readWholeFn = origS, origW })
 }
 
 func TestEraseDiskBlkdiscardHappyPath(t *testing.T) {

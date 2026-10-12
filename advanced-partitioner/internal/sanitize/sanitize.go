@@ -5,15 +5,17 @@
 // exactly what it did to each disk.
 //
 // Erase strategy per disk, in order; every step that reports success is
-// verified by reading samples back (start, middle, end must be zero):
+// verified by reading the disk back:
 //
 //  1. blkdiscard             — discard every block; on SSD/NVMe/thin-provisioned
 //     devices this is the fast path. Advisory: a device may claim success and
-//     keep the data, hence the read-back.
+//     keep the data, or honour only part of the range, hence the read-back of
+//     the WHOLE device (a discarded range reads back fast, as zeroes).
 //  2. blkdiscard -z          — zero-out: the kernel writes zeroes over the whole
 //     device (WRITE ZEROES / WRITE SAME where the device offers it, plain
 //     writes otherwise). Works on every block device, including rotational
-//     disks and virtio; it takes as long as writing the disk once.
+//     disks and virtio; it takes as long as writing the disk once. Verified by
+//     samples (start, middle, end): a write is not advisory.
 //  3. neither verified       — the disk is NOT reported erased: signatures and
 //     the partition table are still cleared (wipefs -a + sgdisk --zap-all) to
 //     limit the damage, and EraseDisk returns an error so the node parks for an
@@ -28,10 +30,12 @@
 package sanitize
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
@@ -116,15 +120,17 @@ func (s *Sanitizer) EraseDisk(ctx context.Context, disk string) (Result, error) 
 		// hypervisor/firmware silently ignored the unmap (seen live on
 		// qcow2-backed virtio: "blkdiscard succeeded" with the filesystem
 		// fully intact — a FALSE SANITIZE, the worst possible outcome for
-		// tenant turnover). Trust nothing: read back samples and require
-		// zeroes before reporting the disk erased.
-		if blank, verr := s.readsBackBlank(disk); verr == nil && blank {
-			s.info("%s: blkdiscard succeeded (blocks discarded, read-back verified blank)", disk)
+		// tenant turnover), or honour only part of the range (lab, 12 Oct
+		// 2026: the three 1 MiB samples read back zero while data was left
+		// next to the middle sample). Trust nothing: read the WHOLE device
+		// back and require zeroes before reporting the disk erased.
+		if blank, verr := s.readsBackBlankWhole(ctx, disk); verr == nil && blank {
+			s.info("%s: blkdiscard succeeded (blocks discarded, the whole device read back blank)", disk)
 			return Result{Disk: disk, Method: "blkdiscard", Discarded: true}, nil
 		} else if verr != nil {
 			s.warn("%s: blkdiscard reported success but read-back verification failed (%v); zero-filling the device", disk, verr)
 		} else {
-			s.warn("%s: blkdiscard reported success but data persists (advisory discard ignored by the device); zero-filling the device", disk)
+			s.warn("%s: blkdiscard reported success but data persists (the device ignored the discard or honoured only part of it); zero-filling the device", disk)
 		}
 	} else {
 		s.warn("%s: blkdiscard unsupported/failed (%v); zero-filling the device", disk, err)
@@ -165,14 +171,73 @@ func (s *Sanitizer) EraseDisk(ctx context.Context, disk string) (Result, error) 
 // and GPT live at the edges) and a partially-honoured one.
 const verifySampleMiB = 1
 
-// readBlankFn is a test seam: it defaults to sampling the real block device.
-var readBlankFn = readsBackBlankDevice
+// readBlankFn and readWholeFn are test seams: they default to sampling and
+// to reading the whole real block device.
+var (
+	readBlankFn = readsBackBlankDevice
+	readWholeFn = readsBackBlankWholeDevice
+)
 
 func (s *Sanitizer) readsBackBlank(disk string) (bool, error) {
 	if s.readBack != nil {
 		return s.readBack(disk)
 	}
 	return readBlankFn(disk)
+}
+
+func (s *Sanitizer) readsBackBlankWhole(ctx context.Context, disk string) (bool, error) {
+	if s.readBack != nil {
+		return s.readBack(disk)
+	}
+	return readWholeFn(ctx, disk, s.info)
+}
+
+// wholeReadChunk is the read size of the whole-device verification.
+const wholeReadChunk = 8 << 20
+
+// readsBackBlankWholeDevice reads the device from start to end and reports
+// whether every byte is zero; the first non-zero offset is logged. Progress is
+// logged once a minute (a discarded range reads back at the device's full
+// speed; a multi-TB disk still takes minutes).
+func readsBackBlankWholeDevice(ctx context.Context, disk string, info func(string, ...any)) (bool, error) {
+	f, err := os.Open(disk) //nolint:gosec // fully-qualified disk path resolved by the caller
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = f.Close() }()
+	size, err := f.Seek(0, io.SeekEnd)
+	if err != nil {
+		return false, err
+	}
+	buf := make([]byte, wholeReadChunk)
+	zero := make([]byte, wholeReadChunk)
+	last := time.Now()
+	for off := int64(0); off < size; {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		n, rerr := f.ReadAt(buf, off)
+		if n > 0 && !bytes.Equal(buf[:n], zero[:n]) {
+			first := 0
+			for first < n && buf[first] == 0 {
+				first++
+			}
+			info("%s: read-back found data at offset %d of %d", disk, off+int64(first), size)
+			return false, nil
+		}
+		off += int64(n)
+		if rerr == io.EOF || n == 0 {
+			break
+		}
+		if rerr != nil {
+			return false, rerr
+		}
+		if time.Since(last) >= time.Minute {
+			info("%s: read-back %d%% (%d of %d MiB)", disk, off*100/size, off>>20, size>>20)
+			last = time.Now()
+		}
+	}
+	return true, nil
 }
 
 func readsBackBlankDevice(disk string) (bool, error) {
