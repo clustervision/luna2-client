@@ -1,6 +1,6 @@
 #!/bin/sh
 
-if [ $UID != 0 ] && [ -z "`which fakeroot`" ]; then
+if [ "$(id -u)" != 0 ] && [ -z "`which fakeroot`" ]; then
     echo Please install fakeroot first, or run this script as root!
     exit 1
 fi
