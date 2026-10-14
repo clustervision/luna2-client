@@ -146,7 +146,12 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 			}
 		}
 		if vol.FS != "" {
-			res := checker.CheckFS(ctx, device, vol.FS)
+			// only the os set's XFS log may be replayed by the probe; a data
+			// set's is left for the operator
+			res := checker.CheckFSReadOnly(ctx, device, vol.FS)
+			if set.Role == "os" {
+				res = checker.CheckFS(ctx, device, vol.FS)
+			}
 			switch {
 			case res.Unavailable:
 				markUnknown(vol.Name, res.Reason)

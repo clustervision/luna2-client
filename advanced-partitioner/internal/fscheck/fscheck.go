@@ -64,6 +64,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
@@ -138,13 +139,23 @@ func New(o Options) *Checker {
 
 // CheckFS runs the appropriate health probe for `fs` on `device` and
 // returns the typed Result. The Logger receives one INFO line per
-// outcome.
+// outcome. An XFS log that needs replaying is replayed (mount+umount).
 func (c *Checker) CheckFS(ctx context.Context, device, fs string) Result {
+	return c.check(ctx, device, fs, true)
+}
+
+// CheckFSReadOnly is CheckFS without the XFS log replay: a log that needs
+// replaying makes the result Unavailable (unknown), for the operator.
+func (c *Checker) CheckFSReadOnly(ctx context.Context, device, fs string) Result {
+	return c.check(ctx, device, fs, false)
+}
+
+func (c *Checker) check(ctx context.Context, device, fs string, replay bool) Result {
 	switch fs {
 	case "ext2", "ext3", "ext4":
 		return c.checkExt(ctx, device, fs)
 	case "xfs":
-		return c.checkXFS(ctx, device)
+		return c.checkXFS(ctx, device, replay)
 	case "vfat", "fat", "fat32":
 		return c.checkVfat(ctx, device, fs)
 	case "swap":
@@ -186,67 +197,70 @@ func (c *Checker) checkExt(ctx context.Context, device, fs string) Result {
 	}
 }
 
-// checkXFS replays the XFS log first (mount + umount, the filesystem's own
-// recovery, which keeps every committed transaction) and only then runs
-// xfs_repair -n (check only, no writes) on a filesystem whose log is clean.
-//
-// The other order failed on the lab nodes after a hard reset of a running
-// node (dirty log on the root LV): xfs_repair -n reads metadata the log
-// would still change and warns about "spurious inconsistencies"; el8 and
-// Ubuntu 22.04 xfsprogs crashed on them (SIGABRT, SIGSEGV), el9 xfsprogs hung
-// without output until the install step timed out. On a clean log the
-// mount + umount changes nothing.
-//
-// `xfs_repair -L` (zero the log) is deliberately absent: it discards
-// committed transactions and must never be a side effect of a health probe
-// (FTA BR-7 / MCS-4).
-func (c *Checker) checkXFS(ctx context.Context, device string) Result {
-	// a checker that cannot run must not cause a mount: probe the binary first
+// xfsCheckTimeout bounds xfs_repair -n: it has hung on a dirty log, and a
+// probe that never returns stalls the install.
+const xfsCheckTimeout = 300 * time.Second
+
+// checkXFS runs xfs_repair -n (check only). A dirty log, a crash or a timeout
+// means the log has to be replayed before the filesystem can be judged: with
+// replay that is done by mount+umount (the filesystem's own recovery, which
+// keeps every committed transaction) and the check runs once more; without
+// it the result is Unavailable. xfs_repair -L (zero the log) is never run by a
+// health probe (FTA BR-7 / MCS-4).
+func (c *Checker) checkXFS(ctx context.Context, device string, replay bool) Result {
+	// a checker that cannot run is unknown, never broken: probe the binary first
 	if res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
 		Path: "xfs_repair", Args: []string{"-V"},
 		CaptureStdout: true, CaptureStderr: true,
 	}); checkerUnavailable(res, err) {
 		return unavailable(device, "xfs", "xfs_repair", err)
 	}
+	res, err := c.xfsRepairN(ctx, device)
+	rc := exitCode(res, err)
+	if rc == 0 {
+		c.log("xfs_repair -n OK: %s", device)
+		return Result{Device: device, FS: "xfs", OK: true}
+	}
+	if !replay {
+		if dirtyXFSLog(res) || rc == -1 {
+			return Result{Device: device, FS: "xfs", OK: false, Unavailable: true,
+				Reason: fmt.Sprintf("the XFS log on %s needs replaying before it can be checked (xfs_repair -n rc=%d); not replayed on this set -- operator review", device, rc)}
+		}
+		return Result{Device: device, FS: "xfs", OK: false,
+			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s (NOT running xfs_repair -L -- operator decision)", rc, device)}
+	}
+
+	c.warn("xfs_repair -n rc=%d on %s; attempting safe journal replay (mount+umount)", rc, device)
 	mnt, err := c.replayMountDir()
 	if err != nil {
 		return Result{Device: device, FS: "xfs", OK: false,
-			Reason: fmt.Sprintf("no journal-replay mountpoint for %s: %v", device, err)}
+			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s and no replay mountpoint: %v", rc, device, err)}
 	}
-	_, mountErr := c.o.Runner.Run(ctx, executor.CommandSpec{
+	if _, err := c.o.Runner.Run(ctx, executor.CommandSpec{
 		Path: "mount", Args: []string{"-t", "xfs", device, mnt},
 		CaptureStdout: true, CaptureStderr: true,
-	})
-	if mountErr == nil {
-		_, _ = c.o.Runner.Run(ctx, executor.CommandSpec{
-			Path: "umount", Args: []string{mnt},
-			CaptureStdout: true, CaptureStderr: true,
-		})
+	}); err != nil {
+		return Result{Device: device, FS: "xfs", OK: false,
+			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s; journal-replay mount failed: %v (NOT running xfs_repair -L -- operator decision)", rc, device, err)}
 	}
-	res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
-		Path: "xfs_repair", Args: []string{"-n", device},
+	_, _ = c.o.Runner.Run(ctx, executor.CommandSpec{
+		Path: "umount", Args: []string{mnt},
 		CaptureStdout: true, CaptureStderr: true,
 	})
-	if checkerUnavailable(res, err) {
-		if mountErr != nil && exitCode(res, err) == -1 && dirtyXFSLog(res) {
-			// the log could not be replayed (the mount failed) and the
-			// check crashed on it: this filesystem does not come up
-			return Result{Device: device, FS: "xfs", OK: false,
-				Reason: fmt.Sprintf("%s does not mount (journal replay failed: %v) and xfs_repair -n crashed on its dirty log (NOT running xfs_repair -L -- operator decision)", device, mountErr)}
-		}
-		return unavailable(device, "xfs", "xfs_repair", err)
-	}
-	rc := exitCode(res, err)
-	switch {
-	case mountErr != nil:
+	res, err = c.xfsRepairN(ctx, device)
+	if rc2 := exitCode(res, err); rc2 != 0 {
 		return Result{Device: device, FS: "xfs", OK: false,
-			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s; journal-replay mount failed: %v (NOT running xfs_repair -L -- operator decision)", rc, device, mountErr)}
-	case rc != 0:
-		return Result{Device: device, FS: "xfs", OK: false,
-			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s after journal replay (NOT running xfs_repair -L -- operator decision)", rc, device)}
+			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s after journal replay (NOT running xfs_repair -L -- operator decision)", rc2, device)}
 	}
-	c.log("xfs journal replayed (mount+umount), xfs_repair -n OK: %s", device)
+	c.log("xfs journal replayed, xfs_repair -n OK: %s", device)
 	return Result{Device: device, FS: "xfs", OK: true}
+}
+
+func (c *Checker) xfsRepairN(ctx context.Context, device string) (executor.CommandResult, error) {
+	return c.o.Runner.Run(ctx, executor.CommandSpec{
+		Path: "xfs_repair", Args: []string{"-n", device},
+		CaptureStdout: true, CaptureStderr: true, Timeout: xfsCheckTimeout,
+	})
 }
 
 // dirtyXFSLog reports whether xfs_repair's output says the log holds
