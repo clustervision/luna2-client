@@ -340,11 +340,11 @@ func TestRaidCountCountsSparesOut(t *testing.T) {
 func TestDiscoverUnmetIsFatalUnlessPoolFailed(t *testing.T) {
 	set := &v2.Set{Name: "os", Role: "os", Selection: "discover", Raid: "1", Match: &v2.Match{Tags: []string{"ssd"}},
 		Volumes: []v2.Volume{{Name: "root", Mountpoint: "/", FS: "xfs", Provider: "lvm", Size: "100%"}}}
-	sp := &setProcessor{logger: silentLogger(t), pool: []discover.Device{{Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(100), Tags: []string{"ssd"}}}}
-	wantFatal(t, sp.resolveDiscover(set), "discover-unmet")
+	sp := &setProcessor{logger: silentLogger(t), runner: executor.NewFakeRunner(executor.FakeResponse{}), pool: []discover.Device{{Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(100), Tags: []string{"ssd"}}}}
+	wantFatal(t, sp.resolveDiscover(context.Background(), set), "discover-unmet")
 
 	sp.poolErr = errors.New("lsblk: exit status 1")
-	err := sp.resolveDiscover(set)
+	err := sp.resolveDiscover(context.Background(), set)
 	var fe *fatalConfigError
 	if err == nil || errors.As(err, &fe) {
 		t.Fatalf("with a failed pool listing the shortfall is retryable, got %v", err)
@@ -352,7 +352,7 @@ func TestDiscoverUnmetIsFatalUnlessPoolFailed(t *testing.T) {
 
 	bad := &v2.Set{Name: "os", Role: "os", Selection: "discover", Raid: "none", Match: &v2.Match{MinSize: "lots"},
 		Volumes: set.Volumes}
-	wantFatal(t, (&setProcessor{logger: silentLogger(t)}).resolveDiscover(bad), "match-invalid")
+	wantFatal(t, (&setProcessor{logger: silentLogger(t)}).resolveDiscover(context.Background(), bad), "match-invalid")
 }
 
 // Resolution failures keep the exit contract: absent / invalid device -> 3,
@@ -513,5 +513,57 @@ func TestMembootIgnoresMissingOSSetDevice(t *testing.T) {
 	res, _, err := sp.runDecision(context.Background(), installcontext.ModeMemboot, cfg, "uefi", true, false)
 	if err != nil || len(res) != 1 || res[0].StorageType != "memory" {
 		t.Fatalf("memboot must ignore the os set's devices: %+v %v", res, err)
+	}
+}
+
+// selection=discover picks the disks that carry the set's own volume group or
+// md array before the identity order: an upgrade that changed the order must
+// not move an installed set to other disks.
+func TestResolveDiscoverPrefersTheSetsOwnDisks(t *testing.T) {
+	pool := func() []discover.Device {
+		return []discover.Device{
+			{Name: "sda", Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(100), WWN: "0xa"},
+			{Name: "sdb", Path: "/dev/sdb", KernelPath: "/dev/sdb", Size: gib(100), WWN: "0xb"},
+			{Name: "sdc", Path: "/dev/sdc", KernelPath: "/dev/sdc", Size: gib(100), WWN: "0xc"},
+		}
+	}
+	for _, c := range []struct {
+		name string
+		set  v2.Set
+		stub func(f *executor.FakeRunner)
+		want []string
+	}{
+		{"vg", v2.Set{Name: "os", Role: "os", Selection: "discover", Raid: "none", Count: 1, Volumes: raidOSSet("none").Volumes},
+			func(f *executor.FakeRunner) {
+				f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "vg_uuid,vg_name,pv_name"},
+					Response: executor.FakeResponse{Stdout: []byte("  OSUUID os /dev/sdc3\n")}})
+				f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/sdc"},
+					Response: executor.FakeResponse{Stdout: []byte("sdc\nsdc3\n")}})
+			}, []string{"/dev/sdc"}},
+		{"md", v2.Set{Name: "scratch", Role: "data", Selection: "discover", Raid: "1", Count: 2,
+			Volumes: []v2.Volume{{Name: "s", Mountpoint: "/scratch", FS: "xfs", Size: "100%", Provider: "lvm"}}},
+			func(f *executor.FakeRunner) {
+				for _, d := range []string{"sdb", "sdc"} {
+					f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME,TYPE", "/dev/" + d},
+						Response: executor.FakeResponse{Stdout: []byte(d + " disk\n" + d + "1 part\n")}})
+					f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine", "/dev/" + d + "1"},
+						Response: executor.FakeResponse{Stdout: []byte("           Name : any:scratch  (local to host any)\n")}})
+				}
+				f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine"},
+					Response: executor.FakeResponse{Err: errors.New("no md superblock")}})
+			}, []string{"/dev/sdb", "/dev/sdc"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sp, f := testProcessor(t)
+			c.stub(f)
+			sp.pool = pool()
+			set := c.set
+			if err := sp.resolveDiscover(context.Background(), &set); err != nil {
+				t.Fatalf("resolveDiscover: %v", err)
+			}
+			if strings.Join(set.Devices, " ") != strings.Join(c.want, " ") {
+				t.Fatalf("devices = %v, want %v (the set's own disks)", set.Devices, c.want)
+			}
+		})
 	}
 }

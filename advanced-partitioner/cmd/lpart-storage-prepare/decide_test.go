@@ -166,6 +166,7 @@ func gib(n int64) int64 { return n * 1024 * 1024 * 1024 }
 func TestResolveDiscoverSelectsByTagsAndConsumesPool(t *testing.T) {
 	sp := &setProcessor{
 		logger: silentLogger(t),
+		runner: executor.NewFakeRunner(executor.FakeResponse{}),
 		pool: []discover.Device{
 			{Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(8000), Tags: []string{"rotary"}},
 			{Path: "/dev/nvme0n1", KernelPath: "/dev/nvme0n1", Size: gib(2000), Tags: []string{"ssd", "nvme"}},
@@ -179,7 +180,7 @@ func TestResolveDiscoverSelectsByTagsAndConsumesPool(t *testing.T) {
 			{Name: "scratch", Mountpoint: "/scratch", FS: "xfs", Provider: "lvm", Size: "100%"},
 		},
 	}
-	if err := sp.resolveDiscover(set); err != nil {
+	if err := sp.resolveDiscover(context.Background(), set); err != nil {
 		t.Fatalf("resolveDiscover: %v", err)
 	}
 	if len(set.Devices) != 2 {
@@ -199,6 +200,7 @@ func TestResolveDiscoverSelectsByTagsAndConsumesPool(t *testing.T) {
 func TestResolveDiscoverHaltsWhenUnmet(t *testing.T) {
 	sp := &setProcessor{
 		logger: silentLogger(t),
+		runner: executor.NewFakeRunner(executor.FakeResponse{}),
 		pool:   []discover.Device{{Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(500), Tags: []string{"ssd"}}},
 	}
 	set := &v2.Set{
@@ -206,7 +208,7 @@ func TestResolveDiscoverHaltsWhenUnmet(t *testing.T) {
 		Match:   &v2.Match{Tags: []string{"ssd"}},
 		Volumes: []v2.Volume{{Name: "root", Mountpoint: "/", FS: "xfs", Provider: "lvm", Size: "100%"}},
 	}
-	if err := sp.resolveDiscover(set); err == nil {
+	if err := sp.resolveDiscover(context.Background(), set); err == nil {
 		t.Fatal("raid1 with one eligible disk must halt (not enough disks)")
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cleanup"
@@ -215,7 +216,7 @@ func (sp *setProcessor) planSet(ctx context.Context, mode installcontext.Mode, c
 	// set.Devices so the record shows the same disks). Failure to meet the
 	// layout is a halt, never a silent fallback.
 	if set.SelectionMode() == "discover" && set.StorageType() != v2.StorageMemory {
-		if err := sp.resolveDiscover(set); err != nil {
+		if err := sp.resolveDiscover(ctx, set); err != nil {
 			return p, err
 		}
 	}
@@ -422,11 +423,7 @@ func (sp *setProcessor) refuseForeignSetSignatures(ctx context.Context, cfg *v2.
 					set.Name, paths, v.Name, other.Name)
 			}
 		}
-		names := []string{other.MDName()}
-		if other.Role == "os" {
-			names = append(names, other.MDName()+"-efi", other.MDName()+"-boot")
-		}
-		for _, n := range names {
+		for _, n := range setMDNames(other) {
 			if dev, ok := mdNames[n]; ok {
 				return safetyRefusalf(reason,
 					"set %q (selection=discover) picked disk(s) %v, and %s carries md array %q of set %q -- discover chose another set's disks; refusing to wipe them -- operator review required (pin the sets with selection=manual)",
@@ -626,13 +623,13 @@ func (sp *setProcessor) reserveManualSets(ctx context.Context, cfg *v2.Config) e
 // raid count, removes them from the pool, and fills set.Devices. A match the
 // pool cannot meet is a fatal config error (exit 3) -- unless the pool itself
 // could not be listed, which may clear on retry (exit 1).
-func (sp *setProcessor) resolveDiscover(set *v2.Set) error {
+func (sp *setProcessor) resolveDiscover(ctx context.Context, set *v2.Set) error {
 	mf := set.MatchFilter()
 	m, err := diskresolve.ParseMatch(mf.Tags, mf.MinSize, mf.MaxSize, mf.Model)
 	if err != nil {
 		return fatalConfigf("match-invalid", "set %q: match: %v", set.Name, err)
 	}
-	selected, err := diskresolve.Resolve(sp.pool, m, set.MemberCount(), set.SpareCount(), 0)
+	selected, err := diskresolve.Resolve(sp.pool, m, set.MemberCount(), set.SpareCount(), 0, sp.ownDisks(ctx, set))
 	if err != nil {
 		if sp.poolErr != nil {
 			return fmt.Errorf("set %q: %w (device discovery failed: %v)", set.Name, err, sp.poolErr)
@@ -656,6 +653,48 @@ func (sp *setProcessor) resolveDiscover(set *v2.Set) error {
 	sp.pool = remaining
 	sp.logger.UserInfo("set %q selection=discover -> %v", set.Name, paths)
 	return nil
+}
+
+// ownDisks returns the pool disks (by Path) that already carry the set's own
+// volume group or md array: the disks it was installed on before. A disk that
+// cannot be probed is simply not preferred; the signature refusals still run
+// before anything is created.
+func (sp *setProcessor) ownDisks(ctx context.Context, set *v2.Set) map[string]bool {
+	own := map[string]bool{}
+	for _, d := range sp.pool {
+		disk := []string{d.KernelPath}
+		vgs, _ := vgselect.OnDisks(ctx, sp.runner, disk)
+		for _, v := range vgs {
+			if v.Name == set.VGName() {
+				own[d.Path] = true
+			}
+		}
+		mdNames := storagehealth.MDNamesOnDisks(ctx, sp.runner, disk)
+		for _, n := range setMDNames(set) {
+			if _, ok := mdNames[n]; ok {
+				own[d.Path] = true
+			}
+		}
+	}
+	if len(own) > 0 {
+		paths := make([]string, 0, len(own))
+		for p := range own {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		sp.logger.UserInfo("set %q: preferring disk(s) %v, which carry its own volume group or md array", set.Name, paths)
+	}
+	return own
+}
+
+// setMDNames are the md array names a set creates: its own, and for the os set
+// the ESP and /boot mirrors.
+func setMDNames(set *v2.Set) []string {
+	names := []string{set.MDName()}
+	if set.Role == "os" {
+		names = append(names, set.MDName()+"-efi", set.MDName()+"-boot")
+	}
+	return names
 }
 
 // runSanitize securely erases every discovered local disk, then stops.

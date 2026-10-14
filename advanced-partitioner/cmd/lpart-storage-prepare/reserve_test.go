@@ -14,6 +14,7 @@ import (
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/discover"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/disk/selector"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installcontext"
 )
 
@@ -64,6 +65,7 @@ func twoSetConfig() *v2.Config {
 func TestReservationKeepsDiscoverOffPersistentDisk(t *testing.T) {
 	sp := &setProcessor{
 		logger: silentLogger(t),
+		runner: executor.NewFakeRunner(executor.FakeResponse{}),
 		pool: []discover.Device{
 			{Name: "sda", Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(20)},
 			{Name: "sdb", Path: "/dev/sdb", KernelPath: "/dev/sdb", Size: gib(8)}, // smallest = persistent
@@ -81,7 +83,7 @@ func TestReservationKeepsDiscoverOffPersistentDisk(t *testing.T) {
 		t.Fatalf("pool must have only /dev/sda left, got %+v", sp.pool)
 	}
 	// Now the discover resolution for the OS set cannot see sdb at all.
-	if err := sp.resolveDiscover(&cfg.Sets[0]); err != nil {
+	if err := sp.resolveDiscover(context.Background(), &cfg.Sets[0]); err != nil {
 		t.Fatalf("resolveDiscover: %v", err)
 	}
 	if len(cfg.Sets[0].Devices) != 1 || cfg.Sets[0].Devices[0] != "/dev/sda" {
