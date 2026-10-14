@@ -159,6 +159,19 @@ func TestDegradedRaidWithoutAllowParks(t *testing.T) {
 	}
 }
 
+// An array the probe found missing a member (disk present, member gone) parks
+// the node like a missing disk does, before any disk is touched.
+func TestDegradedVerdictParks(t *testing.T) {
+	sp, f := testProcessor(t)
+	withVerdict(sp, storagehealth.VerdictDegraded)
+	cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("1", "/dev/vda", "/dev/vdb")}}
+	_, _, err := sp.runDecision(context.Background(), installcontext.ModeSync, cfg, "uefi", false, true)
+	wantSafety(t, err, "degraded")
+	if d := destructive(f); d != "" {
+		t.Fatalf("a degraded set touched a disk: %s", d)
+	}
+}
+
 // With allow_degraded, the same dead member under a create (full, or auto on a
 // broken os set) is still a fatal config error naming the device, before any
 // disk is touched: a create needs every device.

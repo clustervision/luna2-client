@@ -225,6 +225,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// First PRESENT device per set: the BIOS boot partition probe below must
 	// not look at a configured member that is missing (degraded raid).
 	presentFirst := map[string]string{}
+	resolvedBySet := map[string][]selector.Resolved{}
 	for i := range cfg.Sets {
 		set := &cfg.Sets[i]
 		storageType := set.StorageType()
@@ -258,6 +259,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		presentFirst[set.Name] = resolved[0].ResolvedPath
 		verdict, fs := storagehealth.Classify(context.Background(), runner, checker, set, resolved, logger)
 		logger.KV("verdict", set.Name+"="+string(verdict))
+		if verdict == storagehealth.VerdictDegraded {
+			return cli.ExitSafetyRefusal(stderr, toolName, "degraded",
+				"set %q is degraded: an array of the set misses a member; replace the disk and reinstall with install_mode full, or set allow_degraded on the set to install on it degraded", set.Name)
+		}
+		resolvedBySet[set.Name] = resolved
 		failures = append(failures, fs...)
 	}
 
@@ -303,6 +309,17 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	logger.SetStage("mount")
 	logger.UserInfo("All sets healthy — mounting storage tree")
+	// the probe released what it activated: bring the sets up read-write
+	for i := range cfg.Sets {
+		set := &cfg.Sets[i]
+		paths := make([]string, 0, len(resolvedBySet[set.Name]))
+		for _, r := range resolvedBySet[set.Name] {
+			paths = append(paths, r.ResolvedPath)
+		}
+		if len(paths) > 0 {
+			storagehealth.ActivateExisting(context.Background(), runner, set, paths, logger, false)
+		}
+	}
 	predicted := fsmod.PredictFilesystemsFromConfig(cfg, func(set *v2.Set) bool {
 		disk, ok := presentFirst[set.Name]
 		if set.Role != "os" || !ok {

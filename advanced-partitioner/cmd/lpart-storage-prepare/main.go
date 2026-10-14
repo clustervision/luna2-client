@@ -799,7 +799,7 @@ func (sp *setProcessor) activateExisting(ctx context.Context, set *v2.Set, rmode
 	// Assemble with EXPLICIT members (md auto-assembly is disabled for the
 	// whole install), then vgchange; shared with the health probe so both see
 	// the same devices. See storagehealth.ActivateExisting.
-	storagehealth.ActivateExisting(ctx, sp.runner, set, paths, sp.logger)
+	storagehealth.ActivateExisting(ctx, sp.runner, set, paths, sp.logger, false)
 }
 
 // protectedPaths renders the protected-disk set as a path slice for

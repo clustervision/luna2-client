@@ -41,6 +41,9 @@ const (
 	// broken, so the data fence must neither mount nor wipe on it -- auto
 	// used to read a missing e2fsck as "broken" and recreate the os set.
 	VerdictUnknown Verdict = "unknown"
+	// VerdictDegraded means an array of the set misses a member and was not
+	// started (the set does not allow running degraded): the install parks.
+	VerdictDegraded Verdict = "degraded"
 )
 
 // Unhealthy is one volume-level verification failure.
@@ -52,6 +55,9 @@ type Unhealthy struct {
 	// itself could not run (fscheck Result.Unavailable). Classify turns any
 	// Unknown failure into VerdictUnknown, never VerdictBroken.
 	Unknown bool
+	// Degraded marks an array left inactive for a missing member; Classify
+	// turns it into VerdictDegraded.
+	Degraded bool
 }
 
 // VerifyDiskSet runs the per-volume verification for one disk-backed set and
@@ -86,8 +92,20 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 	for _, r := range resolved {
 		disks = append(disks, r.ResolvedPath)
 	}
+	// Data sets are assembled read-only; nothing is started degraded unless
+	// the set allows it, and what the probe brought up is released after it.
+	vgSelect := ""
 	if rm := set.RAIDMode(); rm != "" && rm != "none" {
-		ActivateExisting(ctx, runner, set, disks, logger)
+		act := ActivateExisting(ctx, runner, set, disks, logger, set.Role != "os")
+		defer func() { Release(ctx, runner, act, vgSelect, logger) }()
+		if len(act.Degraded) > 0 {
+			failures = append(failures, Unhealthy{SetName: set.Name, VolumeName: "(raid)", Degraded: true,
+				Reason: fmt.Sprintf("array(s) %s miss a member and were not started", strings.Join(act.Degraded, ", "))})
+			if logger != nil {
+				logger.Warn("DEGRADED set=" + set.Name + ": array(s) " + strings.Join(act.Degraded, ", ") + " miss a member")
+			}
+			return failures
+		}
 	}
 
 	if set.StorageType() == v2.StorageLVM {
@@ -113,6 +131,7 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 			mark("(lvm)", fmt.Sprintf("vgchange -ay --select %s (VG %s) failed: %v", vg.Select(), vgName, err))
 			return failures
 		}
+		vgSelect = vg.Select()
 	}
 
 	diskPath := resolved[0].ResolvedPath
@@ -222,6 +241,11 @@ func Classify(ctx context.Context, runner executor.Runner, checker *fscheck.Chec
 	failures := VerifyDiskSet(ctx, runner, checker, set, resolved, logger)
 	if len(failures) == 0 {
 		return VerdictHealthy, nil
+	}
+	for _, f := range failures {
+		if f.Degraded {
+			return VerdictDegraded, failures
+		}
 	}
 	for _, f := range failures {
 		if f.Unknown {

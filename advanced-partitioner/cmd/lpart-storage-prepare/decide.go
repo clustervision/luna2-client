@@ -234,6 +234,11 @@ func (sp *setProcessor) planSet(ctx context.Context, mode installcontext.Mode, c
 		sp.logger.KV("verdict", set.Name+"="+string(verdict))
 	}
 
+	if verdict == storagehealth.VerdictDegraded {
+		return p, safetyRefusalf("degraded",
+			"set %q is degraded: an array of the set misses a member; replace the disk and reinstall with install_mode full, or set allow_degraded on the set to install on it degraded; no disk was touched",
+			set.Name)
+	}
 	act, halt := decideAction(mode, set.Role, false, verdict)
 	// A set with absent members may only be MOUNTED, degraded, and only when
 	// the array actually came up (healthy verdict, or local/full which do
