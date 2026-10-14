@@ -627,7 +627,7 @@ const DegradedMarker = "degraded.done"
 func (p *Pipeline) markDegraded() {
 	for _, line := range p.stepStderr {
 		if strings.Contains(line, "safety_refusal=degraded") {
-			if err := os.WriteFile(p.rt(DegradedMarker), []byte(line+"\n"), 0o644); err != nil {
+			if err := os.WriteFile(p.rt(DegradedMarker), []byte(line+"\n"), 0o600); err != nil {
 				p.info("could not write " + p.rt(DegradedMarker) + ": " + err.Error())
 			}
 			return
