@@ -235,7 +235,18 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			continue
 		}
 
-		resolved, missing, err := resolvePresent(context.Background(), resolver, set.EffectiveDevices())
+		var resolved []selector.Resolved
+		var missing []string
+		var err error
+		if werr := selector.WaitWhileMissing(context.Background(), runner, selector.LateDeviceWait, func() (int, error) {
+			resolved, missing, err = resolvePresent(context.Background(), resolver, set.EffectiveDevices())
+			if err != nil && len(missing) == 0 {
+				return 0, err // not a missing device: no point waiting
+			}
+			return len(missing), nil
+		}); werr != nil {
+			err = werr
+		}
 		if msg := degradedRefusal(set, len(resolved), missing); err == nil && msg != "" {
 			return cli.ExitSafetyRefusal(stderr, toolName, "degraded", "%s", msg)
 		}

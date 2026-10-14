@@ -566,16 +566,23 @@ func (sp *setProcessor) reserveManualSets(ctx context.Context, cfg *v2.Config) e
 		}
 		var present []selector.Resolved
 		var missing []string
-		for _, dev := range set.EffectiveDevices() {
-			r, err := sp.resolveForReservation(ctx, []string{dev})
-			if err != nil {
-				if errors.Is(err, selector.ErrNotFound) {
-					missing = append(missing, dev)
-					continue
+		resolve := func() (int, error) {
+			present, missing = nil, nil
+			for _, dev := range set.EffectiveDevices() {
+				r, err := sp.resolveForReservation(ctx, []string{dev})
+				if err != nil {
+					if errors.Is(err, selector.ErrNotFound) {
+						missing = append(missing, dev)
+						continue
+					}
+					return 0, err
 				}
-				return classifyResolveErr(set.Name, fmt.Errorf("resolving devices for reservation: %w", err))
+				present = append(present, r...)
 			}
-			present = append(present, r...)
+			return len(missing), nil
+		}
+		if err := selector.WaitWhileMissing(ctx, sp.runner, sp.lateWait, resolve); err != nil {
+			return classifyResolveErr(set.Name, fmt.Errorf("resolving devices for reservation: %w", err))
 		}
 		if len(missing) > 0 {
 			// Judged by planSet (missingDeviceError): a set this run ignores

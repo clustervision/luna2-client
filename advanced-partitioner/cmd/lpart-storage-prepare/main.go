@@ -32,6 +32,7 @@ import (
 	"io"
 	"os"
 	"strings"
+	"time"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cleanup"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
@@ -300,6 +301,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	sp := &setProcessor{
 		runner:   runner,
 		logger:   logger,
+		lateWait: selector.LateDeviceWait,
 		selector: selector.New(selector.Options{Runner: runner, Logger: logger, CandidatesOut: stderr}),
 		cleaner:  cleanup.New(cleanup.Options{Runner: runner, Logger: logger}),
 		part:     partition.New(partition.Options{Runner: runner, Logger: logger, DryRun: f.DryRun}),
@@ -460,6 +462,9 @@ type setProcessor struct {
 	// set's PRESENT devices, and the configured devices absent from the node.
 	manualDisks map[string][]selector.Resolved
 	missing     map[string][]string
+	// lateWait bounds the wait for a manual set's device that is not there
+	// yet (selector.LateDeviceWait; zero in tests).
+	lateWait time.Duration
 	// classifyFn overrides the storagehealth.Classify health probe (tests).
 	classifyFn func(ctx context.Context, set *v2.Set, disks []selector.Resolved) storagehealth.Verdict
 	// poolErr is the device-discovery failure, when listing the pool failed.
