@@ -3,8 +3,8 @@ package pipeline
 // Barrier-pinning tests for the exit-code integrity chain (FTA Cluster B).
 // The invariants pinned here:
 //   - a sub-tool's numeric exit survives as a typed stepError (B1);
-//   - exit 2 (safety refusal) and exit 3 (fatal config) classify FATAL,
-//     everything else retryable (B1);
+//   - exit 2 classifies as a safety refusal and exit 3 as fatal config, both
+//     non-retryable; everything else retryable (B1);
 //   - the terminal outcome is recorded on the Pipeline itself before the
 //     event channel closes, so consumers never depend on the lossy display
 //     bus (B2).
@@ -40,12 +40,12 @@ func TestClassifyFatalCodes(t *testing.T) {
 		err  error
 		want FailureClass
 	}{
-		{&stepError{Code: 2}, FailFatal},     // safety refusal (data fence)
+		{&stepError{Code: 2}, FailSafety},    // safety refusal (data fence)
 		{&stepError{Code: 3}, FailFatal},     // fatal config
 		{&stepError{Code: 1}, FailRetryable}, // generic failure
 		{&stepError{Code: 5}, FailRetryable},
 		{errors.New("plain"), FailRetryable},
-		{fmt.Errorf("wrap: %w", &stepError{Code: 2}), FailFatal},
+		{fmt.Errorf("wrap: %w", &stepError{Code: 2}), FailSafety},
 	}
 	for _, c := range cases {
 		if got := classify(c.err); got != c.want {
@@ -55,7 +55,7 @@ func TestClassifyFatalCodes(t *testing.T) {
 }
 
 func TestFailureClassFatal(t *testing.T) {
-	if !FailFatal.Fatal() || FailRetryable.Fatal() {
+	if !FailFatal.Fatal() || !FailSafety.Fatal() || FailRetryable.Fatal() {
 		t.Fatal("Fatal() mapping wrong")
 	}
 }
@@ -119,8 +119,8 @@ func TestRunStepArgvPreservesExitCode(t *testing.T) {
 			t.Fatalf("exit %d: stepError.Code = %d", code, se.Code)
 		}
 		if code == 2 || code == 3 {
-			if classify(err) != FailFatal {
-				t.Fatalf("exit %d must classify FailFatal (park), got retryable", code)
+			if !classify(err).Fatal() {
+				t.Fatalf("exit %d must park, got retryable", code)
 			}
 		} else if classify(err) != FailRetryable {
 			t.Fatalf("exit %d must classify FailRetryable", code)

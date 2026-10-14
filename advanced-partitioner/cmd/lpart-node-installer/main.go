@@ -31,6 +31,24 @@ import (
 // retry).
 const exitFatalConfig = 3
 
+// exitSafetyRefusal is the exit code for a safety refusal (a sub-tool's exit
+// 2): the wrapper parks on it like on 3, and the install template reports it
+// as install.refused rather than install.fatal.
+const exitSafetyRefusal = 2
+
+// failureExit is the exit code and console line for a phase that failed. Say
+// what the code means, not just what it is: the wrapper's retry-vs-park
+// decision rides on it and the operator reads this line.
+func failureExit(class pipeline.FailureClass) (int, string) {
+	switch {
+	case class == pipeline.FailSafety:
+		return exitSafetyRefusal, fmt.Sprintf("lpart-node-installer: exit %d -- safety refusal; the node is parked for an operator, not retried", exitSafetyRefusal)
+	case class.Fatal():
+		return exitFatalConfig, fmt.Sprintf("lpart-node-installer: exit %d -- non-retryable configuration error; the node is parked for an operator, not retried", exitFatalConfig)
+	}
+	return 1, "lpart-node-installer: exit 1 -- retryable failure; the install wrapper retries after a countdown"
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "lpart-node-installer:", err)
@@ -134,8 +152,8 @@ func run() error {
 	// The AUTHORITATIVE outcome is pipeline.Result(), recorded out-of-band
 	// of the lossy display bus (FTA Cluster B): a dropped terminal event or
 	// an operator quitting the TUI mid-install can never turn a failed or
-	// unfinished install into exit 0, and a fatal/safety-refusal class maps
-	// to exit 3 so luna2-start.sh parks instead of retrying forever.
+	// unfinished install into exit 0, and a safety refusal maps to exit 2 and
+	// a fatal class to exit 3 so luna2-start.sh parks instead of retrying forever.
 	res := pl.Result()
 	switch {
 	case res.Done && !res.Failed:
@@ -144,14 +162,10 @@ func run() error {
 		if renderExit != 0 {
 			os.Exit(renderExit)
 		}
-	case res.Done && res.Class.Fatal():
-		// Say what the code means, not just what it is: the wrapper's
-		// retry-vs-park decision rides on it and the operator reads this line.
-		fmt.Fprintf(os.Stderr, "lpart-node-installer: exit %d -- non-retryable configuration or safety error; the node is parked for an operator, not retried\n", exitFatalConfig)
-		os.Exit(exitFatalConfig)
 	case res.Done:
-		fmt.Fprintln(os.Stderr, "lpart-node-installer: exit 1 -- retryable failure; the install wrapper retries after a countdown")
-		os.Exit(1)
+		code, line := failureExit(res.Class)
+		fmt.Fprintln(os.Stderr, line)
+		os.Exit(code)
 	default:
 		// No terminal state: the pipeline was interrupted (quit/SIGINT/
 		// render exit while steps were still running). Never success.

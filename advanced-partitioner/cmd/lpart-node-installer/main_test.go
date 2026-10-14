@@ -114,3 +114,24 @@ func TestStopPipelineCancelsAndWaits(t *testing.T) {
 		t.Fatalf("the operator must be told: %q", errBuf.String())
 	}
 }
+
+// TestFailureExitParksSafetyAndFatalApart pins the exit code per failure class:
+// the wrapper parks on 2 and 3 alike, and the install template reports 2 as
+// install.refused and 3 as install.fatal, so the two must not collapse again.
+func TestFailureExitParksSafetyAndFatalApart(t *testing.T) {
+	cases := []struct {
+		class pipeline.FailureClass
+		code  int
+		word  string
+	}{
+		{pipeline.FailSafety, 2, "safety refusal"},
+		{pipeline.FailFatal, 3, "non-retryable configuration error"},
+		{pipeline.FailRetryable, 1, "retryable failure"},
+	}
+	for _, c := range cases {
+		code, line := failureExit(c.class)
+		if code != c.code || !strings.Contains(line, c.word) {
+			t.Errorf("failureExit(%v) = %d %q, want %d and %q", c.class, code, line, c.code, c.word)
+		}
+	}
+}

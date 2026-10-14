@@ -74,17 +74,20 @@ type FailureClass int
 const (
 	// FailRetryable is a transient/operational failure — worth a retry.
 	FailRetryable FailureClass = iota
-	// FailFatal will fail identically on every retry: a safety refusal
-	// (exit 2 from a sub-tool — data fence, persistent protection) or a
-	// non-retryable configuration error (exit 3). The wrapper must PARK
-	// for an operator instead of retrying forever.
+	// FailFatal will fail identically on every retry: a non-retryable
+	// configuration error (exit 3). The wrapper must PARK for an operator
+	// instead of retrying forever.
 	FailFatal
+	// FailSafety is a safety refusal (exit 2 from a sub-tool — data fence,
+	// persistent protection). It parks like FailFatal; kept apart so the
+	// node reports it as refused rather than fatal.
+	FailSafety
 )
 
 // Fatal reports whether the class is non-retryable. The renderers read it
 // through a small interface assertion (no package coupling) to map
-// EvInstallerFailed to exit 3 vs 1.
-func (c FailureClass) Fatal() bool { return c == FailFatal }
+// EvInstallerFailed to a park vs a retry.
+func (c FailureClass) Fatal() bool { return c != FailRetryable }
 
 // Result is the pipeline's authoritative terminal outcome. It is recorded
 // on the Pipeline itself BEFORE the event channel closes, so a dropped or
@@ -150,10 +153,13 @@ func (e *stepError) Error() string {
 // classify maps a phase error to its FailureClass. Sub-tool exit 2 is the
 // repo-wide safety_refusal contract (cli.ExitSafetyRefusal: data fence,
 // persistent protection, device overlap) and exit 3 a non-retryable config
-// error — both fail identically on every retry, so both are fatal.
+// error — both fail identically on every retry, so both park.
 func classify(err error) FailureClass {
 	var se *stepError
-	if errors.As(err, &se) && (se.Code == 2 || se.Code == 3) {
+	if errors.As(err, &se) && se.Code == 2 {
+		return FailSafety
+	}
+	if errors.As(err, &se) && se.Code == 3 {
 		return FailFatal
 	}
 	var fe *fatalError

@@ -51,7 +51,7 @@ flowchart TD
   classDef blue fill:#dbeafe,stroke:#3b82f6,color:#1e3a8a;
 ```
 
-`auto`/`sync`/`full`/`local` use the disk layout. `memboot` consults it only for optional DATA sets. `sanitize` ignores it. `legacy` ignores it entirely. Set it with `luna node change <node> --install-mode <mode>` (or `luna group change`).
+`auto`/`sync`/`full`/`local` use the disk layout. With a data-only layout (no OS set), `auto` runs the OS from RAM as `memboot` does and mounts the DATA sets; the other disk modes refuse it with a clear message and touch no disk. `memboot` consults the layout only for optional DATA sets. `sanitize` ignores it. `legacy` ignores it entirely. Set it with `luna node change <node> --install-mode <mode>` (or `luna group change`).
 
 ## `disklayout` — the set of sets
 
