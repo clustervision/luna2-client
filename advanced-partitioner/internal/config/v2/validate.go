@@ -226,6 +226,9 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 	if s.Save && s.Selection != "discover" {
 		return fmt.Errorf("config_validation: %s.save is only valid on a selection=discover set", pfx)
 	}
+	if s.IncludeSAN && s.Selection != "discover" {
+		return fmt.Errorf("config_validation: %s.include_san is only valid on a selection=discover set", pfx)
+	}
 
 	// persistent is a data-set guarantee. The osimage install wipes and
 	// rewrites the os root on every install while excluding /boot, so a

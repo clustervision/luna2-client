@@ -211,6 +211,11 @@ func TestInvalidCases(t *testing.T) {
 			"save is only valid on a selection=discover set",
 		},
 		{
+			"include_san-on-manual",
+			`{"version":2,"sets":[{"name":"x","role":"data","selection":"manual","raid":"none","devices":["/dev/sda"],"include_san":true,"volumes":[` + dataVol() + `]}]}`,
+			"include_san is only valid on a selection=discover set",
+		},
+		{
 			"origin-unknown-field",
 			`{"version":2,"sets":[{"name":"x","role":"data","selection":"manual","raid":"none","devices":["/dev/sda"],"origin":{"bogus":"x"},"volumes":[` + dataVol() + `]}]}`,
 			"origin: unknown field 'bogus'",

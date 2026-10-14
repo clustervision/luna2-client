@@ -567,3 +567,42 @@ func TestResolveDiscoverPrefersTheSetsOwnDisks(t *testing.T) {
 		})
 	}
 }
+
+// FC/iSCSI LUNs are shared storage: a discover set takes one only with
+// include_san, and sanitize never erases one.
+func TestSANLunsOnlyWithIncludeSANAndNeverSanitized(t *testing.T) {
+	pool := func() []discover.Device {
+		return []discover.Device{
+			{Name: "sda", Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(100), WWN: "0xb"},
+			{Name: "sdb", Path: "/dev/sdb", KernelPath: "/dev/sdb", Size: gib(50), WWN: "0xa", Transport: "fc"},
+		}
+	}
+	for _, include := range []bool{false, true} {
+		sp, _ := testProcessor(t)
+		sp.pool = pool()
+		set := v2.Set{Name: "scratch", Role: "data", Selection: "discover", Raid: "none", Count: 1, IncludeSAN: include,
+			Volumes: []v2.Volume{{Name: "s", Mountpoint: "/scratch", FS: "xfs", Size: "100%", Provider: "lvm"}}}
+		if err := sp.resolveDiscover(context.Background(), &set); err != nil {
+			t.Fatalf("include_san=%v: %v", include, err)
+		}
+		want := "/dev/sda"
+		if include {
+			want = "/dev/sdb" // smaller, so first once it is eligible
+		}
+		if len(set.Devices) != 1 || set.Devices[0] != want {
+			t.Fatalf("include_san=%v: devices = %v, want [%s]", include, set.Devices, want)
+		}
+	}
+
+	sp, f := testProcessor(t)
+	sp.pool = pool()
+	sp.sanitizeReadBack = func(string) (bool, error) { return true, nil }
+	if _, _, err := sp.runSanitize(context.Background(), false); err != nil {
+		t.Fatalf("runSanitize: %v", err)
+	}
+	for _, c := range f.Calls() {
+		if strings.Contains(strings.Join(c.Args, " "), "/dev/sdb") && (c.Path == "blkdiscard" || c.Path == "wipefs" || c.Path == "sgdisk") {
+			t.Fatalf("sanitize touched the SAN LUN: %s %v", c.Path, c.Args)
+		}
+	}
+}

@@ -66,6 +66,10 @@ type Set struct {
 	// the next boot (see decisions/0008). Valid only on discover sets; the
 	// validator rejects it on a manual set. Default false.
 	Save bool `json:"save,omitempty"`
+	// IncludeSAN, on a selection=discover set, lets it pick FC and iSCSI LUNs.
+	// They are shared storage, so discover leaves them out by default; sanitize
+	// never erases them. The paths of a multipath LUN are never picked.
+	IncludeSAN bool `json:"include_san,omitempty"`
 	// Persistent, when true, is a hands-off guarantee: the set is never
 	// partitioned, formatted, or written, only mounted. It survives auto,
 	// sync, and full; only sanitize erases it. Operator-set only.
@@ -199,7 +203,7 @@ var (
 	allowedTopLevel = []string{"version", "sets", "comment"}
 	allowedSet      = []string{
 		"name", "role", "selection", "raid", "count", "spares",
-		"match", "devices", "save", "persistent", "bootloader", "allow_degraded", "origin", "volumes", "comment",
+		"match", "devices", "save", "include_san", "persistent", "bootloader", "allow_degraded", "origin", "volumes", "comment",
 	}
 	allowedMatch  = []string{"tags", "min_size", "max_size", "model"}
 	allowedOrigin = []string{"from", "at", "by", "host"}

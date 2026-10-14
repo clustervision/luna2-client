@@ -9,6 +9,7 @@ import (
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cleanup"
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/discover"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/disk/selector"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/diskresolve"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installcontext"
@@ -629,7 +630,11 @@ func (sp *setProcessor) resolveDiscover(ctx context.Context, set *v2.Set) error 
 	if err != nil {
 		return fatalConfigf("match-invalid", "set %q: match: %v", set.Name, err)
 	}
-	selected, err := diskresolve.Resolve(sp.pool, m, set.MemberCount(), set.SpareCount(), 0, sp.ownDisks(ctx, set))
+	pool := sp.pool
+	if !set.IncludeSAN {
+		pool = localDisks(pool)
+	}
+	selected, err := diskresolve.Resolve(pool, m, set.MemberCount(), set.SpareCount(), 0, sp.ownDisks(ctx, set, pool))
 	if err != nil {
 		if sp.poolErr != nil {
 			return fmt.Errorf("set %q: %w (device discovery failed: %v)", set.Name, err, sp.poolErr)
@@ -659,9 +664,9 @@ func (sp *setProcessor) resolveDiscover(ctx context.Context, set *v2.Set) error 
 // volume group or md array: the disks it was installed on before. A disk that
 // cannot be probed is simply not preferred; the signature refusals still run
 // before anything is created.
-func (sp *setProcessor) ownDisks(ctx context.Context, set *v2.Set) map[string]bool {
+func (sp *setProcessor) ownDisks(ctx context.Context, set *v2.Set, pool []discover.Device) map[string]bool {
 	own := map[string]bool{}
-	for _, d := range sp.pool {
+	for _, d := range pool {
 		disk := []string{d.KernelPath}
 		vgs, _ := vgselect.OnDisks(ctx, sp.runner, disk)
 		for _, v := range vgs {
@@ -687,6 +692,17 @@ func (sp *setProcessor) ownDisks(ctx context.Context, set *v2.Set) map[string]bo
 	return own
 }
 
+// localDisks leaves the SAN LUNs (shared storage) out of a pool.
+func localDisks(pool []discover.Device) []discover.Device {
+	out := make([]discover.Device, 0, len(pool))
+	for _, d := range pool {
+		if !d.SAN() {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
 // setMDNames are the md array names a set creates: its own, and for the os set
 // the ESP and /boot mirrors.
 func setMDNames(set *v2.Set) []string {
@@ -699,9 +715,10 @@ func setMDNames(set *v2.Set) []string {
 
 // runSanitize securely erases every discovered local disk, then stops.
 func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.StorageResult, []result.ResolvedSet, error) {
-	disks := make([]string, 0, len(sp.pool))
-	erase := make([]sanitize.Disk, 0, len(sp.pool))
-	for _, d := range sp.pool {
+	local := localDisks(sp.pool)
+	disks := make([]string, 0, len(local))
+	erase := make([]sanitize.Disk, 0, len(local))
+	for _, d := range local {
 		disks = append(disks, d.KernelPath)
 		erase = append(erase, sanitize.Disk{Path: d.KernelPath, Size: d.Size})
 	}

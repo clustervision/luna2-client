@@ -79,6 +79,8 @@ flowchart LR
 
 **`match`** (for discover) filters by media tag, size and model — a disk must satisfy all listed: `tags` (every tag present), `min_size`/`max_size`, `model` (substring). Tags are auto-derived at discovery: `rotary` (spinning), `ssd` (any solid state, incl. NVMe), `nvme` (a subset of `ssd`). E.g. `{ "tags": ["rotary"], "min_size": "8T" }` picks spinning disks of ≥8 TB.
 
+Discover never picks a USB disk or a path of a multipath LUN, and leaves FC and iSCSI LUNs (shared storage) out unless the set says **`include_san: true`**; sanitize never erases a SAN LUN. Disks that already carry the set's own volume group or md array are picked first, so a set stays on the disks it was installed on.
+
 **How to arrange them?** — the `raid` field:
 
 | `raid` | arrangement | disks | gives you |
