@@ -23,7 +23,9 @@ import (
 // bootableKernels returns every kernel release that has a module tree under
 // /lib/modules AND a /boot/vmlinuz-<release>, newest first. A module
 // directory alone is a leftover of an erased kernel package (see
-// detectKernelVersion) and is not rebuilt.
+// detectKernelVersion) and is not rebuilt. A +debug kernel is skipped while a
+// normal one exists, as detectKernelVersion does: dracut fails on it, and the
+// default kernel is then never a debug one.
 func bootableKernels(sysroot string) []string {
 	entries, err := os.ReadDir(filepath.Join(sysroot, "lib", "modules"))
 	if err != nil {
@@ -37,6 +39,15 @@ func bootableKernels(sysroot string) []string {
 		if fileExists(filepath.Join(sysroot, "boot", "vmlinuz-"+e.Name())) {
 			out = append(out, e.Name())
 		}
+	}
+	var normal []string
+	for _, k := range out {
+		if !isDebugKernelDir(k) {
+			normal = append(normal, k)
+		}
+	}
+	if len(normal) > 0 {
+		out = normal
 	}
 	sort.SliceStable(out, func(i, j int) bool { return compareKernelVersions(out[i], out[j]) > 0 })
 	return out
