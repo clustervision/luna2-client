@@ -192,6 +192,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			// an operator (exit 3) instead of retrying every 30 s for ever.
 			return cli.ExitFatalConfig(stderr, toolName, "config-validation", "%v", verr)
 		}
+		for _, w := range loaded.Warnings {
+			logger.Warn(w)
+		}
 		cfg = loaded
 	}
 	logger.KV("config_path", f.ConfigPath)

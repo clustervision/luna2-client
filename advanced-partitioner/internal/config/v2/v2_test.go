@@ -29,6 +29,9 @@ func TestValidCorpus(t *testing.T) {
 			if err := cfg.ValidateRaw(raw); err != nil {
 				t.Fatalf("ValidateRaw: %v", err)
 			}
+			if len(cfg.Warnings) > 0 {
+				t.Fatalf("a worked example must not warn: %q", cfg.Warnings)
+			}
 			if err := cfg.Validate(); err != nil {
 				t.Fatalf("Validate (round-trip): %v", err)
 			}

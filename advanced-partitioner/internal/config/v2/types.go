@@ -34,6 +34,9 @@ type Config struct {
 	// (round-trips through parse/marshal) and ignored by all validation and
 	// decision logic. Allowed at the layout, set, and volume levels.
 	Comment string `json:"comment,omitempty"`
+	// Warnings is what Validate found wrong but installable: the layout is
+	// accepted as written, and the installer logs each line for the operator.
+	Warnings []string `json:"-"`
 }
 
 // Set is one storage set: a group of disks (chosen automatically by match or

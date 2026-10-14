@@ -165,6 +165,36 @@ func TestBIOSDiskOSProceedsWithWarning(t *testing.T) {
 	}
 }
 
+// A layout the validator accepts with a warning installs, and the warning
+// reaches the tool log at WARN level so the operator sees what was read.
+func TestConfigWarningsAreLogged(t *testing.T) {
+	tmp := t.TempDir()
+	cmdline := filepath.Join(tmp, "cmdline")
+	if err := os.WriteFile(cmdline, []byte("root=luna rw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logDir := filepath.Join(tmp, "logs")
+	cfg := writeConfig(t, strings.Replace(validConfig, `"raid": "none",`, `"raid": "none", "spares": 1,`, 1))
+	var outBuf, errBuf bytes.Buffer
+	rc := run([]string{
+		"lpart-storage-prepare",
+		"--log-dir", logDir,
+		"--cmdline-path", cmdline,
+		"--skip-command-check",
+		"--skip-final-inventory",
+		"--config", cfg, "--dry-run",
+	}, &outBuf, &errBuf)
+	if strings.Contains(errBuf.String(), "fatal_config=config-validation") {
+		t.Fatalf("a warning must not refuse the layout; rc=%d stderr=%s", rc, errBuf.String())
+	}
+	logText := readToolLog(t, logDir)
+	for _, want := range []string{"level=WARN", `raid=none takes no spares, so spares=1 is ignored`} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("expected the validation warning to be logged with %q; log=%s", want, logText)
+		}
+	}
+}
+
 // A disk OS gets no bootloader on BIOS, so the post-install handoff must be a
 // pivot to /sysroot. An install ramdisk that reboots instead would land on a
 // disk with nothing to boot and loop back into PXE forever: refuse up front,

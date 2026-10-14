@@ -190,6 +190,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	if err := cfg.ValidateRaw(raw); err != nil {
 		return cli.ExitFatalConfig(stderr, toolName, "config-validation", "%v", err)
 	}
+	for _, w := range cfg.Warnings {
+		logger.Warn(w)
+	}
 	// A selection=discover set names no devices in the config: storage-prepare
 	// picks them from the disk pool and records them in storage-resolved.json
 	// only. Without them the check resolves an empty device list, reports

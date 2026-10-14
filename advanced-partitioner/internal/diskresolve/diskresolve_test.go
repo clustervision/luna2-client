@@ -69,9 +69,15 @@ func TestParseSize(t *testing.T) {
 		{"2048B", 2048, true},
 		{"2048", 2048, true},
 		{"8TB", 8 * tib, true}, // legacy two-letter form
+		{"8TiB", 8 * tib, true},
+		{"20gib", 20 * gib, true},
+		{"1.5T", 3 * tib / 2, true},
+		{"0.5g", gib / 2, true},
 		{"  16G ", 16 * gib, true},
 		{"", 0, false},
 		{"big", 0, false},
+		{"1.T", 0, false},
+		{"99999999999999999999G", 0, false},
 	}
 	for _, c := range cases {
 		got, err := ParseSize(c.in)
