@@ -397,6 +397,17 @@ function fetch_token {
     fi
 }
 
+# The install script reported where it stopped with a token issued when it
+# started, which a long erase outlives: report that state again with a fresh one.
+function luna_post_state () {
+    local _token
+    _token=$(fetch_token 2>/dev/null)
+    [ -n "$_token" ] && [ "$_token" != "None" ] || return 0
+    luna_curl -s -m 10 -X POST -H "x-access-tokens: $_token" -H "Content-Type: application/json" \
+        -d '{"monitor": {"status": {"'"$luna_node"'": {"state": "'"$1"'"}}}}' \
+        "${luna_url}/monitor/node/${luna_node}" > /dev/null 2>&1
+}
+
 # The install pipeline writes the stage, the reason and the failing step's
 # stderr here. Printing it on the console is the only chance an operator gets:
 # the node reboots into the next attempt before anyone can open a log.
@@ -491,13 +502,14 @@ function retry_countdown () {
 # (there is no installed OS to boot): show why, then park the operator in a
 # maintenance shell. 'poweroff' stops the node; exiting the shell re-opens it.
 # install_mode=sanitize finished (marker from lpart-node-installer): report and
-# power the node off. Nothing is left to boot, and returning to the retry loop
+# park the node. Nothing is left to boot, and returning to the retry loop
 # would only start another erase. The marker holds what lpart-storage-prepare
 # reported (the disks it erased, or that there was nothing to erase); print
 # that, never a fixed claim.
 LUNA_SANITIZE_MARKER=/tmp/install_files/runtime/sanitize.done
 function luna_sanitize_stop () {
     local rc="${1:-0}" _line
+    local ctty="${luna_ctty:-/dev/tty1}"
     echo "Luna2: ============================================================"
     echo "Luna2: SANITIZE FINISHED -- lpart-storage-prepare reported:"
     if [ -s "$LUNA_SANITIZE_MARKER" ]; then
@@ -507,18 +519,23 @@ function luna_sanitize_stop () {
     else
         echo "Luna2:   (no report was written -- check the install log)"
     fi
-    echo "Luna2: install_mode=sanitize stops the node: powering off in 10 s."
-    echo "Luna2: (install script exit status ${rc}; set another install_mode before the next boot)"
+    echo "Luna2: install_mode=sanitize stops the node here (install script exit"
+    echo "Luna2: status ${rc}): set another install_mode, then reboot the node."
+    echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
     echo "Luna2: ============================================================"
     if [ "$luna_loghost" ]; then
         readable_log < /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
     fi
+    luna_post_state install.sanitized
     sync
-    sleep 10
-    poweroff -f 2>/dev/null
-    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
-    echo o > /proc/sysrq-trigger 2>/dev/null
-    while true; do sleep 60; done
+    while true; do
+        if { exec 9<>"$ctty"; } 2>/dev/null; then
+            exec 9<&-
+            setsid -c /bin/sh -i -l 0<>"$ctty" 1<>"$ctty" 2<>"$ctty"
+        else
+            sleep 3600
+        fi
+    done
 }
 
 LUNA_FATAL_RC=3   # keep in sync with lpart-node-installer exitFatalConfig
@@ -526,6 +543,15 @@ LUNA_FATAL_RC=3   # keep in sync with lpart-node-installer exitFatalConfig
 # set protection): also deterministic, also parks. lpart-node-installer exits
 # 2 for a safety refusal and 3 for a non-retryable configuration error.
 LUNA_SAFETY_RC=2  # keep in sync with internal/cli ExitSafetyRefusal
+# The state the install template reported for lpart's park exit (lpart_phase).
+function lpart_park_state () {
+    if [ "$1" = "$LUNA_SAFETY_RC" ]; then
+        [ -f /tmp/install_files/runtime/degraded.done ] && echo install.degraded || echo install.refused
+    else
+        echo install.fatal
+    fi
+}
+
 function fatal_park () {
     local rc="${1:-?}" kind
     local ctty="${luna_ctty:-/dev/tty1}"
@@ -552,6 +578,9 @@ function fatal_park () {
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
     echo "Luna2: ============================================================"
+    if [ -s "$LUNA_FAILURE_FILE" ]; then
+        luna_post_state "$(lpart_park_state "$rc")"
+    fi
     while true; do
         if { exec 9<>"$ctty"; } 2>/dev/null; then
             exec 9<&-

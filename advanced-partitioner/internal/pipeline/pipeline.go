@@ -26,6 +26,7 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installcontext"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lpartinputs"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/model"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sanitize"
 )
 
 // Phase selects which built-in sequence to run.
@@ -271,7 +272,7 @@ func (p *Pipeline) runPre() error {
 }
 
 // SanitizeDoneMarker is written to the runtime dir after a successful
-// sanitize. luna-installer.sh stops (powers off) the node when it finds it,
+// sanitize. luna-installer.sh stops (parks) the node when it finds it,
 // whatever the rest of the install script did: sanitize promises "erase, then
 // stop", but the daemon's install template went on with the OS steps (network,
 // hostname: chroot into an empty /sysroot), failed, and the retry loop erased
@@ -354,14 +355,14 @@ func (p *Pipeline) runPart() error {
 	timeout := p.opts.StepTimeout
 	var report sanitizeReport
 	if mode.IsSanitize() {
-		// Zero-filling runs at the disks' write speed, one disk after the
-		// other: a fixed 2 h bound killed it part-way on large HDDs, and the
-		// retry started again from the first disk.
+		// Zero-filling runs at the disks' write speed: a fixed 2 h bound
+		// killed it part-way on large HDDs.
 		timeout = sanitizeTimeout(lsblkDisks(p.ctx), p.opts.StepTimeout)
-		if timeout > 0 {
-			p.info("sanitize: storage-prepare may take up to " + timeout.String() + " (local disk sizes at 50 MB/s)")
-		}
+		p.info("sanitize: storage-prepare may take up to " + timeout.String() + " (the largest local disk at 50 MB/s, written and read back)")
 		p.stepLine = report.observe
+	} else {
+		// Disks erased by an earlier sanitize may hold data again by now.
+		_ = os.Remove(p.rt(sanitize.ProgressFile))
 	}
 	err = p.runStepTimeout("storage-prepare", timeout, append([]string{p.bin("lpart-storage-prepare")}, args...))
 	p.stepLine = nil

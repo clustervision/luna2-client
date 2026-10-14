@@ -230,8 +230,28 @@ luna_report() {
     fi
 }
 
+# The install script reported where it stopped with a token issued when it
+# started, which a long erase outlives: report that state again with a fresh one.
+luna_post_state() {
+    local _token
+    _token=$(fetch_token 2>/dev/null)
+    [ -n "$_token" ] && [ "$_token" != "None" ] || return 0
+    luna_curl -s -m 10 -X POST -H "x-access-tokens: $_token" -H "Content-Type: application/json" \
+        -d '{"monitor": {"status": {"'"$luna_node"'": {"state": "'"$1"'"}}}}' \
+        "${luna_url}/monitor/node/${luna_node}" > /dev/null 2>&1
+}
+
+# The state the install template reported for lpart's park exit (lpart_phase).
+lpart_park_state() {
+    if [ "$1" = "$LUNA_SAFETY_RC" ]; then
+        [ -f /tmp/install_files/runtime/degraded.done ] && echo install.degraded || echo install.refused
+    else
+        echo install.fatal
+    fi
+}
+
 # install_mode=sanitize finished: report what lpart-storage-prepare reported
-# (the marker content) and power off -- a retry would only erase again.
+# (the marker content) and park -- a retry would only erase again.
 luna_sanitize_stop() {
     local _line _r=/lunatmp/luna-report.txt
     {
@@ -241,15 +261,21 @@ luna_sanitize_stop() {
         else
             echo "Luna2:   (no report was written -- check the install log)"
         fi
-        echo "Luna2: install_mode=sanitize stops the node: powering off in 10 s (install.sh rc=$1)."
+        echo "Luna2: install_mode=sanitize stops the node here (install.sh rc=$1):"
+        echo "Luna2: set another install_mode, then reboot the node."
+        echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
     } > "$_r"
     luna_report "$_r"
+    luna_post_state install.sanitized
     sync
-    sleep 10
-    poweroff -f 2>/dev/null
-    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
-    echo o > /proc/sysrq-trigger 2>/dev/null
-    while true; do sleep 60; done
+    while true; do
+        if { exec 9<>"$luna_ctty"; } 2>/dev/null; then
+            exec 9<&-
+            setsid -c /bin/sh -i -l 0<>"$luna_ctty" 1<>"$luna_ctty" 2<>"$luna_ctty"
+        else
+            sleep 3600
+        fi
+    done
 }
 
 # install.sh exit 2 (safety refusal) or 3 (non-retryable config error) recurs
@@ -277,6 +303,9 @@ fatal_park() {
         echo "Luna2: ============================================================"
     } > "$_r"
     luna_report "$_r"
+    if [ -s "$LUNA_FAILURE_FILE" ]; then
+        luna_post_state "$(lpart_park_state "$1")"
+    fi
     while true; do
         if { exec 9<>"$luna_ctty"; } 2>/dev/null; then
             exec 9<&-

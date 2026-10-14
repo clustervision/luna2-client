@@ -661,12 +661,14 @@ func (sp *setProcessor) resolveDiscover(set *v2.Set) error {
 // runSanitize securely erases every discovered local disk, then stops.
 func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.StorageResult, []result.ResolvedSet, error) {
 	disks := make([]string, 0, len(sp.pool))
+	erase := make([]sanitize.Disk, 0, len(sp.pool))
 	for _, d := range sp.pool {
 		disks = append(disks, d.KernelPath)
+		erase = append(erase, sanitize.Disk{Path: d.KernelPath, Size: d.Size})
 	}
 	if len(disks) == 0 {
 		// A diskless node is legitimate (exit 0), but say plainly that
-		// nothing was erased: the node powers off after sanitize.
+		// nothing was erased: the node parks after sanitize.
 		sp.logger.UserInfo("sanitize: no local disks found -- nothing was erased (USB, FC/iSCSI and multipath disks are excluded from sanitize by design)")
 		return nil, nil, nil
 	}
@@ -693,8 +695,8 @@ func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.
 		}
 		return nil, nil, fmt.Errorf("sanitize: pre-erase stack teardown: %w", err)
 	}
-	s := sanitize.New(sanitize.Options{Runner: sp.runner, Logger: sp.logger, DryRun: dryRun, ReadBack: sp.sanitizeReadBack})
-	if _, err := s.EraseAll(ctx, disks); err != nil {
+	s := sanitize.New(sanitize.Options{Runner: sp.runner, Logger: sp.logger, DryRun: dryRun, ReadBack: sp.sanitizeReadBack, Progress: sp.sanitizeProgress})
+	if _, err := s.EraseAll(ctx, erase); err != nil {
 		// Deterministic: the same disk fails the same way on every retry, so
 		// park for an operator (safety refusal, exit 2) instead of looping.
 		return nil, nil, safetyRefusalf("sanitize-incomplete", "%v", err)

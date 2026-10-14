@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -50,6 +51,7 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/partition"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/raid"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sanitize"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/storagehealth"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sysenv"
 )
@@ -310,6 +312,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		fs:       fsmod.New(fsmod.Options{Runner: runner, Logger: logger, MkfsFatName: tools.MkfsFat}),
 		mount:    mounter,
 		checker:  fscheck.New(fscheck.Options{Runner: runner, Logger: logger, FsckVfatCmd: tools.FsckVfat}),
+
+		sanitizeProgress: filepath.Join(filepath.Dir(f.ResultOut), sanitize.ProgressFile),
 	}
 
 	// Discover the disk pool once: selection=discover resolution and sanitize
@@ -450,6 +454,8 @@ type setProcessor struct {
 	pool     []discover.Device // discovered disks for selection=discover + sanitize
 	// sanitizeReadBack overrides the sanitize read-back verification (tests).
 	sanitizeReadBack func(disk string) (bool, error)
+	// sanitizeProgress records the disks a sanitize erased, for a retry.
+	sanitizeProgress string
 	// protected holds the canonical kernel paths of every PERSISTENT set's
 	// disks (filled by reserveManualSets). It is handed to cleanup as an
 	// independent barrier: no destructive cleanup step may touch these

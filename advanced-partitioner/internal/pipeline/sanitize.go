@@ -6,33 +6,24 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sanitize"
 )
 
-// sanitizeWriteRate is the zero-fill speed the sanitize step bound assumes:
-// well under what a large HDD sustains (~150-250 MB/s), so a healthy erase
-// never meets the bound and a wedged one still ends.
-const sanitizeWriteRate = 50 * 1000 * 1000 // bytes per second
-
 // sanitizeTimeout bounds a sanitize run's storage-prepare step. The disks are
-// zero-filled one after the other, so the bound is their total size at
-// sanitizeWriteRate, never below floor (the normal step bound). With no disk
-// sizes known (lsblk failed) it returns 0: no bound, rather than a guess that
-// kills a long erase part-way and starts it again from the first disk.
+// erased in parallel, each within its own sanitize.DiskBound, so the step may
+// take the largest of those on top of floor (the normal step bound, for the
+// stack teardown before the erase): a disk's own bound always ends first and
+// names the disk. With no disk sizes known (lsblk failed) the largest bound is
+// sanitize.UnknownSizeBound.
 func sanitizeTimeout(disks []disk, floor time.Duration) time.Duration {
-	var total int64
+	var largest int64
 	for _, d := range disks {
-		if d.Size > 0 {
-			total += d.Size
+		if d.Size > largest {
+			largest = d.Size
 		}
 	}
-	if total == 0 {
-		return 0
-	}
-	est := time.Duration(total/sanitizeWriteRate+1) * time.Second
-	if est < floor {
-		return floor
-	}
-	return est
+	return floor + sanitize.DiskBound(largest)
 }
 
 // sanitizeReport collects what lpart-storage-prepare reported about the

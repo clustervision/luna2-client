@@ -30,11 +30,15 @@
 package sanitize
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"strings"
+	"sync"
 	"time"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
@@ -51,6 +55,9 @@ type Options struct {
 	// ReadBack overrides the read-back verification (tests); nil reads the
 	// real device.
 	ReadBack func(disk string) (bool, error)
+	// Progress records every disk erased and verified, so a retry in the same
+	// boot skips it; "" keeps no record.
+	Progress string
 }
 
 // Sanitizer erases disks through the central executor.
@@ -59,11 +66,45 @@ type Sanitizer struct {
 	logger   *txlog.Logger
 	dryRun   bool
 	readBack func(disk string) (bool, error)
+	progress string
+	mu       sync.Mutex // serialises the Progress appends of parallel erases
 }
 
 // New builds a Sanitizer. Runner is required.
 func New(o Options) *Sanitizer {
-	return &Sanitizer{runner: o.runner(), logger: o.Logger, dryRun: o.DryRun, readBack: o.ReadBack}
+	return &Sanitizer{runner: o.runner(), logger: o.Logger, dryRun: o.DryRun, readBack: o.ReadBack, progress: o.Progress}
+}
+
+// ProgressFile is the Progress file's name in the install runtime dir.
+const ProgressFile = "sanitize.progress"
+
+// Disk is one disk to erase. Size is in bytes, 0 when unknown.
+type Disk struct {
+	Path string
+	Size int64
+}
+
+// WriteRate is the speed a disk bound assumes: well under what a large HDD
+// sustains, so a healthy erase never meets its bound and a wedged one ends.
+const WriteRate = 50 * 1000 * 1000 // bytes per second
+
+// UnknownSizeBound bounds the erase of a disk whose size is not known.
+const UnknownSizeBound = 24 * time.Hour
+
+// minDiskBound keeps a small disk's bound clear of command start-up costs.
+const minDiskBound = 10 * time.Minute
+
+// DiskBound is how long erasing one disk may take: writing it once and
+// reading it back whole, both at WriteRate.
+func DiskBound(size int64) time.Duration {
+	if size <= 0 {
+		return UnknownSizeBound
+	}
+	bound := time.Duration(2*(size/WriteRate+1)) * time.Second
+	if bound < minDiskBound {
+		return minDiskBound
+	}
+	return bound
 }
 
 func (o Options) runner() executor.Runner { return o.Runner }
@@ -76,32 +117,115 @@ type Result struct {
 	Overwritten bool   // true when the zero-out succeeded and read back blank
 }
 
-// EraseAll erases every disk and returns the per-disk results. It is
-// all-or-nothing only in the sense that a disk that cannot be erased by any
-// method is a hard error; disks before it are already erased (sanitize is
-// inherently destructive and not re-entrant in the "undo" sense).
-func (s *Sanitizer) EraseAll(ctx context.Context, disks []string) ([]Result, error) {
+// EraseAll erases every disk at once, each within its own DiskBound, and
+// returns the results of the disks that were erased. A disk that cannot be
+// erased fails the run once the others have finished; disks recorded in
+// Progress by an earlier attempt are not erased again.
+func (s *Sanitizer) EraseAll(ctx context.Context, disks []Disk) ([]Result, error) {
 	if s.runner == nil {
 		return nil, fmt.Errorf("sanitize: runner is required")
 	}
 	if len(disks) == 0 {
 		return nil, fmt.Errorf("sanitize: no disks to erase")
 	}
-	out := make([]Result, 0, len(disks))
-	for _, d := range disks {
-		r, err := s.EraseDisk(ctx, d)
-		if err != nil {
-			return out, err
+	done := s.erasedEarlier()
+	results := make([]Result, len(disks))
+	errs := make([]error, len(disks))
+	var wg sync.WaitGroup
+	for i, d := range disks {
+		if method, ok := done[d.Path]; ok {
+			results[i] = s.skipErased(d.Path, method)
+			continue
 		}
-		out = append(out, r)
+		wg.Add(1)
+		go func(i int, d Disk) {
+			defer wg.Done()
+			results[i], errs[i] = s.eraseBounded(ctx, d)
+		}(i, d)
 	}
-	return out, nil
+	wg.Wait()
+	out := make([]Result, 0, len(disks))
+	for i, r := range results {
+		if errs[i] == nil {
+			out = append(out, r)
+		}
+	}
+	return out, errors.Join(errs...)
+}
+
+// eraseBounded erases one disk within its DiskBound and records it in
+// Progress once it is verified.
+func (s *Sanitizer) eraseBounded(ctx context.Context, d Disk) (Result, error) {
+	bound := DiskBound(d.Size)
+	s.info("%s: may take up to %s", d.Path, bound)
+	dctx, cancel := context.WithTimeout(ctx, bound)
+	defer cancel()
+	r, err := s.eraseDisk(dctx, ctx, d.Path)
+	if err == nil && !s.dryRun {
+		s.record(r)
+	}
+	return r, err
+}
+
+// erasedEarlier reads the disks a previous attempt erased and verified.
+func (s *Sanitizer) erasedEarlier() map[string]string {
+	done := map[string]string{}
+	if s.progress == "" || s.dryRun {
+		return done
+	}
+	f, err := os.Open(s.progress)
+	if err != nil {
+		return done
+	}
+	defer func() { _ = f.Close() }()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if fields := strings.Fields(sc.Text()); len(fields) == 2 {
+			done[fields[0]] = fields[1]
+		}
+	}
+	return done
+}
+
+// skipErased reports a disk erased by an earlier attempt in the words of the
+// erase itself, so the sanitize report counts it.
+func (s *Sanitizer) skipErased(disk, method string) Result {
+	if method == "blkdiscard" {
+		s.info("%s: blkdiscard succeeded (blocks discarded, the whole device read back blank) in an earlier attempt", disk)
+		return Result{Disk: disk, Method: method, Discarded: true}
+	}
+	s.info("%s: zero-filled (read-back verified blank) in an earlier attempt", disk)
+	return Result{Disk: disk, Method: method, Overwritten: true}
+}
+
+func (s *Sanitizer) record(r Result) {
+	if s.progress == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	f, err := os.OpenFile(s.progress, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err == nil {
+		_, err = fmt.Fprintf(f, "%s %s\n", r.Disk, r.Method)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+	}
+	if err != nil {
+		s.warn("%s: could not record the erase in %s (%v); a retry erases it again", r.Disk, s.progress, err)
+	}
 }
 
 // EraseDisk erases a single disk via the layered strategy. An error means the
 // disk could not be verified erased (signatures and partition table are
 // cleared anyway); the caller must not report the sanitize as done.
 func (s *Sanitizer) EraseDisk(ctx context.Context, disk string) (Result, error) {
+	return s.eraseDisk(ctx, ctx, disk)
+}
+
+// eraseDisk erases within ctx; the damage limiting after a failed erase runs
+// under parent, so it still runs when ctx is the disk's expired bound.
+func (s *Sanitizer) eraseDisk(ctx, parent context.Context, disk string) (Result, error) {
 	if disk == "" {
 		return Result{}, fmt.Errorf("sanitize: empty disk path")
 	}
@@ -155,11 +279,14 @@ func (s *Sanitizer) EraseDisk(ctx context.Context, disk string) (Result, error) 
 	}
 
 	// 3. not erased: limit the damage, then fail closed.
-	_, wipeErr := s.runner.Run(ctx, executor.CommandSpec{
+	if ctx.Err() != nil {
+		s.warn("%s: the erase did not finish within its bound", disk)
+	}
+	_, wipeErr := s.runner.Run(parent, executor.CommandSpec{
 		Path: "wipefs", Args: []string{"-a", disk},
 		CaptureStderr: true,
 	})
-	_, zapErr := s.runner.Run(ctx, executor.CommandSpec{
+	_, zapErr := s.runner.Run(parent, executor.CommandSpec{
 		Path: "sgdisk", Args: []string{"--zap-all", disk},
 		CaptureStderr: true,
 	})

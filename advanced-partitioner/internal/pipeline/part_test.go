@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sanitize"
 )
 
 // fakeBin writes an executable shell script standing in for an lpart binary.
@@ -67,9 +69,10 @@ func TestPartPhaseClearsStaleResults(t *testing.T) {
 // The sanitize marker carries what storage-prepare reported.
 func TestSanitizeMarkerReportsTheErase(t *testing.T) {
 	rt, logs, bin := partEnv(t, "sanitize")
-	fakeBin(t, bin, "lpart-storage-prepare", `echo "sanitize: erasing 2 local disk(s): [/dev/sda /dev/sdb]" >&2
+	fakeBin(t, bin, "lpart-storage-prepare", `echo "sanitize: erasing 3 local disk(s): [/dev/sda /dev/sdb /dev/sdc]" >&2
 echo "/dev/sda: zero-filled (read-back verified blank)" >&2
-echo "/dev/sdb: blkdiscard succeeded (blocks discarded, read-back verified blank)" >&2`)
+echo "/dev/sdb: blkdiscard succeeded (blocks discarded, read-back verified blank)" >&2
+echo "/dev/sdc: zero-filled (read-back verified blank) in an earlier attempt" >&2`)
 	if err := runPartWith(t, rt, logs, bin); err != nil {
 		t.Fatalf("runPart: %v", err)
 	}
@@ -78,7 +81,7 @@ echo "/dev/sdb: blkdiscard succeeded (blocks discarded, read-back verified blank
 		t.Fatalf("marker: %v", err)
 	}
 	got := string(b)
-	for _, want := range []string{"2 local disk(s) erased", "/dev/sda (zero-filled)", "/dev/sdb (discarded)"} {
+	for _, want := range []string{"3 local disk(s) erased", "/dev/sda (zero-filled)", "/dev/sdb (discarded)", "/dev/sdc (zero-filled)"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("marker lost %q:\n%s", want, got)
 		}
@@ -118,16 +121,34 @@ func TestLocalModePassesTheResolvedDisksToStorageCheck(t *testing.T) {
 
 func TestSanitizeTimeout(t *testing.T) {
 	floor := 2 * time.Hour
-	if got := sanitizeTimeout(nil, floor); got != 0 {
-		t.Fatalf("no sizes known: want no bound, got %s", got)
+	if got := sanitizeTimeout(nil, floor); got != floor+sanitize.UnknownSizeBound {
+		t.Fatalf("no sizes known: want %s, got %s", floor+sanitize.UnknownSizeBound, got)
 	}
-	if got := sanitizeTimeout([]disk{{Size: 100 << 30}}, floor); got != floor {
-		t.Fatalf("small disk: want the %s floor, got %s", floor, got)
+	// The disks are erased in parallel: the largest one bounds the step,
+	// not their sum.
+	got := sanitizeTimeout([]disk{{Size: 2e12}, {Size: 2e12}, {Size: 100 << 30}}, floor)
+	if want := floor + sanitize.DiskBound(2e12); got != want {
+		t.Fatalf("2x2TB+100GiB: got %s, want %s", got, want)
 	}
-	// Two 2 TB HDDs at 50 MB/s: 80000 s, ~22 h -- far above the old 2 h bound.
-	got := sanitizeTimeout([]disk{{Size: 2e12}, {Size: 2e12}}, floor)
-	if got < 22*time.Hour || got > 23*time.Hour {
-		t.Fatalf("2x2TB: got %s, want ~22h", got)
+}
+
+// A run in any other mode forgets the disks an earlier sanitize erased: they
+// may hold data again by the next sanitize.
+func TestOtherModesForgetTheSanitizeProgress(t *testing.T) {
+	for mode, kept := range map[string]bool{"sanitize": true, "local": false} {
+		rt, logs, bin := partEnv(t, mode)
+		progress := filepath.Join(rt, sanitize.ProgressFile)
+		if err := os.WriteFile(progress, []byte("/dev/sda zeroout\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		fakeBin(t, bin, "lpart-storage-prepare", `exit 0`)
+		fakeBin(t, bin, "lpart-storage-check", `exit 0`)
+		if err := runPartWith(t, rt, logs, bin); err != nil {
+			t.Fatalf("%s: runPart: %v", mode, err)
+		}
+		if _, err := os.Stat(progress); (err == nil) != kept {
+			t.Errorf("%s: progress kept=%v, want %v", mode, err == nil, kept)
+		}
 	}
 }
 
