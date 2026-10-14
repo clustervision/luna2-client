@@ -151,7 +151,7 @@ func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string
 	}
 	for _, m := range members {
 		if md := mdHolder(ctx, runner, m); md != "" {
-			return false, adoptAssembledArray(ctx, runner, mdName, md, run, logger, start)
+			return false, adoptAssembledArray(ctx, runner, mdName, md, members, run, logger, start)
 		}
 	}
 	args := []string{"--assemble"}
@@ -206,13 +206,21 @@ func mdHolder(ctx context.Context, runner executor.Runner, dev string) string {
 // /dev/md/os-efi") -- a degraded mirror could never be synced or booted
 // locally on Ubuntu. Start it (degraded) when start allows it, and give it its
 // name; otherwise report it degraded and leave it as it is.
-func adoptAssembledArray(ctx context.Context, runner executor.Runner, mdName, md string, run func(string, ...string), logger *txlog.Logger, start bool) (degraded bool) {
+func adoptAssembledArray(ctx context.Context, runner executor.Runner, mdName, md string, members []string, run func(string, ...string), logger *txlog.Logger, start bool) (degraded bool) {
 	state := arrayState(ctx, runner, md)
 	if logger != nil {
 		logger.Info(fmt.Sprintf("activate: array %s is already assembled as /dev/%s (state %q); using it", mdName, md, state))
 	}
 	switch state {
 	case "clean", "active", "active-idle", "readonly", "read-auto", "write-pending":
+		// a member that missed writes (a stale disk put back) must not be
+		// taken over with the others; never used, whatever allow_degraded says
+		if events := memberEvents(ctx, runner, members); len(events) > 1 {
+			if logger != nil {
+				logger.Warn(fmt.Sprintf("activate: array %s (/dev/%s) members disagree on their event count (%s); not taken over", mdName, md, strings.Join(events, ", ")))
+			}
+			return true
+		}
 	default: // inactive (degraded, not started) or unknown
 		if !start {
 			return true
@@ -286,6 +294,31 @@ func mdSuperblockName(ctx context.Context, runner executor.Runner, part string) 
 		return name
 	}
 	return ""
+}
+
+// memberEvents returns the distinct event counts in the members' superblocks
+// (mdadm --examine "Events :"); members it cannot read are skipped.
+func memberEvents(ctx context.Context, runner executor.Runner, members []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range members {
+		res, err := runner.Run(ctx, executor.CommandSpec{
+			Path: "mdadm", Args: []string{"--examine", m},
+			CaptureStdout: true, CaptureStderr: true,
+		})
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(res.Stdout), "\n") {
+			if k, v, ok := strings.Cut(strings.TrimSpace(line), " : "); ok && strings.TrimSpace(k) == "Events" {
+				if v = strings.TrimSpace(v); !seen[v] {
+					seen[v] = true
+					out = append(out, m+"="+v)
+				}
+			}
+		}
+	}
+	return out
 }
 
 // warnIfDegraded logs a loud warning when /dev/md/<mdName> runs degraded.
