@@ -71,13 +71,13 @@ func TestRequireExpectedHostMismatch(t *testing.T) {
 	}
 }
 
-// $_HOSTNAME may be the FQDN: the expected name is reduced to its short form
-// too (the local name always was), and case does not matter.
+// $_HOSTNAME may be the FQDN: a name without a domain is compared as a short
+// name, two names with a domain in full, and case does not matter.
 func TestRequireExpectedHostFQDNOnBothSides(t *testing.T) {
 	for _, c := range []struct{ expected, local string }{
 		{"node001.cluster", "node001"},
 		{"node001.cluster", "node001.cluster"},
-		{"node001.cluster", "node001.other"},
+		{"node001.cluster", "NODE001.Cluster."},
 		{"NODE001", "node001.cluster"},
 	} {
 		if err := RequireExpectedHost(c.expected, Options{
@@ -90,6 +90,11 @@ func TestRequireExpectedHostFQDNOnBothSides(t *testing.T) {
 		Hostname: func() (string, error) { return "node0012.cluster", nil },
 	}); !errors.Is(err, ErrHostMismatch) {
 		t.Fatalf("a different short name must still mismatch: %v", err)
+	}
+	if err := RequireExpectedHost("node001.cluster", Options{
+		Hostname: func() (string, error) { return "node001.other", nil },
+	}); !errors.Is(err, ErrHostMismatch) {
+		t.Fatalf("the same short name in another domain must mismatch: %v", err)
 	}
 	if err := RequireExpectedHost("node001", Options{
 		Hostname: func() (string, error) { return "", errors.New("uname failed") },
