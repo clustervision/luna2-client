@@ -92,7 +92,7 @@ func TestDebianRegenerateInitramfsDracutFallback(t *testing.T) {
 		t.Fatalf("call shape wrong: %+v", calls)
 	}
 	args := strings.Join(calls[0].Args, " ")
-	if args != "dracut -f --omit luna --kver 6.8.0-31-generic" {
+	if args != strings.Join(dracutArgs("6.8.0-31-generic"), " ") {
 		t.Fatalf("args = %q", args)
 	}
 }
@@ -472,7 +472,7 @@ func TestDebianRegenerateInitramfsDracutWrapper(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := f.Calls()
-	if len(calls) != 1 || strings.Join(calls[0].Args, " ") != "dracut -f --omit luna --kver 7.0.0-14-generic" {
+	if len(calls) != 1 || strings.Join(calls[0].Args, " ") != strings.Join(dracutArgs("7.0.0-14-generic"), " ") {
 		t.Fatalf("calls = %+v", calls)
 	}
 }

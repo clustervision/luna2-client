@@ -43,7 +43,7 @@ func (a *rhelAdapter) Prepare(_ context.Context) error {
 	return requireBIOSGRUB(a.deps.BootContext, "grub2-install", "grub2-tools", "grub2-pc-modules", "usr/lib/grub/i386-pc")
 }
 
-// RegenerateInitramfs runs `dracut -f --omit luna --kver <version>` via chroot
+// RegenerateInitramfs runs dracut (dracutArgs) via chroot
 // for every bootable kernel in the image (see dracutAllKernels), after removing
 // the image's LVM devices file (removeImageLVMDevicesFile). Successor of
 // bootloader_rhel_regenerate_initramfs, which rebuilt one kernel only.

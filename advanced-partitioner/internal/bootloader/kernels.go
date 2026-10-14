@@ -66,9 +66,9 @@ func defaultKernel(kernels []string, preferRunning bool) string {
 	return newestKernel(kernels, true)
 }
 
-// dracutAllKernels runs `dracut -f --omit luna --kver <v>` for every bootable
-// kernel, the default kernel first, and returns the default. The luna module is
-// for the netboot install initramfs only, never the installed system's.
+// dracutAllKernels runs dracut (dracutArgs) for every bootable kernel, the
+// default kernel first, and returns the default. The luna module is for the
+// netboot install initramfs only, never the installed system's.
 //
 // A failure on the default kernel fails the step (the node would not boot); a
 // failure on another kernel is a loud warning, because that kernel is only
@@ -94,11 +94,11 @@ func dracutAllKernels(ctx context.Context, deps AdapterDeps, preferRunning bool)
 	for _, kver := range order {
 		if _, err := deps.Runner.Run(ctx, executor.CommandSpec{
 			Path: "/usr/bin/env", Chroot: sysroot,
-			Args:          []string{"dracut", "-f", "--omit", "luna", "--kver", kver},
+			Args:          dracutArgs(kver),
 			CaptureStdout: true, CaptureStderr: true,
 		}); err != nil {
 			if kver == def {
-				return "", fmt.Errorf("dracut -f --omit luna --kver %s: %w", kver, err)
+				return "", fmt.Errorf("%s: %w", strings.Join(dracutArgs(kver), " "), err)
 			}
 			failed = append(failed, kver)
 			if deps.Logger != nil {
@@ -218,8 +218,12 @@ const lvmDevicesFile = "etc/lvm/devices/system.devices"
 // every PV not in it -- this node's root PV included -- so the node stops at
 // "Volume group not found". Without the file LVM uses every device, which is
 // what a freshly provisioned node needs; `vgimportdevices -a` recreates it for
-// this node's PVs if a site wants the filtering back.
+// this node's PVs if a site wants the filtering back. A reused root
+// (install_mode local) keeps its file: it is this node's, not the image host's.
 func removeImageLVMDevicesFile(deps AdapterDeps) error {
+	if deps.BootContext.ReusesRoot {
+		return nil
+	}
 	p := filepath.Join(deps.BootContext.Sysroot, lvmDevicesFile)
 	if _, err := os.Lstat(p); err != nil {
 		return nil

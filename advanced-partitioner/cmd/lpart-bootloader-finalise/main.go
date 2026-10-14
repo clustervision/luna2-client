@@ -148,6 +148,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, "", err)
 	}
+	bctx.ReusesRoot = ic.InstallMode.IsLocal()
 	if err := writeBootContext(f.BootContextOut, bctx); err != nil {
 		errln(stderr, "write boot-context: %v", err)
 		return 1

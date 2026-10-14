@@ -80,7 +80,7 @@ func (a *debianAdapter) updateInitramfsIsDracut() bool {
 
 // RegenerateInitramfs regenerates the INSTALLED system's initramfs with the
 // generator the image uses: `update-initramfs -u -k all` for initramfs-tools
-// (or an image without dracut), else `dracut -f --omit luna --kver <kver>` for
+// (or an image without dracut), else dracut (dracutArgs) for
 // every bootable kernel — identical to the RHEL/SUSE path. Omit the luna
 // module: it is only for the netboot install initramfs, never the installed
 // system's. On Ubuntu 26.04 update-initramfs is dracut's wrapper, which builds

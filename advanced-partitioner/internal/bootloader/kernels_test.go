@@ -110,7 +110,7 @@ func TestDracutAllKernelsFailurePolicy(t *testing.T) {
 		f := executor.NewFakeRunner(executor.FakeResponse{})
 		f.AddMatch(executor.FakeMatch{
 			Path:       "chroot",
-			ArgsPrefix: []string{sysroot, "/usr/bin/env", "dracut", "-f", "--omit", "luna", "--kver", tc.failing},
+			ArgsPrefix: append([]string{sysroot, "/usr/bin/env"}, dracutArgs(tc.failing)...),
 			Response:   executor.FakeResponse{ExitCode: 1, Err: errors.New("exit 1")},
 		})
 		def, err := dracutAllKernels(context.Background(), AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot}}, true)
@@ -202,6 +202,23 @@ func TestRegenerateInitramfsRemovesImageLVMDevicesFile(t *testing.T) {
 				t.Errorf("%s: dry-run removed %s", fam, lvmDevicesFile)
 			}
 		}
+	}
+}
+
+// A reused root (install_mode local) keeps its LVM devices file: it was set up
+// for this node, by lpart or by the site, and is not the image host's.
+func TestRegenerateInitramfsKeepsDevicesFileOnReusedRoot(t *testing.T) {
+	pinRunningKernel(t, "")
+	sysroot := stageRHELSysroot(t, false)
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	a := &rhelAdapter{deps: AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot, ReusesRoot: true}}}
+	devices := filepath.Join(sysroot, lvmDevicesFile)
+	mustWriteFile(t, devices, "VERSION=1.1.2\n")
+	if err := a.RegenerateInitramfs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(devices); err != nil {
+		t.Fatalf("%s removed on a reused root: %v", lvmDevicesFile, err)
 	}
 }
 

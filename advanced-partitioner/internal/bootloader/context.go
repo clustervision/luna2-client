@@ -69,6 +69,10 @@ type BootContext struct {
 	RegisterNVRAM  string               `json:"register_nvram"`
 	ClearUEFINVRAM bool                 `json:"clear_uefi_nvram"`
 	StorageResult  result.StorageResult `json:"storage_result"`
+
+	// ReusesRoot is set when the install keeps the root already on disk
+	// (install_mode local) instead of writing a new one.
+	ReusesRoot bool `json:"reuses_root"`
 }
 
 // BIOSGRUBRequested reports whether this node asked for a BIOS GRUB install:
