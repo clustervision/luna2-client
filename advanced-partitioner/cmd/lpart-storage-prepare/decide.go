@@ -344,9 +344,11 @@ func classifyResolveErr(setName string, err error) error {
 	return fmt.Errorf("set %q: %w", setName, err)
 }
 
-// missingDeviceError is the fatal config error for a set whose absent
-// devices it cannot run without; nil when nothing is missing or the redundant
-// raid set can still run degraded (planSet then still refuses a create).
+// missingDeviceError is the error for a set with absent devices: a safety
+// refusal (reason degraded) when the redundant raid set could run without them
+// but the layout does not allow it, the fatal config error when it cannot run
+// at all, nil when nothing is missing or allow_degraded is set (planSet then
+// still refuses a create).
 func (sp *setProcessor) missingDeviceError(set *v2.Set) error {
 	missing := sp.missing[set.Name]
 	if len(missing) == 0 {
@@ -354,7 +356,12 @@ func (sp *setProcessor) missingDeviceError(set *v2.Set) error {
 	}
 	present := len(sp.manualDisks[set.Name])
 	if set.RunsDegradedWith(present) {
-		return nil
+		if set.AllowDegraded {
+			return nil
+		}
+		return safetyRefusalf("degraded",
+			"set %q is degraded: device(s) %s not present on this node (%d of %d present); replace the disk and reinstall with install_mode full, or set allow_degraded on the set to install on it degraded; no disk was touched",
+			set.Name, strings.Join(missing, ", "), present, len(set.EffectiveDevices()))
 	}
 	return fatalConfigf("device-missing",
 		"set %q: device(s) %s not present on this node, and raid %s cannot run without them (%d of %d device(s) present) -- replace the disk or correct the disklayout; no disk was touched",

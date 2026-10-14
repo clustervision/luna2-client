@@ -268,6 +268,9 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 	if err != nil {
 		return fmt.Errorf("config_validation: %s.raid %v", pfx, err)
 	}
+	if _, ok := setRaw["allow_degraded"]; ok && (r == raidlevel.RaidNone || r == raidlevel.Raid0) {
+		return fmt.Errorf("config_validation: %s.allow_degraded is valid on a redundant raid set only (raid 1, 5, 6 or 10)", pfx)
+	}
 
 	if s.Spares < 0 {
 		return fmt.Errorf("config_validation: %s.spares must be >= 0, got: %d", pfx, s.Spares)

@@ -285,6 +285,7 @@ const SanitizeDoneMarker = "sanitize.done"
 // this attempt's (the dashboard, the post phase's bootloader finalise).
 var partOutputs = []string{
 	SanitizeDoneMarker,
+	DegradedMarker,
 	"storage-result.json",
 	"storage-resolved.json",
 	"storage-check-result.json",
@@ -615,6 +616,23 @@ func (p *Pipeline) stageDone(id, note string) {
 func (p *Pipeline) stageFail(id, note string) {
 	p.emit(engine.InstallerEvent{Time: time.Now(), Type: engine.EvStageFailed, Stage: id, Message: note})
 	p.writeFailure(id, note)
+	p.markDegraded()
+}
+
+// DegradedMarker is written to the runtime dir when a step refused a degraded
+// raid set (safety_refusal=degraded); the install template then reports the
+// park as install.degraded instead of install.refused.
+const DegradedMarker = "degraded.done"
+
+func (p *Pipeline) markDegraded() {
+	for _, line := range p.stepStderr {
+		if strings.Contains(line, "safety_refusal=degraded") {
+			if err := os.WriteFile(p.rt(DegradedMarker), []byte(line+"\n"), 0o644); err != nil {
+				p.info("could not write " + p.rt(DegradedMarker) + ": " + err.Error())
+			}
+			return
+		}
+	}
 }
 
 func (p *Pipeline) failurePath() string { return filepath.Join(p.opts.LogDir, failureFile) }

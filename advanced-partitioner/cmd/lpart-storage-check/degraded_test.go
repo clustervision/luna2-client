@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 
+	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/disk/selector"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 )
@@ -36,5 +38,21 @@ func TestResolvePresentSeparatesMissingMembers(t *testing.T) {
 
 	if _, _, err := resolvePresent(context.Background(), r, []string{absent}); err == nil {
 		t.Fatal("a set with none of its devices present must fail")
+	}
+}
+
+// install_mode=local parks on a degraded set unless the set allows it.
+func TestDegradedRefusalFollowsAllowDegraded(t *testing.T) {
+	set := &v2.Set{Name: "os", Raid: "1", Devices: []string{"/dev/vda", "/dev/vdb"}}
+	if msg := degradedRefusal(set, 1, []string{"/dev/vdb"}); !strings.Contains(msg, "is degraded") {
+		t.Fatalf("missing member without allow_degraded must refuse, got %q", msg)
+	}
+	set.AllowDegraded = true
+	if msg := degradedRefusal(set, 1, []string{"/dev/vdb"}); msg != "" {
+		t.Fatalf("allow_degraded must let the set run degraded, got %q", msg)
+	}
+	set.AllowDegraded = false
+	if msg := degradedRefusal(set, 0, []string{"/dev/vda", "/dev/vdb"}); msg != "" {
+		t.Fatalf("a set that cannot run at all is not a degraded refusal, got %q", msg)
 	}
 }

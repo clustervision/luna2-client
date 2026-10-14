@@ -74,6 +74,9 @@ type Set struct {
 	// order or takes the bootloader away altogether. Absent means "last" —
 	// today's behaviour, the network entry ahead of the disk.
 	Bootloader Bootloader `json:"bootloader,omitempty"`
+	// AllowDegraded lets an install use this redundant raid set with members
+	// missing. Without it a degraded set parks the node for an operator.
+	AllowDegraded bool `json:"allow_degraded,omitempty"`
 	// Origin is provenance written by the installer when it pins a discovered
 	// layout (Save). It is not operator input; it round-trips when the pinned
 	// layout is read back on a later boot. nil on operator-authored configs.
@@ -196,7 +199,7 @@ var (
 	allowedTopLevel = []string{"version", "sets", "comment"}
 	allowedSet      = []string{
 		"name", "role", "selection", "raid", "count", "spares",
-		"match", "devices", "save", "persistent", "bootloader", "origin", "volumes", "comment",
+		"match", "devices", "save", "persistent", "bootloader", "allow_degraded", "origin", "volumes", "comment",
 	}
 	allowedMatch  = []string{"tags", "min_size", "max_size", "model"}
 	allowedOrigin = []string{"from", "at", "by", "host"}

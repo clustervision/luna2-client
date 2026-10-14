@@ -122,3 +122,23 @@ func TestDeviceMapperPathsRejected(t *testing.T) {
 		t.Fatalf("plain /dev/sda must stay valid: %v", err)
 	}
 }
+
+// allow_degraded is a boolean, and only means something on a set that has a
+// member to lose: raid 1, 5, 6 or 10.
+func TestAllowDegradedOnlyOnRedundantRaid(t *testing.T) {
+	layout := func(raid, value string) string {
+		return `{"version": 2, "sets": [{"name": "data", "role": "data", "selection": "manual", "raid": "` + raid + `",
+  "allow_degraded": ` + value + `, "devices": ["/dev/sda", "/dev/sdb"],
+  "volumes": [{"name": "d", "mountpoint": "/data", "fs": "xfs", "provider": "lvm", "size": "100%"}]}]}`
+	}
+	if err := validateJSON(t, layout("1", "true")); err != nil {
+		t.Fatalf("raid1 with allow_degraded: %v", err)
+	}
+	err := validateJSON(t, layout("0", "true"))
+	if err == nil || !strings.Contains(err.Error(), "allow_degraded is valid on a redundant raid set only") {
+		t.Fatalf("raid0 with allow_degraded must be refused, got %v", err)
+	}
+	if _, err := Parse([]byte(layout("1", `"yes"`))); err == nil {
+		t.Fatal("a non-boolean allow_degraded must not parse")
+	}
+}

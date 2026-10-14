@@ -235,6 +235,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 
 		resolved, missing, err := resolvePresent(context.Background(), resolver, set.EffectiveDevices())
+		if msg := degradedRefusal(set, len(resolved), missing); err == nil && msg != "" {
+			return cli.ExitSafetyRefusal(stderr, toolName, "degraded", "%s", msg)
+		}
 		if err == nil && len(missing) > 0 && !set.RunsDegradedWith(len(resolved)) {
 			err = fmt.Errorf("device(s) %s not present on this node, and raid %s cannot run without them (%d of %d device(s) present)",
 				strings.Join(missing, ", "), set.Raid, len(resolved), len(set.EffectiveDevices()))
@@ -417,4 +420,15 @@ func resolvePresent(ctx context.Context, resolver *selector.Resolver, devices []
 		return nil, missing, fmt.Errorf("none of the set's devices (%s) is present on this node", strings.Join(missing, ", "))
 	}
 	return present, missing, nil
+}
+
+// degradedRefusal is the reason to park when a redundant raid set could run
+// without its missing members but the layout does not allow it; "" otherwise.
+// Same rule and wording as lpart-storage-prepare.
+func degradedRefusal(set *v2.Set, present int, missing []string) string {
+	if len(missing) == 0 || set.AllowDegraded || !set.RunsDegradedWith(present) {
+		return ""
+	}
+	return fmt.Sprintf("set %q is degraded: device(s) %s not present on this node (%d of %d present); replace the disk and reinstall with install_mode full, or set allow_degraded on the set to install on it degraded",
+		set.Name, strings.Join(missing, ", "), present, len(set.EffectiveDevices()))
 }

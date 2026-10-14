@@ -178,3 +178,24 @@ func TestPostPhaseSkipsBootloaderForSanitize(t *testing.T) {
 		t.Fatal("auto post phase without storage-result.json must fail")
 	}
 }
+
+// A step that refused a degraded set leaves the marker the install template
+// reads to report install.degraded; any other refusal leaves none.
+func TestMarkDegradedFromStepStderr(t *testing.T) {
+	for _, c := range []struct {
+		line string
+		want bool
+	}{
+		{"lpart-storage-prepare: safety_refusal=degraded set \"os\" is degraded", true},
+		{"lpart-storage-prepare: safety_refusal=data-fence set \"os\" is broken", false},
+	} {
+		dir := t.TempDir()
+		p := New(context.Background(), Options{Phase: PhasePart, RuntimeDir: dir, LogDir: dir})
+		p.stepStderr = []string{c.line}
+		p.markDegraded()
+		_, err := os.Stat(p.rt(DegradedMarker))
+		if (err == nil) != c.want {
+			t.Fatalf("%q: marker present = %v, want %v", c.line, err == nil, c.want)
+		}
+	}
+}

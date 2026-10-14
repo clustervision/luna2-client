@@ -116,12 +116,15 @@ func raidOSSet(raid string, devs ...string) v2.Set {
 
 // --- item 5 (refined): a dead raid member ---------------------------------
 
-// A raid1 os set with one dead member, mounted (sync, healthy verdict): the
-// node keeps booting on the surviving disk, degraded, with a loud warning.
+// A raid1 os set with one dead member and allow_degraded, mounted (sync,
+// healthy verdict): the node keeps booting on the surviving disk, degraded,
+// with a loud warning.
 func TestDegradedRaidMountContinuesWithPresentMember(t *testing.T) {
 	sp, f := testProcessor(t, "/dev/vdb")
 	withVerdict(sp, storagehealth.VerdictHealthy)
-	cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("1", "/dev/vda", "/dev/vdb")}}
+	osSet := raidOSSet("1", "/dev/vda", "/dev/vdb")
+	osSet.AllowDegraded = true
+	cfg := &v2.Config{Version: 2, Sets: []v2.Set{osSet}}
 	if err := sp.reserveManualSets(context.Background(), cfg); err != nil {
 		t.Fatalf("a raid1 set with one member present must be tolerated: %v", err)
 	}
@@ -139,8 +142,26 @@ func TestDegradedRaidMountContinuesWithPresentMember(t *testing.T) {
 	}
 }
 
-// The same dead member under a create (full, or auto on a broken os set) is a
-// fatal config error naming the device, before any disk is touched.
+// Without allow_degraded the same dead member parks the node: a safety
+// refusal (reason degraded) in every mode, before any disk is touched.
+func TestDegradedRaidWithoutAllowParks(t *testing.T) {
+	for _, mode := range []installcontext.Mode{installcontext.ModeSync, installcontext.ModeAuto, installcontext.ModeFull} {
+		t.Run(string(mode), func(t *testing.T) {
+			sp, f := testProcessor(t, "/dev/vdb")
+			withVerdict(sp, storagehealth.VerdictHealthy)
+			cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("1", "/dev/vda", "/dev/vdb")}}
+			_, _, err := sp.runDecision(context.Background(), mode, cfg, "uefi", false, true)
+			wantSafety(t, err, "degraded")
+			if d := destructive(f); d != "" {
+				t.Fatalf("a refused degraded set touched a disk: %s", d)
+			}
+		})
+	}
+}
+
+// With allow_degraded, the same dead member under a create (full, or auto on a
+// broken os set) is still a fatal config error naming the device, before any
+// disk is touched: a create needs every device.
 func TestDegradedRaidCreateIsFatalBeforeTouchingDisks(t *testing.T) {
 	for _, c := range []struct {
 		mode    installcontext.Mode
@@ -156,7 +177,9 @@ func TestDegradedRaidCreateIsFatalBeforeTouchingDisks(t *testing.T) {
 		t.Run(string(c.mode)+"/"+string(c.verdict), func(t *testing.T) {
 			sp, f := testProcessor(t, "/dev/vdb")
 			withVerdict(sp, c.verdict)
-			cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("1", "/dev/vda", "/dev/vdb")}}
+			osSet := raidOSSet("1", "/dev/vda", "/dev/vdb")
+			osSet.AllowDegraded = true
+			cfg := &v2.Config{Version: 2, Sets: []v2.Set{osSet}}
 			_, _, err := sp.runDecision(context.Background(), c.mode, cfg, "uefi", false, true)
 			wantFatal(t, err, "device-missing")
 			if !strings.Contains(err.Error(), "/dev/vdb") {
@@ -209,7 +232,7 @@ func TestMissingDeviceNonRedundantIsFatal(t *testing.T) {
 // member stays protected.
 func TestDegradedPersistentSetStaysProtected(t *testing.T) {
 	sp, _ := testProcessor(t, "/dev/vdc")
-	data := v2.Set{Name: "data", Role: "data", Selection: "manual", Raid: "1", Persistent: true,
+	data := v2.Set{Name: "data", Role: "data", Selection: "manual", Raid: "1", Persistent: true, AllowDegraded: true,
 		Devices: []string{"/dev/vdb", "/dev/vdc"},
 		Volumes: []v2.Volume{{Name: "d", Mountpoint: "/data", FS: "xfs", Size: "100%", Provider: "lvm"}}}
 	cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("none", "/dev/vda"), data}}
