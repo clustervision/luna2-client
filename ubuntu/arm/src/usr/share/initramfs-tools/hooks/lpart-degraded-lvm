@@ -41,7 +41,6 @@ esac
 
 f="${DESTDIR}/scripts/local-block/mdadm"
 [ -f "$f" ] || exit 0
-grep -q -- '--assemble --scan --run' "$f" || exit 0
 grep -q 'lpart-degraded-lvm' "$f" && exit 0
 awk '{ print }
      /mdadm -q --assemble --scan --run/ {
@@ -50,4 +49,7 @@ awk '{ print }
          print "    wait_for_udev 10"
      }' "$f" > "$f.lpart" && cat "$f.lpart" > "$f"
 rm -f "$f.lpart"
+# Ubuntu changed the script this hook patches: say so, the race is back.
+grep -q 'lpart-degraded-lvm' "$f" ||
+    echo "W: lpart-degraded-lvm: scripts/local-block/mdadm has no 'mdadm -q --assemble --scan --run' line to patch; an LVM root on a degraded mirror may not boot" >&2
 exit 0

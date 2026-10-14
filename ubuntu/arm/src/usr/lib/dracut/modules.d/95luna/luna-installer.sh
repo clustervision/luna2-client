@@ -443,7 +443,7 @@ function retry_countdown () {
     echo "Luna2: ============================================================"
     echo "Luna2: INSTALLER FAILED -- retrying in ${secs}s."
     print_failure_reason
-    echo "Luna2: Exit ${rc}: a retryable failure; the reason is above. Retrying."
+    echo "Luna2: Exit ${rc}: a retryable failure; the reason is above. Retrying in ${secs}s."
     echo "Luna2: Press any key to drop to a shell (exit to resume, poweroff to stop)."
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: ============================================================"
@@ -523,11 +523,11 @@ function luna_sanitize_stop () {
 
 LUNA_FATAL_RC=3   # keep in sync with lpart-node-installer exitFatalConfig
 # Exit 2 is the lpart tools' safety_refusal contract (data fence, persistent-
-# set protection): also deterministic, also parks. The node-installer already
-# maps sub-tool exit 2 -> 3; this catches a directly-invoked lpart tool too.
+# set protection): also deterministic, also parks. lpart-node-installer exits
+# 2 for a safety refusal and 3 for a non-retryable configuration error.
 LUNA_SAFETY_RC=2  # keep in sync with internal/cli ExitSafetyRefusal
 function fatal_park () {
-    local rc="${1:-?}"
+    local rc="${1:-?}" kind
     local ctty="${luna_ctty:-/dev/tty1}"
     echo ""
     echo "Luna2: ============================================================"
@@ -537,8 +537,12 @@ function fatal_park () {
     # from anything else the install script runs, e.g. an operator script.
     if [ -s "$LUNA_FAILURE_FILE" ]; then
         print_failure_reason
-        echo "Luna2: lpart reported the reason above (a safety refusal or a non-retryable"
-        echo "Luna2: configuration error); it would recur on every attempt."
+        case "$rc" in
+            "$LUNA_SAFETY_RC") kind="a safety refusal" ;;
+            *) kind="a non-retryable configuration error" ;;
+        esac
+        echo "Luna2: lpart reported the reason above: ${kind}, which would recur on"
+        echo "Luna2: every attempt."
     else
         echo "Luna2: The install script exited ${rc} (operator script or install step);"
         echo "Luna2: see the log."

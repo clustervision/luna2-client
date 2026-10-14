@@ -255,17 +255,26 @@ luna_sanitize_stop() {
 # install.sh exit 2 (safety refusal) or 3 (non-retryable config error) recurs
 # on every attempt: show the reason, park in a shell, never retry.
 fatal_park() {
-    local _line _r=/lunatmp/luna-report.txt
+    local _kind _r=/lunatmp/luna-report.txt
     {
+        echo "Luna2: ============================================================"
         echo "Luna2: INSTALL FAILED (exit $1) -- NOT retrying."
         if [ -s "$LUNA_FAILURE_FILE" ]; then
-            echo "Luna2: Reason (reported by lpart):"
-            while IFS= read -r _line || [ -n "$_line" ]; do echo "Luna2:   ${_line}"; done < "$LUNA_FAILURE_FILE"
+            print_failure_reason
+            case "$1" in
+                "$LUNA_SAFETY_RC") _kind="a safety refusal" ;;
+                *) _kind="a non-retryable configuration error" ;;
+            esac
+            echo "Luna2: lpart reported the reason above: ${_kind}, which would recur on"
+            echo "Luna2: every attempt."
         else
-            echo "Luna2: The install script exited $1 (operator script or install step); see the log."
+            echo "Luna2: The install script exited $1 (operator script or install step);"
+            echo "Luna2: see the log."
         fi
-        echo "Luna2: Exit 2 and 3 are non-retryable: the node is parked. 'poweroff' stops it;"
-        echo "Luna2: exiting the shell re-opens it (no retry)."
+        echo "Luna2: Exit 2 and 3 are non-retryable, so the node is parked instead of"
+        echo "Luna2: reinstalling in a loop."
+        echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
+        echo "Luna2: ============================================================"
     } > "$_r"
     luna_report "$_r"
     while true; do
