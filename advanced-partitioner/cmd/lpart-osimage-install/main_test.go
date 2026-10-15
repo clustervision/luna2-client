@@ -433,3 +433,27 @@ func TestStorageResultOSMountpoints(t *testing.T) {
 		t.Fatalf("single set holding /: os mountpoints %v, err %v", s.OSMountpoints, err)
 	}
 }
+
+// Persistent sets are never written: an image_wins entry that reaches one is a
+// configuration error, refused before anything is extracted.
+func TestImageWinsIntoPersistentRefused(t *testing.T) {
+	tmp := t.TempDir()
+	pm := filepath.Join(tmp, "mounts")
+	cfg := filepath.Join(tmp, "filter.json")
+	sr := filepath.Join(tmp, "storage-result.json")
+	for p, body := range map[string]string{
+		pm:  "tmpfs /sysroot tmpfs rw 0 0\n",
+		cfg: `{"image_wins": ["home/alice/.bashrc"]}`,
+		sr: `{"version":2,"sets":[{"name":"os","role":"os","filesystems":[{"mount":"/"}]},
+			{"name":"home","role":"data","persistent":true,"filesystems":[{"mount":"/home"}]}]}`,
+	} {
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stderr, rc := runEnv(t, "--proc-mounts", pm, "--sysroot", "/sysroot", "--config", cfg, "--storage-result", sr,
+		"--luna-token", "x", "--osimage-file", "img.tar.bz2", "--luna-install-script", "/nonexistent-for-test", "--skip-download")
+	if rc != 3 || !strings.Contains(stderr, "persistent mountpoint /home") {
+		t.Fatalf("want exit 3 naming the persistent mountpoint; rc=%d stderr=%s", rc, stderr)
+	}
+}

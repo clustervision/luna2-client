@@ -93,6 +93,15 @@ func (p Pattern) Match(rel string) bool {
 	return false
 }
 
+// Reaches reports whether p can match dir or anything below it.
+func (p Pattern) Reaches(dir string) bool {
+	if p.Match(dir) || strings.HasPrefix(p.Base, dir+"/") {
+		return true
+	}
+	lit := literalPrefix(p.Raw)
+	return lit != "" && strings.HasPrefix(dir+"/", lit)
+}
+
 // globMatch implements bash-case style globbing. `?` matches one byte,
 // `*` matches zero or more bytes including `/`. Anything else is a
 // literal. Multiple consecutive `*`s collapse to one (bash treats `*`

@@ -294,6 +294,14 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	if filterErr != nil {
 		return cli.ExitFatalConfig(stderr, toolName, "osimage-filter", "%v", filterErr)
 	}
+	for _, mp := range relMounts(srSummary.PersistentMountpoints) {
+		for _, w := range imageWins {
+			if w.Reaches(mp) {
+				return cli.ExitFatalConfig(stderr, toolName, "osimage-filter",
+					"image_wins entry %q reaches the persistent mountpoint /%s, which the install never writes", w.Raw, mp)
+			}
+		}
+	}
 	// Pre-compute tar excludes so the log captures them regardless of
 	// whether --skip-extract / --skip-download short-circuit later.
 	excludes := osimage.BuildTarExcludes(preserve, preserveEmpty, noNew)
