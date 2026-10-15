@@ -160,9 +160,9 @@ func TestDebianInstallUEFI(t *testing.T) {
 			t.Fatalf("/etc/default/grub missing %q:\n%s", want, body)
 		}
 	}
-	// GRUB_DISABLE_SUBMENU is RHEL-only.
-	if strings.Contains(string(body), "GRUB_DISABLE_SUBMENU") {
-		t.Fatalf("Debian grub default should NOT include GRUB_DISABLE_SUBMENU:\n%s", body)
+	// The submenu is off on every family.
+	if !strings.Contains(string(body), "GRUB_DISABLE_SUBMENU=true") {
+		t.Fatalf("Debian grub default must disable the submenu:\n%s", body)
 	}
 
 	// Stub grub.cfg landed under /EFI/debian/ pointing at /boot/grub/

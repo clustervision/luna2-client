@@ -181,14 +181,9 @@ type RegisterUEFIEntriesOptions struct {
 	BootDevices   []string
 	RegisterNVRAM string // "auto"|"yes"|"no"
 	// ESPPartition is the GPT partition number of the ESP on each boot
-	// disk (from storage-result esp_partition). 0 (a result that did not
-	// record it, e.g. a mount-existing layout) means detect it per disk
-	// (detectESPPartition), and only when that finds nothing assume 1.
+	// disk (from storage-result esp_partition); 0 falls back to 1.
 	ESPPartition int
-	// ESPDevice is the /boot/efi filesystem's device from the storage result
-	// (a partition or its md mirror); it disambiguates the detection.
-	ESPDevice   string
-	SnapshotDir string // optional; if non-empty, efibootmgr -v captures are written here
+	SnapshotDir  string // optional; if non-empty, efibootmgr -v captures are written here
 	// BootOrder is "first" or "last" (empty = last), from the os set's
 	// bootloader key.
 	BootOrder string
@@ -316,23 +311,12 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 
 	// 2. Create one TrinityX entry per boot disk. The ESP partition number
 	// comes from the storage result (FTA D11 — it used to be hardcoded 1,
-	// an assumption of the current layout builder rather than a fact), or is
-	// read from the disk when the result did not record it.
+	// an assumption of the current layout builder rather than a fact).
+	espPart := opts.ESPPartition
+	if espPart <= 0 {
+		espPart = 1
+	}
 	for _, disk := range opts.BootDevices {
-		espPart := opts.ESPPartition
-		if espPart <= 0 {
-			espPart = detectESPPartition(ctx, opts.Runner, disk, opts.ESPDevice)
-			switch {
-			case espPart > 0 && opts.Logger != nil:
-				opts.Logger.Info(fmt.Sprintf("ESP partition number not in the storage result; detected partition %d on %s", espPart, disk))
-			case espPart <= 0:
-				espPart = 1
-				if opts.Logger != nil {
-					opts.Logger.Warn("ESP partition number neither in the storage result nor detectable on " + disk +
-						" (no EF00 partition, none mounted at /boot/efi); assuming partition 1")
-				}
-			}
-		}
 		label := fmt.Sprintf("%s %s", BootloaderID, filepath.Base(disk))
 		if _, err := opts.Runner.Run(ctx, executor.CommandSpec{
 			Path: eb, Chroot: opts.Sysroot,

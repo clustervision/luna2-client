@@ -25,7 +25,7 @@ func TestReentrantFstabSecondCallDoesNotDuplicate(t *testing.T) {
 		},
 	}
 	for i := 0; i < 3; i++ {
-		if err := WriteFstab(fsops.FS{}, sysroot, sr); err != nil {
+		if err := WriteFstab(fsops.FS{}, nil, sysroot, sr); err != nil {
 			t.Fatalf("pass %d: %v", i+1, err)
 		}
 	}
@@ -68,7 +68,7 @@ func TestReentrantFstabPreservesManualEdits(t *testing.T) {
 			{Mount: "/data", FS: "ext4", Device: "/dev/sda2", UUID: "auto-data"},
 		},
 	}
-	if err := WriteFstab(fsops.FS{}, sysroot, sr); err != nil {
+	if err := WriteFstab(fsops.FS{}, nil, sysroot, sr); err != nil {
 		t.Fatalf("WriteFstab: %v", err)
 	}
 	body, _ := os.ReadFile(filepath.Join(sysroot, "etc", "fstab")) //nolint:gosec // test artefact

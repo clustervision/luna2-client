@@ -149,6 +149,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return fail(stderr, "", err)
 	}
 	bctx.ReusesRoot = ic.InstallMode.IsLocal()
+	if bctx.LunaKernelOptions, err = bootloader.LunaKernelOptions(f.CmdlinePath); err != nil {
+		errln(stderr, "%v", err)
+		return 1
+	}
 	if err := writeBootContext(f.BootContextOut, bctx); err != nil {
 		errln(stderr, "write boot-context: %v", err)
 		return 1
@@ -162,13 +166,12 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.UserInfo("Sysroot: %s", bctx.Sysroot)
 
 	nativeFS := fsops.FS{DryRun: f.DryRun, Logger: logger}
+	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
 
 	logger.SetStage("write_fstab")
-	if err := bootloader.WriteFstab(nativeFS, bctx.Sysroot, bctx.StorageResult); err != nil {
+	if err := bootloader.WriteFstab(nativeFS, runner, bctx.Sysroot, bctx.StorageResult); err != nil {
 		return fail(stderr, "write fstab", err)
 	}
-
-	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
 
 	cleanup := func() {
 		bootloader.CleanupBindMounts(context.Background(), runner, bctx.Sysroot, nil)

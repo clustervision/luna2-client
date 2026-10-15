@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
 )
 
@@ -20,7 +21,7 @@ func TestWriteFstabBasic(t *testing.T) {
 			{Mount: "swap", FS: "swap", Device: "/dev/mapper/os-swap", UUID: "swap-uuid"},
 		},
 	}
-	if err := WriteFstab(fsops.FS{}, sysroot, sr); err != nil {
+	if err := WriteFstab(fsops.FS{}, nil, sysroot, sr); err != nil {
 		t.Fatalf("WriteFstab: %v", err)
 	}
 	body, err := os.ReadFile(filepath.Join(sysroot, "etc", "fstab")) //nolint:gosec // test artefact
@@ -47,7 +48,7 @@ func TestWriteFstabExt4DumpPass(t *testing.T) {
 			{Mount: "/home", FS: "ext4", Device: "/dev/sda2", UUID: "home-ext4"},
 		},
 	}
-	if err := WriteFstab(fsops.FS{}, sysroot, sr); err != nil {
+	if err := WriteFstab(fsops.FS{}, nil, sysroot, sr); err != nil {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(filepath.Join(sysroot, "etc", "fstab")) //nolint:gosec // test artefact
@@ -67,7 +68,7 @@ func TestWriteFstabTmpfsRoot(t *testing.T) {
 			{Mount: "/", FS: "tmpfs", Device: "tmpfs", Options: "defaults,size=2G"},
 		},
 	}
-	if err := WriteFstab(fsops.FS{}, sysroot, sr); err != nil {
+	if err := WriteFstab(fsops.FS{}, nil, sysroot, sr); err != nil {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(filepath.Join(sysroot, "etc", "fstab")) //nolint:gosec // test artefact
@@ -93,7 +94,7 @@ func TestWriteFstabPreservesExisting(t *testing.T) {
 			{Mount: "/boot", FS: "xfs", Device: "/dev/sda2", UUID: "boot-uuid"},
 		},
 	}
-	if err := WriteFstab(fsops.FS{}, sysroot, sr); err != nil {
+	if err := WriteFstab(fsops.FS{}, nil, sysroot, sr); err != nil {
 		t.Fatal(err)
 	}
 	body, _ := os.ReadFile(filepath.Join(sysroot, "etc", "fstab")) //nolint:gosec // test artefact
@@ -117,16 +118,34 @@ func TestWriteFstabPreservesExisting(t *testing.T) {
 	}
 }
 
-func TestWriteFstabMissingUUIDFails(t *testing.T) {
-	sysroot := t.TempDir()
+// A filesystem without a UUID in the result is read back with blkid after
+// udev settled; when blkid has none either, the entry is fatal.
+func TestWriteFstabMissingUUID(t *testing.T) {
 	sr := result.StorageResult{
 		Filesystems: []result.Filesystem{
 			{Mount: "/", FS: "xfs", Device: "/dev/sda1"}, // no UUID
 		},
 	}
-	err := WriteFstab(fsops.FS{}, sysroot, sr)
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	err := WriteFstab(fsops.FS{}, f, t.TempDir(), sr)
 	if err == nil || !strings.Contains(err.Error(), "missing UUID") {
 		t.Fatalf("expected missing-UUID error; got %v", err)
+	}
+
+	sysroot := t.TempDir()
+	f = executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "blkid", ArgsPrefix: []string{"-p", "-s", "UUID", "-o", "value", "/dev/sda1"},
+		Response: executor.FakeResponse{Stdout: []byte("late-uuid\n")}})
+	if err := WriteFstab(fsops.FS{}, f, sysroot, sr); err != nil {
+		t.Fatalf("WriteFstab: %v", err)
+	}
+	body, _ := os.ReadFile(filepath.Join(sysroot, "etc", "fstab")) //nolint:gosec // test artefact
+	if !strings.Contains(string(body), "UUID=late-uuid / xfs defaults 0 0") {
+		t.Fatalf("recovered UUID not used:\n%s", body)
+	}
+	calls := f.Calls()
+	if len(calls) != 2 || calls[0].Path != "udevadm" || calls[0].Args[0] != "settle" || calls[1].Path != "blkid" {
+		t.Fatalf("expected udevadm settle then blkid, got %v", calls)
 	}
 }
 
@@ -168,7 +187,7 @@ func TestWriteFstabReplacesStaleImageEntry(t *testing.T) {
 			{Mount: "/", FS: "xfs", UUID: "1111-2222"},
 		},
 	}
-	if err := WriteFstab(fsops.FS{}, sysroot, sr); err != nil {
+	if err := WriteFstab(fsops.FS{}, nil, sysroot, sr); err != nil {
 		t.Fatalf("WriteFstab: %v", err)
 	}
 	body, _ := os.ReadFile(filepath.Join(sysroot, "etc/fstab")) //nolint:gosec // test file
@@ -183,7 +202,7 @@ func TestWriteFstabReplacesStaleImageEntry(t *testing.T) {
 		t.Fatalf("unrelated image line must survive:\n%s", got)
 	}
 	// Idempotency: a second run must not duplicate.
-	if err := WriteFstab(fsops.FS{}, sysroot, sr); err != nil {
+	if err := WriteFstab(fsops.FS{}, nil, sysroot, sr); err != nil {
 		t.Fatal(err)
 	}
 	body2, _ := os.ReadFile(filepath.Join(sysroot, "etc/fstab")) //nolint:gosec // test file

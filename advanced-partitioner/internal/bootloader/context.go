@@ -73,6 +73,10 @@ type BootContext struct {
 	// ReusesRoot is set when the install keeps the root already on disk
 	// (install_mode local) instead of writing a new one.
 	ReusesRoot bool `json:"reuses_root"`
+
+	// LunaKernelOptions are the osimage kernel options from the installer's
+	// command line (see LunaKernelOptions), added to GRUB_CMDLINE_LINUX.
+	LunaKernelOptions string `json:"luna_kernel_options"`
 }
 
 // BIOSGRUBRequested reports whether this node asked for a BIOS GRUB install:

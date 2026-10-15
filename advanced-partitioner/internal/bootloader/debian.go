@@ -18,7 +18,7 @@ import (
 //	            grub-install only when BIOS (UEFI uses the signed
 //	            shim+grub from /EFI/<distro>/ instead).
 //	Initramfs:  update-initramfs -u -k all
-//	Install:    write /etc/default/grub (Debian-flavoured keys);
+//	Install:    write /etc/default/grub (GRUB_DEFAULT=0);
 //	            BIOS path runs grub-install --target=i386-pc per disk
 //	            then update-grub; UEFI path calls StageSignedShim
 //	            (with GrubDirName="grub"), then RegisterUEFIEntries,
@@ -146,12 +146,10 @@ func (a *debianAdapter) installBIOS(ctx context.Context) error {
 	return a.generateGrubConfig(ctx)
 }
 
-// writeGrubDefault merges lpart's keys and root-storage kernel arguments into
-// the image's /etc/default/grub (see grubdefault.go). The Debian keys differ
-// from RHEL's: GRUB_DEFAULT=0 (numeric, not "saved"), no GRUB_DISABLE_SUBMENU.
+// writeGrubDefault writes /etc/default/grub (see grubdefault.go) with
+// GRUB_DEFAULT=0: update-grub's first entry is the newest kernel.
 func (a *debianAdapter) writeGrubDefault() error {
-	return writeMergedGrubDefault(a.deps.FS, a.deps.BootContext.Sysroot,
-		debianGrubDefaultKeys, a.deps.BootContext.KernelArgs)
+	return writeGrubDefault(a.deps.FS, a.deps.BootContext, "0")
 }
 
 func (a *debianAdapter) installUEFI(ctx context.Context) error {
@@ -181,7 +179,6 @@ func (a *debianAdapter) installUEFI(ctx context.Context) error {
 		BootDevices:   a.deps.BootContext.StorageResult.BootDevices,
 		RegisterNVRAM: a.deps.BootContext.RegisterNVRAM,
 		ESPPartition:  a.deps.BootContext.StorageResult.ESPPartition,
-		ESPDevice:     espDeviceOf(a.deps.BootContext.StorageResult),
 		SnapshotDir:   a.deps.SnapshotDir,
 		BootOrder:     a.deps.BootContext.BootOrder,
 	}); err != nil {

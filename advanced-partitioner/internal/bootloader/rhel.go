@@ -274,12 +274,11 @@ func (a *rhelAdapter) installBIOS(ctx context.Context) error {
 	return a.generateGrubConfig(ctx)
 }
 
-// writeGrubDefault merges lpart's keys and root-storage kernel arguments into
-// the image's /etc/default/grub (see grubdefault.go). Successor of
-// bootloader_rhel_write_grub_default, which overwrote the file.
+// writeGrubDefault writes /etc/default/grub (see grubdefault.go) with
+// GRUB_DEFAULT=saved: generateGrubConfig points saved_entry at the default
+// kernel.
 func (a *rhelAdapter) writeGrubDefault() error {
-	return writeMergedGrubDefault(a.deps.FS, a.deps.BootContext.Sysroot,
-		rhelGrubDefaultKeys, a.deps.BootContext.KernelArgs)
+	return writeGrubDefault(a.deps.FS, a.deps.BootContext, "saved")
 }
 
 func (a *rhelAdapter) installUEFI(ctx context.Context) error {
@@ -308,7 +307,6 @@ func (a *rhelAdapter) installUEFI(ctx context.Context) error {
 		BootDevices:   a.deps.BootContext.StorageResult.BootDevices,
 		RegisterNVRAM: a.deps.BootContext.RegisterNVRAM,
 		ESPPartition:  a.deps.BootContext.StorageResult.ESPPartition,
-		ESPDevice:     espDeviceOf(a.deps.BootContext.StorageResult),
 		SnapshotDir:   a.deps.SnapshotDir,
 		BootOrder:     a.deps.BootContext.BootOrder,
 	}); err != nil {
