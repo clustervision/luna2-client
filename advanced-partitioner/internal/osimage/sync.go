@@ -380,6 +380,17 @@ func (o SyncOptions) extracted(rel string) bool {
 	return !ExcludedByTar(rel, o.TarExcludes) || matchAny(o.ImageWins, rel)
 }
 
+// parentIsReal reports whether rel's parent directory below the sysroot resolves
+// to itself, i.e. no component of it is a symlink.
+func (o SyncOptions) parentIsReal(rel string) bool {
+	root, err := filepath.EvalSymlinks(o.Sysroot)
+	if err != nil {
+		return false
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Join(o.Sysroot, filepath.Dir(rel)))
+	return err == nil && dir == filepath.Join(root, filepath.Dir(rel))
+}
+
 // memberPath turns a member name into a sysroot-relative path ("./etc/" -> "etc").
 func memberPath(name string) string {
 	return strings.TrimPrefix(filepath.Clean("/"+name), "/")
@@ -419,6 +430,10 @@ func (o SyncOptions) resolveTypeConflict(rel string, hdr *tar.Header) (bool, err
 	}
 	kind, ok := conflictKinds[hdr.Typeflag]
 	if !ok || !fi.IsDir() {
+		return false, nil
+	}
+	if !o.parentIsReal(rel) {
+		// a symlinked parent (opt -> data/opt) would take the removal out of the os tree
 		return false, nil
 	}
 	if o.Protect.protectedSubtree(rel) || o.Protect.mayContainProtected(rel) || o.hasMount(rel) {

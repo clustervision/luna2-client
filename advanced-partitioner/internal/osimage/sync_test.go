@@ -440,3 +440,20 @@ func TestSyncFailingMidStreamReturns(t *testing.T) {
 		t.Fatal("the sync did not return: the decompressor is waited for while it blocks on its pipe")
 	}
 }
+
+// A directory reached through a symlinked parent (opt -> data/opt, into a data
+// set) is never removed to make room for an image file: the removal would leave
+// the os tree.
+func TestSyncTypeChangeNeverFollowsASymlinkedParent(t *testing.T) {
+	requireGNUTar(t)
+	root := t.TempDir()
+	write(t, root, "data/opt/foo/precious/file", "data set\n")
+	if err := os.Symlink("data/opt", filepath.Join(root, "opt")); err != nil {
+		t.Fatal(err)
+	}
+	img := buildTar(t, []ent{{"./", "", "", tar.TypeDir, 0o755}, {"./opt/foo", "image\n", "", tar.TypeReg, 0o644}})
+	_, _ = SyncExtract(context.Background(), syncOpts(root, img, Protection{}, nil, nil, ""))
+	if got, ok := read(root, "data/opt/foo/precious/file"); !ok || got != "data set\n" {
+		t.Fatal("a directory behind a symlinked parent was removed")
+	}
+}
