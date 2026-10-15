@@ -605,8 +605,9 @@ function fatal_park () {
         echo "Luna2: lpart reported the reason above: ${kind}, which would recur on"
         echo "Luna2: every attempt."
     else
-        echo "Luna2: The install script exited ${rc} (operator script or install step);"
-        echo "Luna2: see the log."
+        echo "Luna2: Reason:"
+        echo "Luna2:   install script failed (exit ${rc})"
+        echo "Luna2: lpart left no verdict, so this is not a safety refusal: see the log."
     fi
     echo "Luna2: Exit 2 and 3 are non-retryable, so the node is parked instead of"
     echo "Luna2: reinstalling in a loop."
@@ -615,6 +616,8 @@ function fatal_park () {
     echo "Luna2: ============================================================"
     if [ -s "$LUNA_FAILURE_FILE" ]; then
         luna_post_state "$(lpart_park_state "$rc")"
+    else
+        luna_post_state install.fatal
     fi
     while true; do
         if { exec 9<>"$ctty"; } 2>/dev/null; then
