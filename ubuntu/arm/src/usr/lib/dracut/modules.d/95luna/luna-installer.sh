@@ -338,13 +338,16 @@ function luna_trim () {
 function get_credentials {
     LUNA_INI='/trinity/local/luna/node/config/luna.ini'
     if [ -f "$LUNA_INI" ]; then
-        while IFS='=' read -ra line; do
+        while IFS= read -r raw; do
+            line=${raw%%=*}
             if [ ! "$(luna_trim "$line" | grep -E '^(#|;)')" ] && [ "$line" ]; then
                 if [ "$(luna_trim "$line" | grep '^\[')" ]; then
                     section=$(luna_trim "$line" | grep -oE "[A-Z]+")
                 else
-                    key=$(luna_trim "${line[0]}")
-                    value=$(luna_trim "${line[1]}")
+                    key=$(luna_trim "$line")
+                    # split on the first '=' only: a password may hold '=' (base64)
+                    value=""
+                    [ "$raw" != "$line" ] && value=$(luna_trim "${raw#*=}")
                     declare -x "${section}_${key}"="$value"
                 fi
             fi

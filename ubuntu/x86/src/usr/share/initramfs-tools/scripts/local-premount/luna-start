@@ -359,17 +359,32 @@ luna_curl() {
     fi
 }
 
+luna_trim() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "$v"
+}
+
+# Parses luna.ini as the dracut hook's get_credentials does: [API] section,
+# '#' and ';' comments, a line split on its first '=' only. POSIX sh.
 get_credentials() {
+    local _raw _key _value _section=""
     LUNA_INI='/trinity/local/luna/node/config/luna.ini'
     if [ -f $LUNA_INI ]; then
-        API_USERNAME=$(grep USERNAME $LUNA_INI | awk -F '= ' '{ print $2 }')
-        if [ "x$API_USERNAME" = "x" ]; then
-            API_USERNAME=$(grep USERNAME $LUNA_INI | awk -F '=' '{ print $2 }')
-        fi
-        API_PASSWORD=$(grep PASSWORD $LUNA_INI | awk -F '= ' '{ print $2 }')
-        if [ "x$API_PASSWORD" = "x" ]; then
-            API_PASSWORD=$(grep PASSWORD $LUNA_INI | awk -F '=' '{ print $2 }')
-        fi
+        while IFS= read -r _raw; do
+            _key=$(luna_trim "${_raw%%=*}")
+            case "$_key" in
+                ''|'#'*|';'*) continue ;;
+                '['*) _section=$(printf '%s' "$_key" | grep -oE "[A-Z]+"); continue ;;
+            esac
+            _value=""
+            [ "$_raw" != "${_raw%%=*}" ] && _value=$(luna_trim "${_raw#*=}")
+            case "${_section}_${_key}" in
+                API_USERNAME) API_USERNAME=$_value ;;
+                API_PASSWORD) API_PASSWORD=$_value ;;
+            esac
+        done < $LUNA_INI
     else
         echo ":"
     fi
