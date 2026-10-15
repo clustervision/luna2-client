@@ -93,11 +93,3 @@ func biosBootPartitions(ctx context.Context, runner executor.Runner, disk string
 	}
 	return out, nil
 }
-
-// HasBIOSBootPartition reports whether disk carries a BIOS boot (EF02)
-// partition, for a storage result that recorded none (bios_boot_partition 0,
-// e.g. a mount-existing layout).
-func HasBIOSBootPartition(ctx context.Context, runner executor.Runner, disk string) bool {
-	parts, err := biosBootPartitions(ctx, runner, disk)
-	return err == nil && len(parts) > 0
-}

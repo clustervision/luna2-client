@@ -419,21 +419,25 @@ func biosDiskImage(t *testing.T) string {
 	return p
 }
 
-// On BIOS the none message names the firmware. There is no UEFI boot path to
-// strip (nothing on the ESP is touched, no efibootmgr runs), but GRUB from an
-// earlier "first" is taken out of the MBR, partition table untouched.
-func TestDiskRootBootloaderNoneOnBIOSClearsBootCode(t *testing.T) {
+// biosNoneRun finalises a BIOS disk root whose MBR carries boot code, with the
+// given boot_order, and returns the log, the disk image and its first sector.
+func biosNoneRun(t *testing.T, bootOrder string) (log string, disk string, before []byte) {
+	t.Helper()
 	tmp := t.TempDir()
 	sysroot := filepath.Join(tmp, "sysroot")
 	if err := os.MkdirAll(sysroot, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	stageESPLoaders(t, sysroot)
-	disk := biosDiskImage(t)
+	disk = biosDiskImage(t)
+	before, err := os.ReadFile(disk) //nolint:gosec // test artefact
+	if err != nil {
+		t.Fatal(err)
+	}
 	res := result.StorageResult{
 		Version: 2, Name: "os", Role: "os",
 		FirmwareMode: "bios", StorageType: "lvm",
-		BootMethod: "none", BootOrder: "last", BootFirmware: "uefi", RegisterNVRAM: "auto",
+		BootMethod: "none", BootOrder: bootOrder, BootFirmware: "uefi", RegisterNVRAM: "auto",
 		RAIDMode: "none", MountedTargetRoot: sysroot,
 		BootDevices: []string{disk},
 		Filesystems: []result.Filesystem{
@@ -450,24 +454,41 @@ func TestDiskRootBootloaderNoneOnBIOSClearsBootCode(t *testing.T) {
 	if rc != 0 {
 		t.Fatalf("rc=%d stderr=%s", rc, stderr)
 	}
-	log := readLog(t, logPath)
+	log = readLog(t, logPath)
 	if !strings.Contains(log, `firmware is "bios"`) {
-		t.Fatalf("the BIOS message must name the firmware as the reason:\n%s", log)
+		t.Fatalf("the BIOS message must name the firmware:\n%s", log)
 	}
 	if _, err := os.Stat(filepath.Join(sysroot, "boot", "efi", "EFI", "BOOT", "BOOTX64.EFI")); err != nil {
 		t.Errorf("a BIOS node has no UEFI boot path to strip: %v", err)
 	}
-	img, err := os.ReadFile(disk) //nolint:gosec // test artefact
+	return log, disk, before
+}
+
+// "last" on BIOS installs nothing and keeps what an earlier "first" left on the
+// disk: it is the fallback when PXE fails.
+func TestDiskRootBootloaderLastOnBIOSKeepsBootCode(t *testing.T) {
+	log, disk, before := biosNoneRun(t, "last")
+	if !strings.Contains(log, "fallback behind PXE") {
+		t.Errorf("the last message must say the disk's GRUB stays:\n%s", log)
+	}
+	after, err := os.ReadFile(disk) //nolint:gosec // test artefact
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i := 0; i < 440; i++ {
-		if img[i] != 0 {
-			t.Fatalf("MBR boot code byte %d not cleared", i)
-		}
+	if string(after) != string(before) {
+		t.Fatal(`bootloader "last" must not touch the disk`)
 	}
-	if img[446] != 0x11 || img[510] != 0x55 || img[511] != 0xAA {
-		t.Fatal("partition table or MBR signature changed")
+}
+
+// "none" on BIOS goes through the removal (proven against disk images in the
+// bootloader package); here the disk cannot be listed, so it is warned about and
+// left rather than half-cleared.
+func TestDiskRootBootloaderNoneOnBIOSRunsTheRemoval(t *testing.T) {
+	log, _, _ := biosNoneRun(t, "none")
+	for _, want := range []string{`asks for bootloader "none"`, "left as it is"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("missing %q:\n%s", want, log)
+		}
 	}
 }
 
@@ -489,8 +510,7 @@ func biosGRUBResult(t *testing.T, biosBootPartition int) string {
 		FirmwareMode: "bios", StorageType: "lvm",
 		BootMethod: "grub", BootOrder: "first", BootFirmware: "uefi", RegisterNVRAM: "auto",
 		RAIDMode: "none", MountedTargetRoot: sysroot,
-		// not a real disk: with bios_boot_partition 0 finalise looks for an
-		// EF02 partition on it (lsblk), and must find none
+		// never a real disk: the gate must refuse before anything reaches it
 		BootDevices:       []string{filepath.Join(tmp, "no-such-disk")},
 		BIOSBootPartition: biosBootPartition,
 		Filesystems: []result.Filesystem{

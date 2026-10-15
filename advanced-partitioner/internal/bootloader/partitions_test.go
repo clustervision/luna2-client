@@ -18,7 +18,7 @@ func lsblkRunner(out string, def executor.FakeResponse) *executor.FakeRunner {
 func TestListBlockDevsProbesMissingPartType(t *testing.T) {
 	f := lsblkRunner(`NAME="/dev/sda1" TYPE="part" PARTTYPE="" PKNAME="/dev/sda" MOUNTPOINT=""`+"\n", executor.FakeResponse{})
 	f.AddMatch(executor.FakeMatch{Path: "blkid", Response: executor.FakeResponse{Stdout: []byte("21686148-6449-6e6f-744e-656564454649\n")}})
-	if !HasBIOSBootPartition(context.Background(), f, "/dev/sda") {
+	if parts, err := biosBootPartitions(context.Background(), f, "/dev/sda"); err != nil || len(parts) != 1 {
 		t.Fatal("blkid-probed EF02 partition not found")
 	}
 }

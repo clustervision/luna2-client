@@ -174,10 +174,10 @@ func TestRemoveExistingBootloaderSkipsNVRAMWithoutEfivars(t *testing.T) {
 	}
 }
 
-// mkMBRDisk writes a disk image whose first sector carries GRUB-like boot
-// code, a disk signature, a partition table and the 0x55AA signature, and an
-// EF02 partition image holding a core.img stand-in. Returns both paths and the
-// original first sector.
+// mkMBRDisk writes a disk image whose first sector carries boot code with
+// GRUB's boot.img marker, a disk signature, a partition table and the 0x55AA
+// signature, and an EF02 partition image that starts like GRUB's core.img.
+// Returns both paths and the original first sector.
 func mkMBRDisk(t *testing.T) (disk, part string, sector0 []byte) {
 	t.Helper()
 	dir := t.TempDir()
@@ -185,6 +185,7 @@ func mkMBRDisk(t *testing.T) (disk, part string, sector0 []byte) {
 	for i := 0; i < mbrBootCodeLen; i++ {
 		img[i] = byte(0xEB + i)
 	}
+	copy(img[0x180:], grubBootImgMark+"Hard Disk")
 	copy(img[440:446], []byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 0})
 	for i := 446; i < 510; i++ {
 		img[i] = byte(i)
@@ -196,7 +197,7 @@ func mkMBRDisk(t *testing.T) (disk, part string, sector0 []byte) {
 	}
 	part = filepath.Join(dir, "disk.img-part1")
 	core := make([]byte, 1<<20)
-	copy(core, []byte("GRUB core.img"))
+	copy(core[0x117:], grubCoreImgMark+"Geom\x00Read")
 	if err := os.WriteFile(part, core, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +210,7 @@ NAME="`+part+`" TYPE="part" PARTTYPE="21686148-6449-6e6f-744e-656564454649" PKNA
 `, executor.FakeResponse{})
 }
 
-// Review finding 6: "none"/"last" on BIOS after an earlier "first" must take
+// Review finding 6: "none" on BIOS after an earlier "first" must take
 // GRUB out of the MBR and the BIOS boot partition, leaving the partition table
 // and disk signature exactly as they were.
 func TestRemoveBIOSBootloaderClearsMBRAndCoreImage(t *testing.T) {
@@ -243,8 +244,47 @@ func TestRemoveBIOSBootloaderDryRunWritesNothing(t *testing.T) {
 	if got := readFile(t, disk); got[:512] != string(before) {
 		t.Error("dry-run changed the first sector")
 	}
-	if !strings.HasPrefix(readFile(t, part), "GRUB core.img") {
+	if !strings.Contains(readFile(t, part), grubCoreImgMark) {
 		t.Error("dry-run wiped the BIOS boot partition")
+	}
+}
+
+// Boot code that is not GRUB's (another boot manager, a vendor tool) or a GRUB
+// without its core image where lpart puts it is not ours to remove: warned
+// about and left, MBR and BIOS boot partition alike.
+func TestRemoveBIOSBootloaderLeavesWhatIsNotGRUB(t *testing.T) {
+	cases := map[string]func(t *testing.T, disk, part string) *executor.FakeRunner{
+		"foreign MBR boot code": func(t *testing.T, disk, part string) *executor.FakeRunner {
+			b := []byte(readFile(t, disk))
+			copy(b[0x180:], "LILO boot code..")
+			mustWriteFile(t, disk, string(b))
+			return biosLsblk(disk, part)
+		},
+		"no core image in the BIOS boot partition": func(t *testing.T, disk, part string) *executor.FakeRunner {
+			mustWriteFile(t, part, strings.Repeat("x", 4096))
+			return biosLsblk(disk, part)
+		},
+		"no BIOS boot partition": func(t *testing.T, disk, part string) *executor.FakeRunner {
+			return lsblkRunner(`NAME="`+disk+`" TYPE="disk" PARTTYPE="" PKNAME="" MOUNTPOINT=""`+"\n", executor.FakeResponse{})
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			disk, part, _ := mkMBRDisk(t)
+			f := setup(t, disk, part)
+			beforeDisk, beforePart := readFile(t, disk), readFile(t, part)
+			ro, logPath := removeOpts(t, t.TempDir(), f)
+			opts := RemoveBIOSBootloaderOptions{Runner: f, Logger: ro.Logger, BootDevices: []string{disk}}
+			if err := RemoveBIOSBootloader(context.Background(), opts); err != nil {
+				t.Fatalf("RemoveBIOSBootloader: %v", err)
+			}
+			if readFile(t, disk) != beforeDisk || readFile(t, part) != beforePart {
+				t.Error("boot code that is not a GRUB install was modified")
+			}
+			if log := readFile(t, logPath); !strings.Contains(log, "level=WARN") || !strings.Contains(log, "left as it is") {
+				t.Errorf("leaving it must be a warning:\n%s", log)
+			}
+		})
 	}
 }
 
