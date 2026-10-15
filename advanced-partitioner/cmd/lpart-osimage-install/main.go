@@ -114,7 +114,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		"Streamed curl|tar extract (no tarball on disk, halves peak RAM): auto = only when the sysroot is tmpfs (memboot), always, never. Streaming falls back to the classic download+extract on failure.")
 
 	if err := fs.Parse(argv[1:]); err != nil {
-		return 2
+		// A bad command line is identical on every retry: park (exit 3).
+		return cli.ExitFatalConfig(stderr, toolName, "usage", "%v", err)
 	}
 	if f.ShowVersion {
 		_, _ = fmt.Fprintln(stdout, cli.Version())

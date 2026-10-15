@@ -684,3 +684,14 @@ func TestFailClassification(t *testing.T) {
 		t.Fatalf("wrapped FatalError: rc=%d out=%s", rc, buf.String())
 	}
 }
+
+// A bad command line is the same on every attempt: exit 3 parks with a
+// fatal_config line, as in every lpart tool; exit 2 is reserved for safety
+// refusals.
+func TestBadFlagIsFatalConfig(t *testing.T) {
+	var out, errb bytes.Buffer
+	rc := run([]string{toolName, "--no-such-flag"}, &out, &errb)
+	if rc != 3 || !strings.Contains(errb.String(), "fatal_config=usage") {
+		t.Fatalf("rc=%d (want 3), stderr=%s", rc, errb.String())
+	}
+}

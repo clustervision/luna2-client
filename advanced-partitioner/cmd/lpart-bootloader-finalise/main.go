@@ -90,7 +90,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&f.ArchOverride, "arch", "", "(test) override detected architecture")
 
 	if err := fs.Parse(argv[1:]); err != nil {
-		return 2
+		// A bad command line is identical on every retry: park (exit 3).
+		return cli.ExitFatalConfig(stderr, toolName, "usage", "%v", err)
 	}
 	if f.ShowVersion {
 		_, _ = fmt.Fprintln(stdout, cli.Version())
