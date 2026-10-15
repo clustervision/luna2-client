@@ -250,6 +250,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}); werr != nil {
 			err = werr
 		}
+		if resolveRetryable(err) {
+			errln(stderr, "set %q: %v", set.Name, err)
+			return 1
+		}
 		if msg := degradedRefusal(set, len(resolved), missing); err == nil && msg != "" {
 			return cli.ExitSafetyRefusal(stderr, toolName, "degraded", "%s", msg)
 		}
@@ -451,6 +455,14 @@ func resolvePresent(ctx context.Context, resolver *selector.Resolver, devices []
 		return nil, missing, fmt.Errorf("none of the set's devices (%s) is present on this node", strings.Join(missing, ", "))
 	}
 	return present, missing, nil
+}
+
+// resolveRetryable reports a device-resolution failure that may clear on
+// retry (a failed lsblk probe): exit 1, as in lpart-storage-prepare, not a
+// park for an operator.
+func resolveRetryable(err error) bool {
+	var re *selector.ResolveError
+	return errors.As(err, &re) && re.Kind == selector.KindProbe
 }
 
 // degradedRefusal is the reason to park when a redundant raid set could run
