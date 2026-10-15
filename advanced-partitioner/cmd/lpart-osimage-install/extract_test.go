@@ -13,7 +13,7 @@ import (
 // runFullExtract runs install_mode=full end to end on the classic path: the
 // image is downloaded from a local server with the real curl and unpacked with
 // the real tar and lbzip2 into a temporary sysroot.
-func runFullExtract(t *testing.T, files map[string]string, extraArgs ...string) (stderr string, code int) {
+func runFullExtract(t *testing.T, files map[string]string, extraArgs ...string) (stderr, logBody string, code int) {
 	t.Helper()
 	tmp := t.TempDir()
 	src := filepath.Join(tmp, "image")
@@ -62,13 +62,13 @@ func runFullExtract(t *testing.T, files map[string]string, extraArgs ...string) 
 		"--luna-url", srv.URL,
 		"--stream-extract", "never",
 	}, extraArgs...)
-	return runEnv(t, args...)
+	return runEnvWithLog(t, args...)
 }
 
 // An image without /etc/os-release fails the same way on every attempt: the
 // classic path parks it (exit 3), as the sync path does.
 func TestFullExtractWithoutOSReleaseIsFatal(t *testing.T) {
-	stderr, code := runFullExtract(t, map[string]string{"usr/bin/true": "x", "etc/hostname": "n"})
+	stderr, _, code := runFullExtract(t, map[string]string{"usr/bin/true": "x", "etc/hostname": "n"})
 	if code != 3 {
 		t.Fatalf("exit = %d, want 3; stderr:\n%s", code, stderr)
 	}
@@ -76,9 +76,33 @@ func TestFullExtractWithoutOSReleaseIsFatal(t *testing.T) {
 
 // Control: the same path with os-release installs (exit 0).
 func TestFullExtractWithOSReleaseSucceeds(t *testing.T) {
-	stderr, code := runFullExtract(t, map[string]string{"usr/bin/true": "x", "etc/os-release": "ID=test\n"})
+	stderr, _, code := runFullExtract(t, map[string]string{"usr/bin/true": "x", "etc/os-release": "ID=test\n"})
 	if code != 0 {
 		t.Fatalf("exit = %d, want 0; stderr:\n%s", code, stderr)
+	}
+}
+
+// A full os filesystem fails the same way on every attempt: the classic
+// extract, and the streamed extract with its classic fallback, park (exit 3).
+// tar's message is the only place ENOSPC shows.
+func TestFullExtractOnAFullFilesystemIsFatal(t *testing.T) {
+	realTar, err := exec.LookPath("tar")
+	if err != nil {
+		t.Skip("no tar")
+	}
+	for _, stream := range []string{"never", "always"} {
+		t.Run("stream-extract="+stream, func(t *testing.T) {
+			writeStub(t, filepath.Join(t.TempDir(), "bin"), "tar",
+				`for a; do [ "$a" = -xf ] && { echo "tar: ./usr/bin/true: Cannot write: No space left on device" >&2; exit 2; }; done; exec `+realTar+` "$@"`)
+			stderr, logBody, code := runFullExtract(t, map[string]string{"usr/bin/true": "x", "etc/os-release": "ID=test\n"},
+				"--stream-extract", stream)
+			if stream == "always" && !strings.Contains(logBody, "streamed extract failed; falling back") {
+				t.Fatalf("the streamed extract did not run and fail first; log:\n%s", logBody)
+			}
+			if code != 3 || !strings.Contains(stderr, "fatal_config=no-space") {
+				t.Fatalf("exit = %d, want 3 (no-space); stderr:\n%s", code, stderr)
+			}
+		})
 	}
 }
 

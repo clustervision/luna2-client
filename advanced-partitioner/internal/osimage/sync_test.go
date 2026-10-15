@@ -495,3 +495,22 @@ func TestSyncImageWinsFailureFailsTheSync(t *testing.T) {
 		})
 	}
 }
+
+// A tar that dies early (a full os filesystem) surfaces as a broken pipe on
+// the image stream; its own message must stay in the error, which is what
+// the caller classifies (ENOSPC parks).
+func TestSyncKeepsTheStderrOfATarThatDiedEarly(t *testing.T) {
+	requireGNUTar(t)
+	img := buildTar(t, []ent{
+		{"./", "", "", tar.TypeDir, 0o755},
+		{"./big", strings.Repeat("x", 4<<20), "", tar.TypeReg, 0o644},
+	})
+	so := syncOpts(t.TempDir(), img, Protection{}, nil, nil, "")
+	so.tarCmd = func(ctx context.Context, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", `echo "tar: ./big: Cannot write: No space left on device" >&2; exit 2`)
+	}
+	_, err := SyncExtract(context.Background(), so)
+	if err == nil || !strings.Contains(err.Error(), "No space left on device") {
+		t.Fatalf("the sync error lost tar's stderr: %v", err)
+	}
+}

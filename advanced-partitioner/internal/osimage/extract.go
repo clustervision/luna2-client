@@ -442,11 +442,11 @@ func Extract(ctx context.Context, opts ExtractOptions) error {
 	args = append(args, "-xf", opts.TarballPath, "-C", opts.Sysroot)
 
 	opts.info("extracting osimage into " + opts.Sysroot)
-	if _, err := opts.Runner.Run(ctx, executor.CommandSpec{
+	if res, err := opts.Runner.Run(ctx, executor.CommandSpec{
 		Path: "tar", Args: args,
 		CaptureStdout: true, CaptureStderr: true,
 	}); err != nil {
-		return fmt.Errorf("tar extract: %w", err)
+		return fmt.Errorf("tar extract: %w", withStderr(err, res.Stderr))
 	}
 
 	// No os-release check here: VerifyExtract makes it, and refuses (exit 3)
@@ -501,4 +501,13 @@ func (o ExtractOptions) warn(msg string) {
 	if o.Logger != nil {
 		o.Logger.Warn(msg)
 	}
+}
+
+// withStderr adds a failed command's stderr to its error: the cause (a full
+// filesystem) is only there, and the caller classifies on the error text.
+func withStderr(err error, stderr []byte) error {
+	if s := executor.StderrExcerpt(stderr); s != "" {
+		return fmt.Errorf("%w: %s", err, s)
+	}
+	return err
 }

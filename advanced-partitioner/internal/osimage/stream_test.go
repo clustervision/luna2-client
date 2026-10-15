@@ -109,3 +109,18 @@ func TestShJoinQuoting(t *testing.T) {
 		t.Fatalf("shJoin = %s, want %s", got, want)
 	}
 }
+
+// A failed stream keeps the pipe's stderr in its error: a full filesystem
+// shows only there, and the caller classifies on the error text.
+func TestStreamHTTPExtractErrorKeepsStderr(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{
+		Stderr:   []byte("tar: ./usr/lib/x: Cannot write: No space left on device\n"),
+		ExitCode: 2, Err: fmt.Errorf("exit status 2"),
+	})
+	d, e := streamOpts(t.TempDir())
+	d.Runner = f
+	err := StreamHTTPExtract(context.Background(), d, e)
+	if err == nil || !strings.Contains(err.Error(), "No space left on device") {
+		t.Fatalf("the stream error lost tar's stderr: %v", err)
+	}
+}

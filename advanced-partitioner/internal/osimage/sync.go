@@ -288,6 +288,10 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 		_ = src.Close() // the decompressor blocks on a full pipe until its reader goes
 	}
 	srcErr := waitSrc()
+	if errors.Is(streamErr, syscall.EPIPE) && werr1 != nil {
+		// a tar that died early shows here as a broken pipe; the cause is its stderr
+		return res, fmt.Errorf("%w (tar extract: %v: %s)", streamErr, werr1, strings.TrimSpace(tar1Err.String()))
+	}
 	if streamErr != nil {
 		return res, streamErr
 	}
