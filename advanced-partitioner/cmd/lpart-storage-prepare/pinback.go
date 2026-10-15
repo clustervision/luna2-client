@@ -85,15 +85,16 @@ func buildPinnableConfig(orig *v2.Config, resolved []result.ResolvedSet, origin 
 			devices = append(devices, p)
 		}
 		pinned := v2.Set{
-			Name:       src.Name,
-			Role:       src.Role,
-			Selection:  "manual",
-			Raid:       src.Raid,
-			Spares:     src.Spares,
-			Devices:    devices,
-			Persistent: src.Persistent,
-			Bootloader: src.Bootloader,
-			Volumes:    src.Volumes,
+			Name:          src.Name,
+			Role:          src.Role,
+			Selection:     "manual",
+			Raid:          src.Raid,
+			Spares:        src.Spares,
+			Devices:       devices,
+			Persistent:    src.Persistent,
+			Bootloader:    src.Bootloader,
+			AllowDegraded: src.AllowDegraded,
+			Volumes:       src.Volumes,
 		}
 		// Stamp provenance only on sets the installer actually discovered;
 		// operator-authored manual sets pass through unmarked.

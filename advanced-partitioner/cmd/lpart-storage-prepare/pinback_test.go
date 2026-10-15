@@ -1,6 +1,7 @@
 package main
 
 import (
+	"reflect"
 	"testing"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -198,5 +199,62 @@ func TestBuildPinnableConfig_KeepsSpares(t *testing.T) {
 	}
 	if s := pin.Sets[0]; s.Spares != 1 || len(s.Devices) != 5 {
 		t.Fatalf("pinned set must keep spares=1 and all 5 devices, got spares=%d devices=%v", s.Spares, s.Devices)
+	}
+}
+
+// Every per-set key the operator wrote survives the pin unless it is listed
+// here as deliberately rewritten or dropped: a key added to v2.Set and missed
+// in buildPinnableConfig would otherwise vanish from a save:true node silently.
+func TestBuildPinnableConfig_CarriesEveryOperatorKey(t *testing.T) {
+	orig0 := byIDDir
+	byIDDir = t.TempDir()
+	defer func() { byIDDir = orig0 }()
+
+	notCarried := map[string]bool{
+		"Selection": true, "Count": true, "Match": true, "Save": true, "IncludeSAN": true, // discover-only
+		"Devices": true, // taken from the resolution
+		"Origin":  true, // stamped by the installer
+		"Comment": true, // not carried today
+	}
+	src := v2.Set{Selection: "discover"}
+	sv := reflect.ValueOf(&src).Elem()
+	for i := 0; i < sv.NumField(); i++ {
+		f := sv.Field(i)
+		if !f.IsZero() {
+			continue
+		}
+		switch f.Kind() {
+		case reflect.String:
+			f.SetString("x-" + sv.Type().Field(i).Name)
+		case reflect.Bool:
+			f.SetBool(true)
+		case reflect.Int:
+			f.SetInt(1)
+		case reflect.Slice:
+			f.Set(reflect.MakeSlice(f.Type(), 1, 1))
+		case reflect.Pointer:
+			f.Set(reflect.New(f.Type().Elem()))
+		default:
+			t.Fatalf("field %s: kind %s has no test value", sv.Type().Field(i).Name, f.Kind())
+		}
+	}
+	orig := &v2.Config{Version: v2.SchemaVersion, Sets: []v2.Set{src}}
+	resolved := []result.ResolvedSet{{
+		Name:          src.Name,
+		SelectedDisks: []selector.Resolved{{ConfiguredPath: "/dev/sda", ResolvedPath: "/dev/sda"}},
+	}}
+	pin := buildPinnableConfig(orig, resolved, nil)
+	if pin == nil || len(pin.Sets) != 1 {
+		t.Fatalf("expected one pinned set, got %+v", pin)
+	}
+	pv := reflect.ValueOf(pin.Sets[0])
+	for i := 0; i < sv.NumField(); i++ {
+		name := sv.Type().Field(i).Name
+		if notCarried[name] {
+			continue
+		}
+		if !reflect.DeepEqual(pv.Field(i).Interface(), sv.Field(i).Interface()) {
+			t.Errorf("%s not carried into the pinned set: got %v, want %v", name, pv.Field(i).Interface(), sv.Field(i).Interface())
+		}
 	}
 }
