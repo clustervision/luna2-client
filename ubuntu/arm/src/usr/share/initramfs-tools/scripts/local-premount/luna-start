@@ -111,12 +111,23 @@ luna_start() {
     local luna_bootproto
     local luna_mac
     echo "$(getargs luna.hostname=)" > /proc/sys/kernel/hostname
-    echo "Luna2: Starting ssh"
-    echo "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin" >> /etc/passwd
-    echo sshd:x:74: >> /etc/group
-    # Debian's sshd refuses to start without /run/sshd (its privilege-separation dir).
-    mkdir -p /var/empty/sshd /run/sshd
-    /usr/sbin/sshd > /dev/null 2>&1 || echo "Luna2: sshd did not start: no ssh into this ramdisk"
+    # The dhcpcd hook replaces /etc/passwd with its own line only; without root
+    # every ssh key is refused for a user that does not exist.
+    grep -q '^root:' /etc/passwd 2>/dev/null || echo 'root:x:0:0:root:/:/bin/sh' >> /etc/passwd
+    # dropbear first, as in the dracut hook: one self-contained binary that makes
+    # its own host keys and needs no privilege-separation dir. sshd only without it.
+    if [ -x /usr/sbin/dropbear ]; then
+        echo "Luna2: Starting ssh (dropbear)"
+        mkdir -p /etc/dropbear
+        /usr/sbin/dropbear -R -p 22 || echo "Luna2: dropbear did not start: no ssh into this ramdisk"
+    else
+        echo "Luna2: Starting ssh"
+        echo "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin" >> /etc/passwd
+        echo sshd:x:74: >> /etc/group
+        # Debian's sshd refuses to start without /run/sshd (its privilege-separation dir).
+        mkdir -p /var/empty/sshd /run/sshd
+        /usr/sbin/sshd > /dev/null 2>&1 || echo "Luna2: sshd did not start: no ssh into this ramdisk"
+    fi
     echo "Luna2: Start shell on tty2"
     luna_ctty2=/dev/tty2
     setsid -c /bin/sh -i -l 0<>$luna_ctty2 1<>$luna_ctty2 2<>$luna_ctty2 &

@@ -23,6 +23,8 @@ copy_exec /usr/bin/curl /usr/bin
 copy_exec /usr/bin/awk /usr/bin
 copy_exec /usr/bin/tar /usr/bin
 copy_exec /usr/sbin/sshd /usr/sbin
+# dropbear is the installer's ssh server; without it luna-start falls back to sshd
+if [ -x /usr/sbin/dropbear ]; then copy_exec /usr/sbin/dropbear /usr/sbin; fi
 copy_exec /usr/bin/file /usr/bin
 copy_exec /usr/bin/bash /bin
 copy_exec /usr/bin/bash /usr/bin
