@@ -188,6 +188,9 @@ func (c *Cleaner) CleanupSelectedSet(ctx context.Context, set Set) (Result, erro
 		}
 	}
 
+	if err := c.refuseOutsideSpans(ctx, selected); err != nil {
+		return Result{}, err
+	}
 	c.unmountUnderSysroot(ctx, set.Name, set.OwnsSysroot, selected)
 	if err := c.teardownVG(ctx, set.Name, selected, set.Protected); err != nil {
 		return Result{}, err

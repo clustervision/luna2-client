@@ -1,0 +1,95 @@
+package cleanup
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"testing"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+)
+
+// spanCleaner runs a cleanup of selected sda against the given pvs output,
+// /proc/mdstat body and member superblock name; sdc's transport is tran.
+func spanCleaner(t *testing.T, pvs, mdstat, name, tran string) (*Cleaner, *executor.FakeRunner) {
+	t.Helper()
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "pv_name,vg_name"},
+		Response: executor.FakeResponse{Stdout: []byte(pvs)}})
+	f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine", "/dev/sda1"},
+		Response: executor.FakeResponse{Stdout: []byte("           Name : " + name + "  (local to host x)\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-dno", "TRAN", "/dev/sdc"},
+		Response: executor.FakeResponse{Stdout: []byte(tran + "\n")}})
+	stat := filepath.Join(t.TempDir(), "mdstat")
+	if err := os.WriteFile(stat, []byte(mdstat), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	md := &fakeMDDetail{bySource: map[string][]string{"/dev/md0": {"/dev/sda1", "/dev/sdc1"}}}
+	return New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep, MDStatPath: stat,
+		MDAdmDetail: md.detail, Stat: statNotExist}), f
+}
+
+func runSpan(c *Cleaner) error {
+	_, err := c.CleanupSelectedSet(context.Background(), Set{Name: "os", SelectedDisks: []string{"/dev/sda"}})
+	return err
+}
+
+// A VG with a PV directly on a disk outside the selection was never lpart's
+// (it builds every VG on one PV): refused, nothing touched.
+func TestCleanupRefusesVGSpanningOutsideDisk(t *testing.T) {
+	c, f := spanCleaner(t, "  /dev/sda2 scratch\n  /dev/sdc2 scratch\n", "", "", "sata")
+	err := runSpan(c)
+	if err == nil {
+		t.Fatal("a VG reaching outside the selected disks must refuse")
+	}
+	assertProtected(t, err)
+	assertNoDestruction(t, f)
+}
+
+// An md array reaching outside the selection that lpart did not create (no
+// homehost "any") is refused.
+func TestCleanupRefusesForeignArraySpanningOutsideDisk(t *testing.T) {
+	c, f := spanCleaner(t, "", "md0 : active raid1 sda1[0] sdc1[1]\n", "node7:data", "sata")
+	err := runSpan(c)
+	if err == nil {
+		t.Fatal("a foreign array reaching outside the selected disks must refuse")
+	}
+	assertProtected(t, err)
+	assertNoDestruction(t, f)
+}
+
+// lpart's own leftover array is torn down as before, outside member included.
+func TestCleanupTearsDownOwnLeftoverArray(t *testing.T) {
+	c, f := spanCleaner(t, "", "md0 : active raid1 sda1[0] sdc1[1]\n", "any:os", "sata")
+	if err := runSpan(c); err != nil {
+		t.Fatalf("lpart's own array must be torn down: %v", err)
+	}
+	zeroed := false
+	for _, call := range f.Calls() {
+		if call.Path == "mdadm" && len(call.Args) == 2 && call.Args[0] == "--zero-superblock" && call.Args[1] == "/dev/sdc1" {
+			zeroed = true
+		}
+	}
+	if !zeroed {
+		t.Fatal("the leftover's outside member was not cleared")
+	}
+}
+
+// Even lpart's own array is refused when its outside member is a SAN LUN.
+func TestCleanupRefusesOwnArrayOnSANLUN(t *testing.T) {
+	c, f := spanCleaner(t, "", "md0 : active raid1 sda1[0] sdc1[1]\n", "any:os", "fc")
+	err := runSpan(c)
+	if err == nil {
+		t.Fatal("an array reaching an FC LUN must refuse")
+	}
+	assertProtected(t, err)
+	assertNoDestruction(t, f)
+}
+
+// A VG and an array wholly on the selected disks are torn down as always.
+func TestCleanupAcceptsSpansInsideSelection(t *testing.T) {
+	c, _ := spanCleaner(t, "  /dev/sda2 os\n", "md0 : active raid1 sda1[0] sda3[1]\n", "node7:data", "sata")
+	if err := runSpan(c); err != nil {
+		t.Fatalf("nothing reaches outside the selected disks: %v", err)
+	}
+}

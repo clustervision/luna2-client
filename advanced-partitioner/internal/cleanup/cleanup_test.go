@@ -503,6 +503,9 @@ func TestCleanupSelectedSetEndToEnd(t *testing.T) {
 	}
 
 	f := executor.NewFakeRunner(executor.FakeResponse{})
+	// the array is lpart's own (homehost "any") from the previous install
+	f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine", "/dev/sda1"},
+		Response: executor.FakeResponse{Stdout: []byte("  Name : any:os\n")}})
 	// Step 1: unmount sysroot tree (one mount).
 	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET,SOURCE"},
 		Response: executor.FakeResponse{Stdout: []byte("/sysroot /dev/mapper/os-root xfs rw\n")}})
