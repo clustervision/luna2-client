@@ -42,9 +42,21 @@ const (
 	// used to read a missing e2fsck as "broken" and recreate the os set.
 	VerdictUnknown Verdict = "unknown"
 	// VerdictDegraded means an array of the set misses a member and was not
-	// started (the set does not allow running degraded): the install parks.
+	// started (the set does not allow running degraded), or a member is stale:
+	// the install parks.
 	VerdictDegraded Verdict = "degraded"
 )
+
+// DegradedRefusal is the reason a VerdictDegraded set parks. allow_degraded is
+// advised only when the set lacks it: with it set, the verdict means a stale
+// member, which allow_degraded never accepts.
+func DegradedRefusal(set *v2.Set) string {
+	msg := fmt.Sprintf("set %q is degraded: an array of the set misses a member; replace the disk and reinstall with install_mode full", set.Name)
+	if !set.AllowDegraded {
+		msg += ", or set allow_degraded on the set to install on it degraded"
+	}
+	return msg
+}
 
 // Unhealthy is one volume-level verification failure.
 type Unhealthy struct {

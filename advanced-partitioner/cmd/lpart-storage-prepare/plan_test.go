@@ -173,6 +173,21 @@ func TestDegradedVerdictParks(t *testing.T) {
 	}
 }
 
+// The degraded refusal advises allow_degraded only when the set lacks it.
+func TestDegradedVerdictAdvisesOnlyWhatIsMissing(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		sp, _ := testProcessor(t)
+		withVerdict(sp, storagehealth.VerdictDegraded)
+		set := raidOSSet("1", "/dev/vda", "/dev/vdb")
+		set.AllowDegraded = allow
+		_, _, err := sp.runDecision(context.Background(), installcontext.ModeSync, &v2.Config{Version: 2, Sets: []v2.Set{set}}, "uefi", false, true)
+		wantSafety(t, err, "degraded")
+		if advised := strings.Contains(err.Error(), "set allow_degraded"); advised == allow {
+			t.Errorf("allow_degraded=%v: advice to set it = %v: %v", allow, advised, err)
+		}
+	}
+}
+
 // With allow_degraded, the same dead member under a create (full, or auto on a
 // broken os set) is still a fatal config error naming the device, before any
 // disk is touched: a create needs every device.

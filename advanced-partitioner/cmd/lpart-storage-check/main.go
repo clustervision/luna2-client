@@ -279,8 +279,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		verdict, fs := storagehealth.Classify(context.Background(), runner, checker, set, resolved, logger)
 		logger.KV("verdict", set.Name+"="+string(verdict))
 		if verdict == storagehealth.VerdictDegraded {
-			return cli.ExitSafetyRefusal(stderr, toolName, "degraded",
-				"set %q is degraded: an array of the set misses a member; replace the disk and reinstall with install_mode full, or set allow_degraded on the set to install on it degraded", set.Name)
+			return cli.ExitSafetyRefusal(stderr, toolName, "degraded", "%s", storagehealth.DegradedRefusal(set))
 		}
 		resolvedBySet[set.Name] = resolved
 		failures = append(failures, fs...)
