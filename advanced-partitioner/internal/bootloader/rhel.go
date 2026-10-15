@@ -324,7 +324,9 @@ func (a *rhelAdapter) installUEFI(ctx context.Context) error {
 // chose), because GRUB_DEFAULT=saved would otherwise follow whatever the image
 // host last booted.
 func (a *rhelAdapter) generateGrubConfig(ctx context.Context) error {
-	a.normalizeBLSEntries()
+	if err := a.normalizeBLSEntries(); err != nil {
+		return err
+	}
 	if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
 		Path: "/usr/bin/env", Chroot: a.deps.BootContext.Sysroot,
 		Args:          []string{"grub2-mkconfig", "-o", "/boot/grub2/grub.cfg"},
@@ -332,7 +334,9 @@ func (a *rhelAdapter) generateGrubConfig(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("grub2-mkconfig: %w", err)
 	}
-	a.makeGrubCfgDegradedSafe()
+	if err := a.makeGrubCfgDegradedSafe(); err != nil {
+		return err
+	}
 	def := defaultKernel(bootableKernels(a.deps.BootContext.Sysroot), true)
 	return setDefaultBootEntry(ctx, a.deps, def)
 }
@@ -365,12 +369,12 @@ func (a *rhelAdapter) generateGrubConfig(ctx context.Context) error {
 //
 // Generalises bootloader_rhel_normalize_bls_for_separate_boot, which only
 // rewrote a clean `/boot/` prefix and only when /boot was separate.
-func (a *rhelAdapter) normalizeBLSEntries() {
+func (a *rhelAdapter) normalizeBLSEntries() error {
 	sysroot := a.deps.BootContext.Sysroot
 	dir := filepath.Join(sysroot, "boot", "loader", "entries")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return nil
 	}
 	prefix := "/boot/"
 	if a.hasBootMount() {
@@ -396,8 +400,12 @@ func (a *rhelAdapter) normalizeBLSEntries() {
 				out = append(out, line)
 			}
 		}
-		_ = a.deps.FS.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644)
+		// the unrepaired entry drops the node to the GRUB rescue prompt
+		if err := a.deps.FS.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644); err != nil {
+			return fmt.Errorf("repair BLS entry: %w", err)
+		}
 	}
+	return nil
 }
 
 // rewriteBLSPathLine normalises the path token of a BLS `linux`/`initrd`
@@ -510,10 +518,10 @@ func anyExist(sysroot string, rel ...string) bool {
 // mirror leg sometimes would not boot. Dropping the mduuid hints + the
 // `set root/boot='mduuid/…'` lines forces the deterministic fs-uuid path.
 //
-// No-op on non-RAID layouts (grub2-mkconfig emits no mduuid references) and
-// best-effort: a missing/unreadable grub.cfg just leaves it untouched.
-func (a *rhelAdapter) makeGrubCfgDegradedSafe() {
-	makeGrubCfgDegradedSafeAt(a.deps.FS,
+// No-op on non-RAID layouts (grub2-mkconfig emits no mduuid references). A
+// missing/unreadable grub.cfg is left untouched; a failed write is an error.
+func (a *rhelAdapter) makeGrubCfgDegradedSafe() error {
+	return grubCfgDegradedSafeAt(a.deps.FS,
 		filepath.Join(a.deps.BootContext.Sysroot, "boot", "grub2", "grub.cfg"))
 }
 
@@ -522,8 +530,14 @@ func (a *rhelAdapter) makeGrubCfgDegradedSafe() {
 // Debian used to keep the mduuid-based grub.cfg — the non-deterministic
 // degraded assembly — that the RHEL fix above removed). Best-effort: a
 // missing/unreadable path is skipped, an unchanged body is not rewritten.
-// Writes go through fs, so --dry-run leaves grub.cfg alone.
+// Writes go through fs, so --dry-run leaves grub.cfg alone. Write errors are
+// ignored here, for the Debian adapter; grubCfgDegradedSafeAt, which the RHEL
+// adapter uses, returns them.
 func makeGrubCfgDegradedSafeAt(fs fsops.FS, paths ...string) {
+	_ = grubCfgDegradedSafeAt(fs, paths...)
+}
+
+func grubCfgDegradedSafeAt(fs fsops.FS, paths ...string) error {
 	for _, path := range paths {
 		body, err := os.ReadFile(path) //nolint:gosec // sysroot file
 		if err != nil {
@@ -533,8 +547,11 @@ func makeGrubCfgDegradedSafeAt(fs fsops.FS, paths ...string) {
 		if out == string(body) {
 			continue
 		}
-		_ = fs.WriteFile(path, []byte(out), 0o644)
+		if err := fs.WriteFile(path, []byte(out), 0o644); err != nil {
+			return fmt.Errorf("make grub.cfg degraded-safe: %w", err)
+		}
 	}
+	return nil
 }
 
 var (
