@@ -514,3 +514,60 @@ func TestSyncKeepsTheStderrOfATarThatDiedEarly(t *testing.T) {
 		t.Fatalf("the sync error lost tar's stderr: %v", err)
 	}
 }
+
+// A directory on an os volume (/boot, /boot/efi, a separate /var) converges
+// like one on the root; a directory on any other filesystem, listed as a mount
+// or not, is never entered.
+func TestSyncSweepConvergesOSVolumesOnly(t *testing.T) {
+	requireGNUTar(t)
+	root := t.TempDir()
+	mounts := filepath.Join(t.TempDir(), "mounts")
+	body := "/dev/os " + root + " xfs rw 0 0\n/dev/boot " + root + "/boot xfs rw 0 0\n" +
+		"/dev/esp " + root + "/boot/efi vfat rw 0 0\n/dev/sdb1 " + root + "/srv/data xfs rw 0 0\n"
+	if err := os.WriteFile(mounts, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origMounts, origDev := procSelfMounts, devOf
+	procSelfMounts = mounts
+	// One device per volume: boot, boot/efi and srv/data are their own
+	// filesystems, and mnt/foreign is one the mount table does not list.
+	devOf = func(path string) uint64 {
+		rel := strings.TrimPrefix(path, root+"/")
+		for dev, vol := range []string{"boot/efi", "boot", "srv/data", "mnt/foreign"} {
+			if within(rel, vol) {
+				return uint64(dev + 2)
+			}
+		}
+		return 1
+	}
+	t.Cleanup(func() { procSelfMounts, devOf = origMounts, origDev })
+
+	d, f := byte(tar.TypeDir), byte(tar.TypeReg)
+	img := buildTar(t, []ent{
+		{"./", "", "", d, 0o755}, {"./boot/", "", "", d, 0o755}, {"./boot/efi/", "", "", d, 0o755},
+		{"./boot/efi/EFI/", "", "", d, 0o755}, {"./boot/vmlinuz-new", "kernel\n", "", f, 0o644},
+		{"./srv/", "", "", d, 0o755}, {"./mnt/", "", "", d, 0o755},
+	})
+	write(t, root, "boot/old-kernel-dir/vmlinuz-old", "old kernel\n")
+	write(t, root, "boot/efi/EFI/oldvendor/grubx64.efi", "old loader\n")
+	write(t, root, "srv/data/sub/deep", "data set\n")
+	write(t, root, "mnt/foreign/sub/deep", "foreign\n")
+	so := syncOpts(root, img, Protection{}, nil, nil, "")
+	so.OSMounts = []string{"boot", "boot/efi"}
+	if _, err := SyncExtract(context.Background(), so); err != nil {
+		t.Fatalf("SyncExtract: %v", err)
+	}
+	for _, rel := range []string{"boot/old-kernel-dir", "boot/efi/EFI/oldvendor"} {
+		if _, err := os.Lstat(filepath.Join(root, rel)); err == nil {
+			t.Errorf("%s is on an os volume and not in the image: it must be swept", rel)
+		}
+	}
+	for _, rel := range []string{"srv/data/sub/deep", "mnt/foreign/sub/deep"} {
+		if _, ok := read(root, rel); !ok {
+			t.Errorf("%s is not on an os volume and must not be swept", rel)
+		}
+	}
+	if _, ok := read(root, "boot/vmlinuz-new"); !ok {
+		t.Error("the image's own boot file is missing")
+	}
+}

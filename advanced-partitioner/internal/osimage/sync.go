@@ -492,7 +492,13 @@ func (p Protection) sweepAction(rel string, isDir, inImage, excluded, keepDir bo
 func (o SyncOptions) sweep(members map[string]memberInfo, keepDirs map[string]bool) (int, error) {
 	removed := 0
 	root := o.Sysroot
-	rootDev := devOf(root)
+	// The root and the os set's own volumes converge alike.
+	ownDevs := map[uint64]bool{devOf(root): true}
+	for _, m := range o.OSMounts {
+		if slices.Contains(o.mounts, m) {
+			ownDevs[devOf(filepath.Join(root, m))] = true
+		}
+	}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			if errors.Is(werr, fs.ErrNotExist) {
@@ -514,8 +520,9 @@ func (o SyncOptions) sweep(members map[string]memberInfo, keepDirs map[string]bo
 		case actKeep, actDescend:
 			return nil
 		}
-		if d.IsDir() && (devOf(path) != rootDev || o.hasMount(rel)) {
-			// another filesystem that the image does not own: never delete into it
+		if d.IsDir() && (!ownDevs[devOf(path)] || o.hasMount(rel)) {
+			// a mountpoint, a parent of one, or a filesystem that is not the os
+			// set's: never delete into it
 			o.detail("  sync: keeping mountpoint %s (not part of the image)", rel)
 			return filepath.SkipDir
 		}
@@ -647,7 +654,8 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func devOf(path string) uint64 {
+// devOf is a test seam: the device a path is on.
+var devOf = func(path string) uint64 {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return 0
