@@ -724,11 +724,13 @@ if [ "x$root" = "xluna" ]; then
             while [ 0 ]; do
                 token=$(fetch_token)
                 luna_curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
+                curl_rc=$?
                 http_code=$(cat /lunatmp/http_code.out)
-                if [ "$http_code" == "200" ]; then
+                # a body cut short still reports 200; only curl's exit status tells
+                if [ "$curl_rc" = "0" ] && [ "$http_code" == "200" ]; then
                     break
                 else
-                    echo "Luna2: Could not get install script [$http_code]. Sleeping 10 sec."
+                    echo "Luna2: Could not get install script [$http_code, curl exit $curl_rc]. Sleeping 10 sec."
                     sleep 10
                 fi
             done
