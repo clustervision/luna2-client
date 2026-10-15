@@ -27,7 +27,7 @@ import (
 
 // exitFatalConfig is the exit code for a non-retryable configuration error: one
 // that will fail identically on every retry, so the install wrapper
-// (luna2-start.sh) must stop the retry loop rather than spin forever. Distinct
+// (luna-installer.sh) must stop the retry loop rather than spin forever. Distinct
 // from the generic exit 1 (a transient/operational failure that may be worth a
 // retry).
 const exitFatalConfig = 3
@@ -165,7 +165,7 @@ func run() error {
 // of the lossy display bus (FTA Cluster B): a dropped terminal event or
 // an operator quitting the TUI mid-install can never turn a failed or
 // unfinished install into exit 0, and a safety refusal maps to exit 2 and
-// a fatal class to exit 3 so luna2-start.sh parks instead of retrying forever.
+// a fatal class to exit 3 so luna-installer.sh parks instead of retrying forever.
 // A render error is read after the verdict of a failed phase, so it cannot
 // turn a park into a retry.
 func phaseExit(res pipeline.Result, renderExit int, renderErr error) (int, string) {

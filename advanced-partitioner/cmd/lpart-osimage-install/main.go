@@ -1,18 +1,22 @@
 // lpart-osimage-install downloads the Luna OS image and extracts it
-// into /sysroot. Behavioural reference: /root/NEWTREE/bin/lpart-osimage-install.
+// into /sysroot.
 //
 // Flow:
-//  1. Parse flags (or --config JSON), init logger, sysroot + LUNA_TOKEN
-//     preflight.
+//  1. Parse flags (or --config JSON), init logger, installer-env guard,
+//     install context, storage result, sysroot + LUNA_TOKEN preflight.
 //  2. Detect the image filename from /lunatmp/install.sh (or override).
-//  3. Download via aria2c (torrent) when present, otherwise curl.
-//  4. Resolve preserve / preserve_empty / no_new_files through
-//     first-component sysroot symlinks.
-//  5. PrepareSysroot: top-level wipe, sibling deletion, preserve-empty
-//     content clear.
-//  6. BuildTarExcludes from the resolved patterns.
-//  7. Extract with --acls or --no-acls based on the sysroot fs type.
-//  8. Remove the cached tarball.
+//  3. Resolve preserve / preserve_empty / no_new_files through the sysroot's
+//     symlinks (every component) and build the tar excludes, persistent
+//     mountpoints included.
+//  4. Download via aria2c (torrent) or curl, in the node's provision order.
+//     A streamed curl|tar extract (by default on a tmpfs sysroot) downloads
+//     inside the extract instead, and falls back to the download on failure.
+//  5. sync/auto on an existing install: SyncExtract converges the sysroot to
+//     the image (extract over it, then sweep what the image does not carry).
+//  6. Otherwise PrepareSysroot (top-level wipe, sibling deletion,
+//     preserve-empty content clear), then extract with --acls or --no-acls
+//     by the sysroot fs type; the tarball is removed.
+//  7. VerifyExtract: os-release present, the tree populated.
 package main
 
 import (
@@ -263,7 +267,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
 
-	// Resolve filter paths through first-component sysroot symlinks.
+	// Resolve filter paths through the sysroot's symlinks.
 	// Done before download so tests can drive filter logic without the
 	// 60-90s torrent fetch via --skip-download.
 	logger.SetStage("filter_resolve")
@@ -324,28 +328,6 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		logger.UserInfo("persistent-set-mountpoint excluded from extract: %s", mp)
 	}
 	logger.KV("tar_excludes", strings.Join(excludes, " "))
-
-	// Defensive check: every persistent mountpoint must appear in the
-	// tar excludes. Should never trip, but exits 2 if it does (safety
-	// refusal) rather than continue with a broken exclude set.
-	for _, mp := range srSummary.PersistentMountpoints {
-		clean := strings.TrimPrefix(mp, "/")
-		if clean == "" {
-			continue
-		}
-		want := "--exclude=./" + clean
-		found := false
-		for _, ex := range excludes {
-			if ex == want {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return cli.ExitSafetyRefusal(stderr, toolName, "persistent",
-				"persistent mountpoint %s not present in tar excludes", mp)
-		}
-	}
 
 	// --skip-download halts HERE — before download, PrepareSysroot and
 	// extract. There is no tarball to extract, so running the destructive

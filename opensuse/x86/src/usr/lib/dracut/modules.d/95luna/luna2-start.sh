@@ -16,11 +16,10 @@
 # You should have received a copy of the GNU General Public License
 # along with Luna.  If not, see <http://www.gnu.org/licenses/>.
 
-# dracut (redhat/suse) entrypoint for the install initramfs. It is a thin
-# wrapper: set up console+log capture, pull in dracut's getargs/getargbool, and
-# source the SHARED installer body (/usr/share/luna/luna-installer.sh), which is
-# byte-identical to the one the ubuntu initramfs-tools hook sources. All install
-# logic lives in the shared body; only the framework glue differs per distro.
+# dracut entrypoint for the install initramfs. It is a thin wrapper: set up
+# console+log capture, pull in dracut's getargs/getargbool, and source the
+# installer body (/usr/share/luna/luna-installer.sh), where all install logic
+# lives. The ubuntu initramfs-tools hook has its own (luna-start).
 
 # Don't use POSIX compliancy mode !
 set +o posix

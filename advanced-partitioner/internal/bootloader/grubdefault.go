@@ -21,7 +21,7 @@ import (
 
 // writeGrubDefault writes <sysroot>/etc/default/grub through fs (dry-run
 // aware). defaultEntry is GRUB_DEFAULT: "saved" where the default kernel is
-// set afterwards with grub2-set-default, "0" where the first entry is it.
+// set afterwards in grubenv (saved_entry), "0" where the first entry is it.
 func writeGrubDefault(fs fsops.FS, bc BootContext, defaultEntry string) error {
 	path := filepath.Join(bc.Sysroot, "etc", "default", "grub")
 	if err := fs.MkdirAll(filepath.Dir(path), 0o755); err != nil {

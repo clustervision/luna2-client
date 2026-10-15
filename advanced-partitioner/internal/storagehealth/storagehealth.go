@@ -105,7 +105,9 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 		disks = append(disks, r.ResolvedPath)
 	}
 	// Data sets are assembled read-only; nothing is started degraded unless
-	// the set allows it, and what the probe brought up is released after it.
+	// the set allows it. On a raid set what the probe brought up (arrays, VG)
+	// is released after it; a raid=none set's VG stays active (mount and
+	// create handle it).
 	vgSelect := ""
 	if rm := set.RAIDMode(); rm != "" && rm != "none" {
 		act := ActivateExisting(ctx, runner, set, disks, logger, set.Role != "os")

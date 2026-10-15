@@ -11,7 +11,10 @@
 //	luna.go       LUNA_TOKEN + image-filename detection
 //	config.go     --config JSON shape
 //	download.go   aria2c (torrent) + curl (HTTP) download paths
-//	extract.go    PrepareSysroot + BuildTarExcludes + ExtractTarball
+//	extract.go    PrepareSysroot + BuildTarExcludes + Extract
+//	stream.go     StreamHTTPExtract: curl | tar in one pipe
+//	sync.go       SyncExtract: extract over an existing tree, then sweep
+//	verify.go     VerifyExtract: os-release and a populated tree
 //
 // Cross-platform notes:
 //   - tar -I lbzip2 --acls/--no-acls --numeric-owner is identical on

@@ -214,7 +214,6 @@ func TestBuildPinnableConfig_CarriesEveryOperatorKey(t *testing.T) {
 		"Selection": true, "Count": true, "Match": true, "Save": true, "IncludeSAN": true, // discover-only
 		"Devices": true, // taken from the resolution
 		"Origin":  true, // stamped by the installer
-		"Comment": true, // not carried today
 	}
 	src := v2.Set{Selection: "discover"}
 	sv := reflect.ValueOf(&src).Elem()

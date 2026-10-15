@@ -75,7 +75,7 @@ type Set struct {
 	IncludeSAN bool `json:"include_san,omitempty"`
 	// Persistent, when true, is a hands-off guarantee: the set is never
 	// partitioned, formatted, or written, only mounted. It survives auto,
-	// sync, and full; only sanitize erases it. Operator-set only.
+	// sync, and full; sanitize refuses a layout that has one. Operator-set only.
 	Persistent bool `json:"persistent,omitempty"`
 	// Bootloader, on the os set, places the node's own disk in the UEFI boot
 	// order or takes the bootloader away altogether. Absent means "last" —

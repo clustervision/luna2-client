@@ -69,8 +69,8 @@ var trailingEntryRE = regexp.MustCompile(
 var bootNextRE = regexp.MustCompile(`^BootNext:\s*(.+)\s*$`)
 
 // ClearUEFINVRAMEntries deletes UEFI boot entries whose label does NOT
-// match pxeAllowRE. Used by tmpfs-root + clear_uefi_nvram=true
-// to wipe stale local-install entries before reboot. Mirrors
+// match pxeAllowRE. Used whenever clear_uefi_nvram=true, for every boot
+// method, to wipe stale local-install entries before reboot. Mirrors
 // lib/bootloader_common.sh::clear_uefi_nvram_entries.
 func ClearUEFINVRAMEntries(ctx context.Context, runner executor.Runner, sysroot, firmwareMode string) error {
 	if firmwareMode != "uefi" {

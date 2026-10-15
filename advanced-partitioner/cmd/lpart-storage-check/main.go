@@ -89,9 +89,7 @@ const (
 	defaultResultOut  = defaultRuntimeDir + "/storage-check-result.json"
 )
 
-// bash predecessor section by section.
-//
-//nolint:gocyclo // command flow is intentionally linear; matches the
+//nolint:gocyclo // command flow is intentionally linear; matches the bash predecessor section by section.
 func run(argv []string, stdout, stderr io.Writer) int {
 	if len(argv) == 0 {
 		argv = []string{toolName}
@@ -120,8 +118,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stdout, cli.Version())
 		return 0
 	}
-	// storage-check's probes are already read-only (BR-7: fsck -n variants,
-	// lsblk/blkid reads) -- there is nothing for --dry-run to protect. What
+	// --dry-run cannot make storage-check read-only: the probes assemble
+	// arrays, replay an XFS log by mounting and run e2fsck -p. What
 	// --dry-run WOULD do is stub every probe to rc 0, making Classify
 	// fabricate a verdict from evidence it never gathered: a false health
 	// report an operator may act on (FTA v2 BE-F7, TE-D). Fail closed: refuse
@@ -129,8 +127,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// --dry-run to this tool.
 	if f.DryRun {
 		return cli.ExitFatalConfig(stderr, toolName, "dry-run",
-			"--dry-run is not supported: storage-check probes are already read-only, "+
-				"and stubbing them would fabricate health verdicts; run without --dry-run")
+			"--dry-run is not supported: stubbing the storage-check probes "+
+				"would fabricate health verdicts; run without --dry-run")
 	}
 
 	logger, err := f.NewLogger(toolName)
@@ -157,7 +155,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		CmdlinePath:       f.CmdlinePath,
 		AllowNonInstaller: f.AllowNonInstaller,
 	}); err != nil {
-		return cli.ExitFatalConfig(stderr, toolName, "installer-env", "%v", err)
+		errln(stderr, "%v", err) // exit 1, as in every lpart tool
+		return 1
 	}
 
 	logger.SetStage("command_checks")

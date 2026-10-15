@@ -17,8 +17,7 @@ import (
 // builds one of these per selected set from the typed v2 config + the
 // disk/selector.Resolved records.
 type Set struct {
-	// Name is the set name; also the LVM VG name (unless provider.vg_name
-	// overrides it, in which case the override goes here too).
+	// Name is the set name; also the LVM VG name (v2.Set.VGName).
 	Name string
 	// SelectedDisks is the list of resolved whole-disk paths, e.g.
 	// "/dev/sda", "/dev/disk/by-path/pci-0000:00:1f.2-ata-1.0" (the

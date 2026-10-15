@@ -60,9 +60,9 @@ type Options struct {
 
 // failureFile is the one-shot failure summary written into Options.LogDir on a
 // stage failure: the stage, the untruncated reason and the failing step's
-// stderr. The per-tool logs and the loghost keep everything, but the node
-// reboots into the next attempt ~30 s later, so the boot wrapper prints this
-// file on the console — there is no second look.
+// stderr. The per-tool logs and the loghost keep everything, but the boot
+// wrapper starts the next attempt ~30 s later, so it prints this file on the
+// console — there is no second look.
 const failureFile = "last-failure.txt"
 
 // stepStderrLines bounds the stderr kept for the failure file. A step logs the
@@ -74,7 +74,7 @@ const stepStderrLines = 40
 const failureStderrLines = 12
 
 // FailureClass classifies a phase failure for the retry-vs-park decision
-// in the boot wrapper (see luna2-start.sh LUNA_FATAL_RC).
+// in the boot wrapper (see luna-installer.sh LUNA_FATAL_RC).
 type FailureClass int
 
 const (
@@ -588,14 +588,9 @@ func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []st
 	if p.ctx.Err() != nil {
 		return fmt.Errorf("%s: install interrupted; the step was killed with its child processes", filepath.Base(argv[0]))
 	}
-	// A non-zero child exit is reported by RunCommand as BOTH a numeric code
-	// AND a non-nil err (the exec.ExitError echoing that code). Build the
-	// typed stepError from the CODE first, so the fatal/retry class survives.
-	// Returning the raw err before this check discarded the code, so a
-	// safety-refusal (exit 2 -> should map to fatal exit 3) was misclassified
-	// retryable and the node retry-looped forever instead of parking — the FTA
-	// Cluster B catastrophe, found by the real PXE regression (unit tests
-	// exercised stepError classification but not this RunCommand seam).
+	// RunCommand reports a non-zero exit as both a code and an err. The typed
+	// stepError is built from the code first: returning the raw err dropped
+	// it, and a park (exit 2 or 3) became a retry loop.
 	if code != 0 {
 		return &stepError{Bin: filepath.Base(argv[0]), Stage: stage, Code: code}
 	}

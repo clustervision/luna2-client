@@ -95,6 +95,7 @@ func buildPinnableConfig(orig *v2.Config, resolved []result.ResolvedSet, origin 
 			Bootloader:    src.Bootloader,
 			AllowDegraded: src.AllowDegraded,
 			Volumes:       src.Volumes,
+			Comment:       src.Comment,
 		}
 		// Stamp provenance only on sets the installer actually discovered;
 		// operator-authored manual sets pass through unmarked.

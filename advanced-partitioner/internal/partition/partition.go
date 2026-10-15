@@ -188,9 +188,7 @@ func raidIsRedundant(raidMode string) bool {
 // on UEFI and BIOS -- GPT with an ESP (EF00, or FD00 when mirrored) -- so a
 // node switched to UEFI later needs no repartition.
 //
-// easy side-by-side diffing.
-//
-//nolint:gocyclo // mirrors the flat structure of the Bash function for
+//nolint:gocyclo // mirrors the flat structure of the Bash function for easy side-by-side diffing.
 func (b *Builder) BuildLayout(ctx context.Context, set *v2.Set, resolved []selector.Resolved, firmwareMode string) (Layout, error) {
 	if b.o.Runner == nil {
 		return Layout{}, fmt.Errorf("partition.BuildLayout: Runner is required")

@@ -1,13 +1,11 @@
-# luna-installer.sh -- SHARED Luna install-initramfs logic.
+# luna-installer.sh -- Luna install-initramfs logic for dracut.
 #
-# CANONICAL SHARED SCRIPT. This file is byte-identical in the redhat (dracut
-# 95luna) and ubuntu (initramfs-tools) client trees, and is installed to
-# /usr/share/luna/luna-installer.sh inside the install initramfs. The per-distro
-# entrypoint sources it after setting up logging and the getargs/getargbool
-# helpers:
-#   - redhat/suse : 95luna/luna2-start.sh  (dracut; getargs from dracut-lib.sh)
-#   - ubuntu      : scripts/local-premount/luna-start  (initramfs-tools; shims)
-# Keep the two copies in sync -- edit one, copy to the other.
+# Byte-identical in all six 95luna module copies (redhat, opensuse and ubuntu;
+# x86 and arm): edit one, copy to the others. Installed to
+# /usr/share/luna/luna-installer.sh inside the install initramfs and sourced by
+# 95luna/luna2-start.sh after its logging setup and dracut-lib.sh (getargs).
+# The ubuntu initramfs-tools hook does not use it: its
+# scripts/local-premount/luna-start is a separate implementation.
 #
 # Written by ClusterVision Development team. This file is part of Luna, a
 # cluster provisioning tool, and is free software under the GNU GPL v3+
@@ -794,6 +792,8 @@ if [ "x$root" = "xluna" ]; then
     echo 'Exit from Luna2 Installer'
 
     # Post-install boot of the freshly installed disk.
+    # Not reached today: the only entrypoint, luna2-start.sh, sources
+    # dracut-lib.sh first, so the initramfs-tools branch below never runs.
     # dracut (redhat/suse) pivots cleanly to /sysroot once this hook returns, so
     # there is nothing more to do. initramfs-tools (ubuntu/debian) cannot: with
     # root=luna there is no device for mountroot to mount, so it would drop to an

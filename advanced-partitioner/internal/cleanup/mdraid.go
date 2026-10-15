@@ -181,13 +181,6 @@ func (c *Cleaner) stopMDIfExists(ctx context.Context, mdDevice string) {
 	c.runBest(ctx, "udevadm", "settle")
 }
 
-// partitionsOf returns the partition device paths of a whole disk by
-// asking lsblk. KNAME, not PATH: the PATH column arrived in util-linux 2.33,
-// and el8 ships 2.32 — with PATH the lsblk call fails there, partitionsOf
-// returns nil, and the dormant protected-disk barrier silently never sees
-// the partition superblocks (found live: battery S24 + regression 3.47
-// refused=0 on rocky8). KNAME exists everywhere and for a disk's partitions
-// "/dev/"+KNAME is exactly what PATH printed.
 // dormantArrayUUIDs maps md Array UUIDs found in the superblocks on the given
 // disks (whole disk + every partition) to one carrying device path. Running
 // state is irrelevant: --examine reads the on-disk metadata.
@@ -219,6 +212,13 @@ func (c *Cleaner) mdArrayUUID(ctx context.Context, dev string) string {
 	return ""
 }
 
+// partitionsOf returns the partition device paths of a whole disk by
+// asking lsblk. KNAME, not PATH: the PATH column arrived in util-linux 2.33,
+// and el8 ships 2.32 — with PATH the lsblk call fails there, partitionsOf
+// returns nil, and the dormant protected-disk barrier silently never sees
+// the partition superblocks (found live: battery S24 + regression 3.47
+// refused=0 on rocky8). KNAME exists everywhere and for a disk's partitions
+// "/dev/"+KNAME is exactly what PATH printed.
 func (c *Cleaner) partitionsOf(ctx context.Context, disk string) []string {
 	res, ok := c.runOK(ctx, "lsblk", "-ln", "-o", "KNAME,TYPE", disk)
 	if !ok {

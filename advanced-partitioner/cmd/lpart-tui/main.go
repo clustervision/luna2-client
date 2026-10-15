@@ -1,5 +1,5 @@
 // Command lpart-tui is the standalone install dashboard (ADR 0009). It is the
-// renderer half of the decoupled TUI: luna2-start.sh launches it once, around
+// renderer half of the decoupled TUI: luna-installer.sh launches it once, around
 // the whole install.sh run, and it draws one live screen by reading the event
 // bus that every step — the lpart-* workers and the bash steps (bmcsetup, the
 // pre/part/post admin columns, the legacy tail) — emits to.

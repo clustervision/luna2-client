@@ -75,7 +75,7 @@ func RequireInstallerEnv(opts Options) error {
 }
 
 // KernelParam returns the value of a `key=value` token on the kernel cmdline
-// — the Go equivalent of luna2-start.sh's `getargs key=`. The path defaults to
+// — the Go equivalent of luna-installer.sh's `getargs key=`. The path defaults to
 // CmdlinePath; tests inject Options.CmdlinePath. ok is false when the file is
 // unreadable or the key is absent. The first occurrence wins, matching kernel
 // last-wins-at-parse but getargs first-match behaviour used by the bash client.

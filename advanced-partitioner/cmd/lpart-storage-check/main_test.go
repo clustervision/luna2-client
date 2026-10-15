@@ -96,8 +96,8 @@ func TestRefusesWithoutLunaMarker(t *testing.T) {
 		"--skip-command-check",
 		"--config", cfg,
 	}, &outBuf, &errBuf)
-	if rc == 0 {
-		t.Fatalf("expected refusal; stderr=%s", errBuf.String())
+	if rc != 1 { // the same exit as every lpart tool's installer-env guard
+		t.Fatalf("expected refusal with exit 1, got %d; stderr=%s", rc, errBuf.String())
 	}
 	if !strings.Contains(errBuf.String(), "root=luna") {
 		t.Fatalf("wording wrong: %s", errBuf.String())
@@ -128,7 +128,7 @@ func TestMemoryProviderInConfigRejected(t *testing.T) {
 	}
 }
 
-// storage-check refuses --dry-run outright: its probes are already read-only,
+// storage-check refuses --dry-run outright: stubbing its probes would fabricate a verdict,
 // and a dry-run would stub them all to rc 0, fabricating health verdicts from
 // evidence never gathered -- a false report an operator may act on.
 // FTA v2 BE-F7 (TE-D), barrier NB-8.

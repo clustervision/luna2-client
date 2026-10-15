@@ -361,8 +361,8 @@ func TestRefusesWithoutLunaMarker(t *testing.T) {
 		"--skip-final-inventory",
 		"--config", cfg, "--dry-run",
 	}, &outBuf, &errBuf)
-	if rc == 0 {
-		t.Fatalf("expected refusal; stderr=%s", errBuf.String())
+	if rc != 1 { // the same exit as every lpart tool's installer-env guard
+		t.Fatalf("expected refusal with exit 1, got %d; stderr=%s", rc, errBuf.String())
 	}
 	if !strings.Contains(errBuf.String(), "root=luna") {
 		t.Fatalf("wording wrong: %s", errBuf.String())
