@@ -123,6 +123,7 @@ copy_file config /etc/ssh/ssh_host_rsa_key
 copy_file config /etc/ssh/ssh_host_ecdsa_key
 copy_file config /etc/ssh/ssh_host_ed25519_key
 copy_file config /etc/pki/tls/certs/ca-bundle.crt
+copy_file config /etc/ssl/certs/ca-certificates.crt
 copy_file config /etc/resolv.conf
 copy_file config /trinity/local/luna/node/config/luna.ini
 copy_file library /usr/lib/aarch64-linux-gnu/libtss2-tcti-device.so.0
