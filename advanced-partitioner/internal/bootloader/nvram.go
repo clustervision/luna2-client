@@ -32,12 +32,11 @@ func efibootmgrChrootPath(sysroot string) string {
 	return ""
 }
 
-// pxeAllowlist mirrors the bash awk allow-pass in
-// clear_uefi_nvram_entries: "anything matching PXE|Network|Luna|iPXE
-// must NOT be deleted". This is the safety net that keeps the network
-// boot path alive when an operator runs the clear_uefi_nvram path on
-// the tmpfs OS.
-var pxeAllowRE = regexp.MustCompile(`PXE|Network|Luna|iPXE`)
+// pxeAllowRE is the safety net that keeps the network boot path alive
+// when an operator runs the clear_uefi_nvram path: an entry whose label
+// matches is never deleted. Case-insensitive and wider than the bash
+// predecessor's PXE|Network|Luna|iPXE, which deleted HTTP boot entries.
+var pxeAllowRE = regexp.MustCompile(`(?i)PXE|Network|HTTP|IPv4|IPv6|iPXE|Luna`)
 
 // bootEntryRE matches a line like "Boot0001* TrinityX sda" or
 // "Boot0042  Linux Boot Manager". The first group is the four-hex
@@ -70,7 +69,7 @@ var trailingEntryRE = regexp.MustCompile(
 var bootNextRE = regexp.MustCompile(`^BootNext:\s*(.+)\s*$`)
 
 // ClearUEFINVRAMEntries deletes UEFI boot entries whose label does NOT
-// match PXE|Network|Luna|iPXE. Used by tmpfs-root + clear_uefi_nvram=true
+// match pxeAllowRE. Used by tmpfs-root + clear_uefi_nvram=true
 // to wipe stale local-install entries before reboot. Mirrors
 // lib/bootloader_common.sh::clear_uefi_nvram_entries.
 func ClearUEFINVRAMEntries(ctx context.Context, runner executor.Runner, sysroot, firmwareMode string) error {
@@ -101,7 +100,7 @@ func ClearUEFINVRAMEntries(ctx context.Context, runner executor.Runner, sysroot,
 }
 
 // parseClearableBootNums returns the four-hex boot numbers whose label
-// is NOT in the PXE/Network/Luna/iPXE allowlist. Exported as an
+// does not match pxeAllowRE. Exported as an
 // internal helper for tests.
 func parseClearableBootNums(efibootmgrOutput string) []string {
 	var out []string
