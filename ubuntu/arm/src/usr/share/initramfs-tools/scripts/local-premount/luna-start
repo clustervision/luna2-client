@@ -461,8 +461,16 @@ if [ "x$ROOT" = "xluna" ]; then
             if [ "$RES" != "success" ] && { [ "$rc" = "$LUNA_SAFETY_RC" ] || [ "$rc" = "$LUNA_FATAL_RC" ]; }; then
                 fatal_park "$rc"           # never returns
             fi
-            if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
-                logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
+            if [ "$RES" != "success" ]; then
+                # with or without a loghost: keep the first and the last failed
+                # attempt, and start the next on an empty log (tmpfs is RAM)
+                if [ "$luna_loghost" ]; then
+                    logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
+                fi
+                cat /tmp/luna_install.log > /tmp/luna_install.log.prev
+                if [ ! -f /tmp/luna_install.log.first ]; then
+                    cat /tmp/luna_install.log > /tmp/luna_install.log.first
+                fi
                 echo -n '' > /tmp/luna_install.log
             fi
             if [ "$RES" != "success" ]; then
