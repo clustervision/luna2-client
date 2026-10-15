@@ -119,14 +119,14 @@ luna_start() {
     if [ -x /usr/sbin/dropbear ]; then
         echo "Luna2: Starting ssh (dropbear)"
         mkdir -p /etc/dropbear
-        /usr/sbin/dropbear -R -p 22 || echo "Luna2: dropbear did not start: no ssh into this ramdisk"
+        /usr/sbin/dropbear -R -p 22 -P /run/luna-ssh.pid || echo "Luna2: dropbear did not start: no ssh into this ramdisk"
     else
         echo "Luna2: Starting ssh"
         echo "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin" >> /etc/passwd
         echo sshd:x:74: >> /etc/group
         # Debian's sshd refuses to start without /run/sshd (its privilege-separation dir).
         mkdir -p /var/empty/sshd /run/sshd
-        /usr/sbin/sshd > /dev/null 2>&1 || echo "Luna2: sshd did not start: no ssh into this ramdisk"
+        /usr/sbin/sshd -o PidFile=/run/luna-ssh.pid > /dev/null 2>&1 || echo "Luna2: sshd did not start: no ssh into this ramdisk"
     fi
     echo "Luna2: Start shell on tty2"
     luna_ctty2=/dev/tty2
@@ -174,10 +174,9 @@ luna_finish() {
     else
         echo "Luna2: loghost not defined, cannot forward logs."
     fi
-    # shutdown sshd
-#   ps -h not available in busybox
-#    /usr/bin/ps h --ppid `cat /var/run/sshd.pid` -o 'pid' | while read pid; do kill $pid; done
-#    kill `cat /var/run/sshd.pid`
+    # shutdown sshd: initramfs-tools hands its processes on to the installed system,
+    # where this one would hold port 22 and refuse every key.
+    [ -f /run/luna-ssh.pid ] && kill "$(cat /run/luna-ssh.pid)" 2>/dev/null
     # shutdown dhclient
     /usr/sbin/dhclient -lf /lunatmp/dhclient.leases -x
     # bring interfaces down
