@@ -449,10 +449,8 @@ func Extract(ctx context.Context, opts ExtractOptions) error {
 		return fmt.Errorf("tar extract: %w", err)
 	}
 
-	osRelease := filepath.Join(opts.Sysroot, "etc", "os-release")
-	if _, err := os.Stat(osRelease); err != nil {
-		return fmt.Errorf("osimage extract did not produce %s: %w", osRelease, err)
-	}
+	// No os-release check here: VerifyExtract makes it, and refuses (exit 3)
+	// an image without one, which fails the same way on every retry.
 	opts.info("osimage extracted into " + opts.Sysroot + " successfully")
 
 	if opts.RemoveAfter {

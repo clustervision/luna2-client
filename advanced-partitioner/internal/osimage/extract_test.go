@@ -335,14 +335,3 @@ func TestExtractNoACLs(t *testing.T) {
 		t.Fatalf("tar args: %s", args)
 	}
 }
-
-func TestExtractFailsWithoutOSRelease(t *testing.T) {
-	sysroot := t.TempDir()
-	tarball := realTarball(t, []ent{{"./", "", "", tar.TypeDir, 0o755}, {"./bin", "x\n", "", tar.TypeReg, 0o755}})
-	err := Extract(context.Background(), ExtractOptions{
-		Runner: newRecordingRunner(t), Sysroot: sysroot, TarballPath: tarball, ACLs: true,
-	})
-	if err == nil || !strings.Contains(err.Error(), "os-release") {
-		t.Fatalf("expected os-release error; got %v", err)
-	}
-}
