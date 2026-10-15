@@ -205,9 +205,18 @@ luna_finish() {
     # initramfs-tools mounts the new root at $rootmnt (/root), not /sysroot:
     # the move to /sysroot failed on every node and the log was lost
     mv /tmp/luna_install.log "${rootmnt:-/root}/var/log/"
+    # The lpart per-tool logs are the detailed record of the install, and /tmp
+    # does not survive run-init: keep them, as the dracut hook does.
+    if [ -d /tmp/install_files/logs ]; then
+        mkdir -p "${rootmnt:-/root}/var/log/luna"
+        cp -a /tmp/install_files/logs/. "${rootmnt:-/root}/var/log/luna/" 2>/dev/null \
+            || echo "Luna2: could not preserve the lpart logs"
+    fi
     # kill shell on tty2
     ps h t tty2 o pid | while read pid; do kill -9 $pid; done
 
+    # The installer reached its end, the root is complete (as the dracut hook).
+    : > /run/luna-install-finished
 }
 
 # Without luna.ctty: the last console= on the command line (the kernel's
