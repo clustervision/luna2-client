@@ -350,17 +350,18 @@ const (
 
 // notGRUBInstall says why the boot code on disk is not a GRUB install to remove,
 // or "" when it is: boot.img in the MBR and core.img at the start of every BIOS
-// boot partition. An MBR without boot code, or no MBR at all, is "" too: there
-// is nothing to remove and clearMBRBootCode leaves it alone.
+// boot partition. A blank MBR or partition is what an interrupted removal
+// leaves, so it counts as GRUB's; anything else is not ours.
 func notGRUBInstall(disk string, parts []blockDev) (string, error) {
 	mbr, err := readFirstSector(disk, true)
-	if err != nil || mbr == nil || mbr[510] != 0x55 || mbr[511] != 0xAA || allZero(mbr[:mbrBootCodeLen]) {
+	if err != nil {
 		return "", err
 	}
-	if !strings.Contains(string(mbr[:mbrBootCodeLen]), grubBootImgMark) {
+	blank := mbr == nil || mbr[510] != 0x55 || mbr[511] != 0xAA || allZero(mbr[:mbrBootCodeLen])
+	if !blank && !strings.Contains(string(mbr[:mbrBootCodeLen]), grubBootImgMark) {
 		return "the MBR boot code is not GRUB's", nil
 	}
-	if len(parts) == 0 {
+	if !blank && len(parts) == 0 {
 		return "GRUB is in the MBR but there is no BIOS boot partition with its core image", nil
 	}
 	for _, p := range parts {
@@ -368,7 +369,7 @@ func notGRUBInstall(disk string, parts []blockDev) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if s == nil || !strings.Contains(string(s), grubCoreImgMark) {
+		if s == nil || (!strings.Contains(string(s), grubCoreImgMark) && !allZero(s)) {
 			return fmt.Sprintf("the BIOS boot partition %s does not start with GRUB's core image", p.Name), nil
 		}
 	}

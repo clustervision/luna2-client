@@ -264,6 +264,13 @@ func TestRemoveBIOSBootloaderLeavesWhatIsNotGRUB(t *testing.T) {
 			mustWriteFile(t, part, strings.Repeat("x", 4096))
 			return biosLsblk(disk, part)
 		},
+		"blank MBR, foreign BIOS boot partition": func(t *testing.T, disk, part string) *executor.FakeRunner {
+			b := []byte(readFile(t, disk))
+			copy(b, make([]byte, mbrBootCodeLen))
+			mustWriteFile(t, disk, string(b))
+			mustWriteFile(t, part, strings.Repeat("x", 4096))
+			return biosLsblk(disk, part)
+		},
 		"no BIOS boot partition": func(t *testing.T, disk, part string) *executor.FakeRunner {
 			return lsblkRunner(`NAME="`+disk+`" TYPE="disk" PARTTYPE="" PKNAME="" MOUNTPOINT=""`+"\n", executor.FakeResponse{})
 		},
