@@ -525,18 +525,12 @@ func (a *rhelAdapter) makeGrubCfgDegradedSafe() error {
 		filepath.Join(a.deps.BootContext.Sysroot, "boot", "grub2", "grub.cfg"))
 }
 
-// makeGrubCfgDegradedSafeAt applies rewriteMduuidToFSUUID to every grub.cfg
+// grubCfgDegradedSafeAt applies rewriteMduuidToFSUUID to every grub.cfg
 // path that exists. Shared by the RHEL/SUSE and Debian adapters (BE-W5:
 // Debian used to keep the mduuid-based grub.cfg — the non-deterministic
-// degraded assembly — that the RHEL fix above removed). Best-effort: a
-// missing/unreadable path is skipped, an unchanged body is not rewritten.
-// Writes go through fs, so --dry-run leaves grub.cfg alone. Write errors are
-// ignored here, for the Debian adapter; grubCfgDegradedSafeAt, which the RHEL
-// adapter uses, returns them.
-func makeGrubCfgDegradedSafeAt(fs fsops.FS, paths ...string) {
-	_ = grubCfgDegradedSafeAt(fs, paths...)
-}
-
+// degraded assembly — that the RHEL fix above removed). A missing/unreadable
+// path is skipped, an unchanged body is not rewritten, a failed write is an
+// error. Writes go through fs, so --dry-run leaves grub.cfg alone.
 func grubCfgDegradedSafeAt(fs fsops.FS, paths ...string) error {
 	for _, path := range paths {
 		body, err := os.ReadFile(path) //nolint:gosec // sysroot file

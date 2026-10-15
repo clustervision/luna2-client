@@ -2,6 +2,7 @@ package bootloader
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -492,5 +493,40 @@ func TestDebianRegenerateInitramfsPrefersInitramfsTools(t *testing.T) {
 	calls := f.Calls()
 	if len(calls) != 1 || strings.Join(calls[0].Args, " ") != "update-initramfs -u -k all" {
 		t.Fatalf("calls = %+v", calls)
+	}
+}
+
+// A grub.cfg repair that cannot be written fails finalise, as on RHEL: the
+// unrepaired file leaves the node unbootable or at a GRUB prompt.
+func TestDebianGenerateGrubConfigFailsOnUnwritableRepair(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only file")
+	}
+	for _, c := range []struct {
+		name, mount, cfg string
+	}{
+		{"separate /boot", "/boot", "linux /boot/vmlinuz-x root=/dev/sda2\n"},
+		{"degraded-safe", "/", "set root='mduuid/3dbc7f6c203c674664990e4cdd81136b'\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sysroot := stageDebianSysroot(t, false)
+			p := filepath.Join(sysroot, "boot", "grub", "grub.cfg")
+			if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(c.cfg), 0o400); err != nil {
+				t.Fatal(err)
+			}
+			a := &debianAdapter{deps: AdapterDeps{
+				Runner: executor.NewFakeRunner(executor.FakeResponse{}),
+				BootContext: BootContext{
+					Sysroot:       sysroot,
+					StorageResult: result.StorageResult{Filesystems: []result.Filesystem{{Mount: c.mount}}},
+				},
+			}}
+			if err := a.generateGrubConfig(context.Background()); err == nil || !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("an unwritable grub.cfg (%s) must fail generateGrubConfig, got %v", c.name, err)
+			}
+		})
 	}
 }

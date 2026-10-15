@@ -200,25 +200,26 @@ func (a *debianAdapter) generateGrubConfig(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("update-grub: %w", err)
 	}
-	a.normalizeGrubCfgForSeparateBoot()
+	if err := a.normalizeGrubCfgForSeparateBoot(); err != nil {
+		return err
+	}
 	// Same degraded-safe rewrite as RHEL (BE-W5): on a mirrored boot chain
 	// the update-grub output locates /boot and root by md-array UUID, which
 	// GRUB resolves non-deterministically when a mirror leg is missing —
 	// dropping the mduuid set/hints forces the fs-uuid scan that finds a raw
 	// metadata-1.0 member. No-op on non-RAID layouts (no mduuid references).
-	makeGrubCfgDegradedSafeAt(a.deps.FS,
+	return grubCfgDegradedSafeAt(a.deps.FS,
 		filepath.Join(sysroot, "boot", "grub", "grub.cfg"),
 		filepath.Join(sysroot, "boot", "grub2", "grub.cfg"),
 	)
-	return nil
 }
 
 // normalizeGrubCfgForSeparateBoot rewrites /boot-prefixed kernel /
 // initrd lines in grub.cfg when /boot is a separate filesystem.
 // Mirrors bootloader_debian_normalize_grub_for_separate_boot.
-func (a *debianAdapter) normalizeGrubCfgForSeparateBoot() {
+func (a *debianAdapter) normalizeGrubCfgForSeparateBoot() error {
 	if !a.hasBootMount() {
-		return
+		return nil
 	}
 	sysroot := a.deps.BootContext.Sysroot
 	for _, cfg := range []string{
@@ -240,8 +241,12 @@ func (a *debianAdapter) normalizeGrubCfgForSeparateBoot() {
 				out = append(out, line)
 			}
 		}
-		_ = a.deps.FS.WriteFile(cfg, []byte(strings.Join(out, "\n")), 0o644)
+		// the unrepaired /boot/vmlinuz paths are not found on a separate /boot
+		if err := a.deps.FS.WriteFile(cfg, []byte(strings.Join(out, "\n")), 0o644); err != nil {
+			return fmt.Errorf("repair grub.cfg for a separate /boot: %w", err)
+		}
 	}
+	return nil
 }
 
 func (a *debianAdapter) hasBootMount() bool {
