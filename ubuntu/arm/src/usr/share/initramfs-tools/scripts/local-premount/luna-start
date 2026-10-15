@@ -175,8 +175,18 @@ luna_finish() {
         echo "Luna2: loghost not defined, cannot forward logs."
     fi
     # shutdown sshd: initramfs-tools hands its processes on to the installed system,
-    # where this one would hold port 22 and refuse every key.
-    [ -f /run/luna-ssh.pid ] && kill "$(cat /run/luna-ssh.pid)" 2>/dev/null
+    # where this one would hold port 22 and refuse every key. Each login is a child
+    # of the listener: end those first, while they are still its children.
+    if [ -f /run/luna-ssh.pid ]; then
+        local _ssh_pid _stat _st _ppid
+        _ssh_pid=$(cat /run/luna-ssh.pid)
+        for _stat in /proc/[0-9]*/stat; do
+            read -r _st 2>/dev/null < "$_stat" || continue
+            read -r _ _ppid _ <<< "${_st##*) }"
+            [ "$_ppid" = "$_ssh_pid" ] && kill "${_stat//[^0-9]/}" 2>/dev/null
+        done
+        kill "$_ssh_pid" 2>/dev/null
+    fi
     # shutdown dhclient
     /usr/sbin/dhclient -lf /lunatmp/dhclient.leases -x
     # bring interfaces down
