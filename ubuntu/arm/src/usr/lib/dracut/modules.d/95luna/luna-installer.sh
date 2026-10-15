@@ -458,40 +458,75 @@ function retry_countdown () {
     echo "Luna2: Press any key to drop to a shell (exit to resume, poweroff to stop)."
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: ============================================================"
-    if ! { exec 9<>"$ctty"; } 2>/dev/null; then
+    # The countdown runs on the recovery console and, unless luna.ctty pins it, on tty1
+    # too: a node with a serial and a VGA console has its operator on either one.
+    local _t _fd _fds=() _ttys=() _cand=("$ctty")
+    [ "$ctty" != /dev/tty1 ] && [ -z "$(getargs luna.ctty=)" ] && _cand+=(/dev/tty1)
+    for _t in "${_cand[@]}"; do
+        _tty_opens "$_t" || continue
+        { exec {_fd}<>"$_t"; } 2>/dev/null || continue
+        _fds+=("$_fd"); _ttys+=("$_t")
+    done
+    if [ ${#_fds[@]} -eq 0 ]; then
         sleep "$secs"
         return 0
     fi
-    local i key _quiet=0 _n=0
-    # Input is read from the recovery console only (fd 9), and the first second
-    # is ignored: what is already buffered there (keys pressed during the
-    # install, serial line noise) and what arrives in that second is dropped,
-    # so a stray byte does not take the node into a shell instead of a retry.
-    printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$secs" >"$ctty"
-    while (( _quiet < 10 && _n < 4096 )); do
-        if read -t 0.1 -n 1 -s key <&9; then
-            (( _n++ ))
-        elif (( $? > 128 )); then
-            (( _quiet++ ))            # 0.1 s without input
-        else
-            sleep 1; break            # EOF/error: no input to ignore
-        fi
+    local i k key _quiet _n _wait
+    _wait=1; [ ${#_fds[@]} -gt 1 ] && _wait=0.5    # one second per tick, shared
+    # Input is read from these consoles only, and the first second is ignored: what is
+    # already buffered there (keys pressed during the install, serial line noise) and
+    # what arrives in that second is dropped, so a stray byte does not take the node
+    # into a shell instead of a retry.
+    for k in "${!_fds[@]}"; do
+        printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$secs" >"${_ttys[$k]}"
+        _quiet=0; _n=0
+        while (( _quiet < 10 / ${#_fds[@]} && _n < 4096 )); do
+            if read -t 0.1 -n 1 -s key <&"${_fds[$k]}"; then
+                (( _n++ ))
+            elif (( $? > 128 )); then
+                (( _quiet++ ))        # 0.1 s without input
+            else
+                sleep 0.5; break      # EOF/error: no input to ignore
+            fi
+        done
     done
     for (( i=secs-1; i>0; i-- )); do
-        printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$i" >"$ctty"
-        if read -t 1 -n 1 -s key <&9; then
-            exec 9<&-
-            echo "" >"$ctty"
-            echo "Luna2: Dropping to shell. 'exit' resumes the retry; 'poweroff' stops." >"$ctty"
-            setsid -c /bin/sh -i -l 0<>"$ctty" 1<>"$ctty" 2<>"$ctty"
-            return 0
-        elif (( $? <= 128 )); then
-            sleep 1                   # EOF/error, not a timeout: keep the pause
-        fi
+        for k in "${!_fds[@]}"; do
+            printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$i" >"${_ttys[$k]}"
+            if read -t "$_wait" -n 1 -s key <&"${_fds[$k]}"; then
+                _t=${_ttys[$k]}
+                for _fd in "${_fds[@]}"; do exec {_fd}<&-; done
+                echo "" >"$_t"
+                echo "Luna2: Dropping to shell. 'exit' resumes the retry; 'poweroff' stops." >"$_t"
+                setsid -c /bin/sh -i -l 0<>"$_t" 1<>"$_t" 2<>"$_t"
+                return 0
+            elif (( $? <= 128 )); then
+                sleep "$_wait"        # EOF/error, not a timeout: keep the pause
+            fi
+        done
     done
-    exec 9<&-
-    echo "" >"$ctty"
+    for k in "${!_fds[@]}"; do
+        echo "" >"${_ttys[$k]}"
+        _fd=${_fds[$k]}; exec {_fd}<&-
+    done
     return 0
+}
+
+# _tty_opens TTY: opening a serial port can wait for its line's carrier and hang the
+# retry; try it in a child and give up on the port after 2 s.
+function _tty_opens () {
+    ( exec 3<>"$1" ) 2>/dev/null &
+    local _p=$! _n
+    for _n in {1..20}; do
+        kill -0 "$_p" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$_p" 2>/dev/null; then
+        kill -9 "$_p" 2>/dev/null
+        wait "$_p" 2>/dev/null
+        return 1
+    fi
+    wait "$_p"
 }
 
 # Non-retryable failure. Some install failures are deterministic: they will fail
