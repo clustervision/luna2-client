@@ -284,6 +284,9 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 	if tar2 != nil {
 		werr2 = tar2.Wait()
 	}
+	if streamErr != nil {
+		_ = src.Close() // the decompressor blocks on a full pipe until its reader goes
+	}
 	srcErr := waitSrc()
 	if streamErr != nil {
 		return res, streamErr

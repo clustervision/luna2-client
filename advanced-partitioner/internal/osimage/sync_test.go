@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"io"
 	"os"
@@ -397,5 +398,45 @@ func TestSyncHardlinkToleranceNeedsExitStatus2(t *testing.T) {
 	_, err := SyncExtract(context.Background(), so)
 	if err == nil || !strings.Contains(err.Error(), "signal: killed") || !strings.Contains(err.Error(), "Cannot hard link") {
 		t.Fatalf("a killed tar must fail the sync, got %v", err)
+	}
+}
+
+// A sync that stops mid-stream (here the refusal on a protected directory, at
+// the first member) returns at once with the real decompressor: lbzip2 is still
+// writing the rest of the image into a pipe nobody reads any more.
+func TestSyncFailingMidStreamReturns(t *testing.T) {
+	requireGNUTar(t)
+	if _, err := exec.LookPath("lbzip2"); err != nil {
+		t.Skip("lbzip2 not available")
+	}
+	root := t.TempDir()
+	write(t, root, "var/lib/app/state", "precious\n")
+	noise := make([]byte, 8<<20)
+	if _, err := rand.Read(noise); err != nil {
+		t.Fatal(err)
+	}
+	img := buildTar(t, []ent{
+		{"./", "", "", tar.TypeDir, 0o755}, {"./var/", "", "", tar.TypeDir, 0o755}, {"./var/lib/", "", "", tar.TypeDir, 0o755},
+		{"./var/lib/app", "file now\n", "", tar.TypeReg, 0o644}, {"./big", string(noise), "", tar.TypeReg, 0o644},
+	})
+	p := filepath.Join(t.TempDir(), "image.tar")
+	if err := os.WriteFile(p, img, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("lbzip2", p).CombinedOutput(); err != nil { //nolint:gosec // test-built path
+		t.Fatalf("lbzip2: %v: %s", err, out)
+	}
+	prot, ex := protectionFor([]string{"var/lib/app/state"}, nil, nil, nil, nil)
+	so := syncOpts(root, nil, prot, ex, nil, "")
+	so.TarballPath, so.decompress = p+".bz2", nil
+	done := make(chan error, 1)
+	go func() { _, err := SyncExtract(context.Background(), so); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "operator review required") {
+			t.Fatalf("want the refusal, got %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the sync did not return: the decompressor is waited for while it blocks on its pipe")
 	}
 }
