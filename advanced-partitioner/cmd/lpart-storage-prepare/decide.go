@@ -453,8 +453,13 @@ func (sp *setProcessor) checkForeignVGs(ctx context.Context, plans []plannedSet)
 			continue
 		}
 		loc, err := vgselect.Locate(ctx, sp.runner, p.set.VGName(), diskPaths(p.disks))
-		if err != nil || len(loc.Foreign) == 0 {
-			continue // the lvm builder re-checks right before vgcreate
+		if err != nil {
+			// Retry rather than skip: the builder's re-check would only run
+			// after every create set was cleaned.
+			return fmt.Errorf("set %q: look for a foreign volume group %q: %w; no disk was touched", p.set.Name, p.set.VGName(), err)
+		}
+		if len(loc.Foreign) == 0 {
+			continue
 		}
 		wiped, err := vgselect.StackedKernelNames(ctx, sp.runner, createDisks)
 		if err != nil {

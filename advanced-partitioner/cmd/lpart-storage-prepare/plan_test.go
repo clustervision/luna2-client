@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -442,6 +443,25 @@ func TestForeignSameNameVGRefusedBeforeCleanup(t *testing.T) {
 	wantSafety(t, err, "foreign-vg")
 	if d := destructive(f); d != "" {
 		t.Fatalf("foreign VG refusal must precede cleanup; ran %s", d)
+	}
+}
+
+// A failed foreign-VG probe is retried (exit 1) before any set is cleaned,
+// not skipped: skipping left the refusal to the builder, after the wipe.
+func TestForeignVGProbeErrorRetriesBeforeCleanup(t *testing.T) {
+	sp, f := testProcessor(t)
+	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "vg_uuid,vg_name,pv_name"},
+		Response: executor.FakeResponse{Err: errors.New("exit status 5")}})
+	_, _, err := sp.runDecision(context.Background(), installcontext.ModeFull,
+		&v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("none", "/dev/vda")}}, "uefi", false, true)
+	if err == nil {
+		t.Fatal("a failed pvs probe must fail the run")
+	}
+	if code := exitForError(io.Discard, err); code != 1 {
+		t.Fatalf("exit = %d, want 1 (retryable): %v", code, err)
+	}
+	if d := destructive(f); d != "" {
+		t.Fatalf("probe failure must precede cleanup; ran %s", d)
 	}
 }
 
