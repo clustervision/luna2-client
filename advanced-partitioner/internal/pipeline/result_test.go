@@ -179,6 +179,27 @@ func TestPostPhaseSkipsBootloaderForSanitize(t *testing.T) {
 	}
 }
 
+// An install-context the post phase cannot read parks (fatal) instead of
+// being taken for install_mode=auto.
+func TestPostPhaseRefusesAnUnreadableInstallContext(t *testing.T) {
+	for name, body := range map[string]string{"corrupt": "{not json", "unknown mode": `{"install_mode":"bogus"}`} {
+		t.Run(name, func(t *testing.T) {
+			rt := t.TempDir()
+			if err := os.WriteFile(rt+"/install-context.json", []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			p := New(context.Background(), Options{Phase: PhasePost, RuntimeDir: rt, LogDir: rt, StepTimeout: 10 * time.Second})
+			go func() {
+				for range p.Events() {
+				}
+			}()
+			if err := p.runPost(); classify(err) != FailFatal {
+				t.Fatalf("got %v (class %v), want a fatal failure", err, classify(err))
+			}
+		})
+	}
+}
+
 // A step that refused a degraded set leaves the marker the install template
 // reads to report install.degraded; any other refusal leaves none.
 func TestMarkDegradedFromStepStderr(t *testing.T) {

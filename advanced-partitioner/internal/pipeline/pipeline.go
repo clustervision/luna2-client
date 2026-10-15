@@ -479,11 +479,16 @@ func (p *Pipeline) runPost() error {
 	// post-phase failure -> 30 s retry loop. Found live on node001 the moment
 	// the sanitize exit-0 fix (NB-1) let the post phase run at all -- the
 	// CCF-7 class again: a contract only exercised end-to-end.
-	mode := installcontext.ModeAuto
-	if ic, err := installcontext.LoadFile(p.rt("install-context.json")); err == nil {
-		mode = ic.InstallMode
-		p.emitLuna(string(ic.InstallMode))
+	// The part phase wrote it: unreadable now, it is unreadable on every retry.
+	ic, err := installcontext.LoadFile(p.rt("install-context.json"))
+	if err != nil {
+		err = fmt.Errorf("install-context: %w", err)
+		p.stageStart("bootloader", "Bootloader finalise")
+		p.stageFail("bootloader", err.Error())
+		return &fatalError{err}
 	}
+	mode := ic.InstallMode
+	p.emitLuna(string(ic.InstallMode))
 	p.emitNode()
 	if !mode.InstallsBootloader() {
 		p.stageStart("bootloader", "Bootloader finalise")
