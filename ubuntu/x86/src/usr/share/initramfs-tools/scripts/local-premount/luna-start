@@ -372,7 +372,7 @@ fetch_token() {
     fi
     luna_mac=$(getargs luna.mac=)
     luna_nic=$(find_nic "${luna_mac}")
-    luna_curl -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
+    luna_curl -X POST -H "Content-Type: application/json" -d "$json" -s -m 60 --connect-timeout 10 "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
     valid=$(grep token /lunatmp/token.json)
     if [ "$valid" ]; then
         token=$(cat /lunatmp/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
