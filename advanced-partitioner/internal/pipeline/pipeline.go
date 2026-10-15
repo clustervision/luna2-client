@@ -68,6 +68,10 @@ const failureFile = "last-failure.txt"
 // cause just before it exits, so the tail is the useful end here.
 const stepStderrLines = 40
 
+// failureStderrLines is the stderr tail written to the failure file: the boot
+// wrapper prints the file's first 15 lines (stage, reason, "stderr:" and these).
+const failureStderrLines = 12
+
 // FailureClass classifies a phase failure for the retry-vs-park decision
 // in the boot wrapper (see luna2-start.sh LUNA_FATAL_RC).
 type FailureClass int
@@ -642,18 +646,36 @@ func (p *Pipeline) failurePath() string { return filepath.Join(p.opts.LogDir, fa
 // the boot wrapper to print. Best-effort: a failure to write is reported into
 // the install log rather than masking the failure that is being reported.
 func (p *Pipeline) writeFailure(stage, reason string) {
+	if v := verdict(p.stepStderr); v != "" {
+		reason = v
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "stage: %s\n", stage)
 	fmt.Fprintf(&b, "reason: %s\n", reason)
-	if len(p.stepStderr) > 0 {
+	if tail := p.stepStderr[max(0, len(p.stepStderr)-failureStderrLines):]; len(tail) > 0 {
 		b.WriteString("stderr:\n")
-		for _, line := range p.stepStderr {
+		for _, line := range tail {
 			b.WriteString("  " + line + "\n")
 		}
 	}
 	if err := os.WriteFile(p.failurePath(), []byte(b.String()), 0o640); err != nil {
 		p.info("could not write " + p.failurePath() + ": " + err.Error())
 	}
+}
+
+// verdict is the lpart tool's own one-line reason for a park ("<tool>:
+// safety_refusal=<code> <message>" or fatal_config=, see internal/cli), as
+// "<code>: <message>"; "" when the step printed none.
+func verdict(stderr []string) string {
+	for i := len(stderr) - 1; i >= 0; i-- {
+		for _, marker := range []string{"safety_refusal=", "fatal_config="} {
+			if _, rest, ok := strings.Cut(stderr[i], marker); ok {
+				code, msg, _ := strings.Cut(rest, " ")
+				return code + ": " + msg
+			}
+		}
+	}
+	return ""
 }
 
 func (p *Pipeline) bin(name string) string { return filepath.Join(p.opts.BinDir, name) }
