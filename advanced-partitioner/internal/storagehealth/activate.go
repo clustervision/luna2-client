@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -82,7 +83,19 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 		}
 		run("udevadm", "settle")
 		for _, n := range names {
-			warnIfDegraded(ctx, runner, set.Name, n, logger)
+			active, total, state, degraded := runningDegraded(ctx, runner, n)
+			switch {
+			case !degraded:
+			case set.AllowDegraded:
+				if logger != nil {
+					logger.Warn(fmt.Sprintf("set %s: array %s runs DEGRADED (%s of %s members active, state %q); allow_degraded is set, so the set is used as it is -- re-add or replace the failed member (mdadm --detail /dev/md/%s), or reinstall with install_mode full to rebuild it", set.Name, n, active, total, state, n))
+				}
+			case !slices.Contains(act.Degraded, n):
+				// Already running on fewer members (started before lpart):
+				// without allow_degraded that is the same refusal as a
+				// member that is missing.
+				act.Degraded = append(act.Degraded, n)
+			}
 		}
 	}
 	if set.StorageType() == v2.StorageLVM {
@@ -321,23 +334,17 @@ func memberEvents(ctx context.Context, runner executor.Runner, members []string)
 	return out
 }
 
-// warnIfDegraded logs a loud warning when /dev/md/<mdName> runs degraded.
-// A mirror member that lost its md superblock (or failed) is not a missing
-// disk: the array starts on the other member, the set probes healthy and is
-// used -- correctly -- but nothing said so, and the mirror silently stayed
-// single for every later install. Arrays that do not exist are skipped.
-func warnIfDegraded(ctx context.Context, runner executor.Runner, setName, mdName string, logger *txlog.Logger) {
-	if logger == nil {
-		return
-	}
+// runningDegraded reports whether /dev/md/<mdName> runs degraded, with its
+// active and total member counts and state as mdadm --detail prints them. An
+// array that does not exist is not degraded.
+func runningDegraded(ctx context.Context, runner executor.Runner, mdName string) (active, total, state string, degraded bool) {
 	res, err := runner.Run(ctx, executor.CommandSpec{
 		Path: "mdadm", Args: []string{"--detail", "/dev/md/" + mdName},
 		CaptureStdout: true, CaptureStderr: true,
 	})
 	if err != nil {
-		return
+		return "", "", "", false
 	}
-	var state, active, total string
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
 		k, v, ok := strings.Cut(strings.TrimSpace(line), " : ")
 		if !ok {
@@ -352,8 +359,5 @@ func warnIfDegraded(ctx context.Context, runner executor.Runner, setName, mdName
 			total = strings.TrimSpace(v)
 		}
 	}
-	if !strings.Contains(state, "degraded") {
-		return
-	}
-	logger.Warn(fmt.Sprintf("set %s: array %s runs DEGRADED (%s of %s members active, state %q); the set is used as it is -- re-add or replace the failed member (mdadm --detail /dev/md/%s), or reinstall with install_mode full to rebuild it", setName, mdName, active, total, state, mdName))
+	return active, total, state, strings.Contains(state, "degraded")
 }
