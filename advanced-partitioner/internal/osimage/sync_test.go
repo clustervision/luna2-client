@@ -457,3 +457,41 @@ func TestSyncTypeChangeNeverFollowsASymlinkedParent(t *testing.T) {
 		t.Fatal("a directory behind a symlinked parent was removed")
 	}
 }
+
+// An image_wins entry the image does not carry is only reported; any other
+// failure of the image_wins tar fails the sync, or the old file stays in place
+// while the install reports success.
+func TestSyncImageWinsFailureFailsTheSync(t *testing.T) {
+	requireGNUTar(t)
+	d, f := byte(tar.TypeDir), byte(tar.TypeReg)
+	img := buildTar(t, []ent{
+		{"./", "", "", d, 0o755}, {"./etc/", "", "", d, 0o755}, {"./etc/ssh/", "", "", d, 0o755},
+		{"./etc/ssh/sshd_config", "image-sshd\n", "", f, 0o644},
+	})
+	prot, ex := protectionFor([]string{"etc/ssh"}, nil, nil, nil, nil)
+
+	t.Run("entry not in the image", func(t *testing.T) {
+		so := syncOpts(t.TempDir(), img, prot, ex, []string{"etc/ssh/sshd_config", "etc/not-in-image"}, "")
+		if _, err := SyncExtract(context.Background(), so); err != nil {
+			t.Fatalf("a missing image_wins entry must not fail the sync: %v", err)
+		}
+	})
+	for name, script := range map[string]string{
+		"exit 2, write error": `tar "$@"; echo "tar: ./etc/ssh/sshd_config: Cannot write: No space left on device" >&2; exit 2`,
+		"killed":              `tar "$@"; kill -9 $$`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			so := syncOpts(t.TempDir(), img, prot, ex, []string{"etc/ssh/sshd_config"}, "")
+			so.tarCmd = func(ctx context.Context, args ...string) *exec.Cmd {
+				if args[len(args)-1] != "./etc/ssh/sshd_config" {
+					return exec.CommandContext(ctx, "tar", args...) //nolint:gosec // test-built args
+				}
+				return exec.CommandContext(ctx, "sh", append([]string{"-c", script, "sh"}, args...)...) //nolint:gosec // test-built args
+			}
+			_, err := SyncExtract(context.Background(), so)
+			if err == nil || !strings.Contains(err.Error(), "image_wins") {
+				t.Fatalf("a failed image_wins tar must fail the sync, got %v", err)
+			}
+		})
+	}
+}

@@ -318,6 +318,10 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 	if werr2 != nil {
 		// tar exits 2 when a requested member is not in the archive: an
 		// image_wins entry the image does not carry. Report, do not fail.
+		// It exits 2 for a fatal error too; only its stderr tells them apart.
+		if exitStatus(werr2) != 2 || !onlyNotFoundErrors(tar2Err.String()) {
+			return res, fmt.Errorf("sync: tar extract (image_wins): %v: %s", werr2, strings.TrimSpace(tar2Err.String()))
+		}
 		o.warn("image_wins: %v: %s", werr2, strings.TrimSpace(tar2Err.String()))
 	}
 	res.Members = len(members)
@@ -757,6 +761,24 @@ func (o SyncOptions) detail(format string, args ...any) {
 	if o.Logger != nil && o.Details {
 		o.Logger.UserInfo(format, args...)
 	}
+}
+
+// onlyNotFoundErrors reports whether tar's stderr holds nothing but "Not found
+// in archive" errors and the closing exit summary.
+func onlyNotFoundErrors(stderr string) bool {
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "":
+		case strings.HasSuffix(line, ": Not found in archive"):
+			n++
+		case strings.Contains(line, "Exiting with failure status due to previous errors"):
+		default:
+			return false
+		}
+	}
+	return n > 0
 }
 
 // onlyHardlinkErrors reports whether tar's stderr holds nothing but "Cannot
