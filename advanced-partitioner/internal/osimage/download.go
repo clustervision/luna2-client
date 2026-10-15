@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
@@ -171,14 +172,8 @@ func ProvisionOrder(method, fallback string) []string {
 		}
 	}
 	// http is always the last resort: torrent alone (and no aria2c in the
-	// initramfs) used to be a permanent download failure, retried every 30 s.
-	hasHTTP := false
-	for _, e := range out {
-		if e == "http" || e == "https" {
-			hasHTTP = true
-		}
-	}
-	if !hasHTTP {
+	// initramfs) is a permanent download failure otherwise.
+	if !slices.Contains(out, "http") && !slices.Contains(out, "https") {
 		out = append(out, "http")
 	}
 	return out

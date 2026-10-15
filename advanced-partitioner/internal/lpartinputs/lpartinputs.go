@@ -82,10 +82,8 @@ type installContext struct {
 }
 
 // readInstallContext reads the template-written install context. A missing
-// file means "not pinned" (auto). A file that exists but is not valid JSON
-// used to become auto as well -- an intended local, full or sanitize run then
-// ran as auto, which on a healthy disk converges and deletes everything not
-// preserved. It is now an error.
+// file means auto; an invalid one is an error, since guessing auto would let a
+// healthy disk be converged when local, full or sanitize was meant.
 func readInstallContext(path string) (installContext, error) {
 	ic := installContext{InstallMode: "auto"}
 	data, err := os.ReadFile(path) //nolint:gosec // G304: runtimeDir-derived path; binary runs as root

@@ -1,13 +1,16 @@
 package osimage
 
 import (
+	"archive/tar"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
 )
 
 func TestSysrootFSTypeTmpfs(t *testing.T) {
@@ -239,31 +242,58 @@ func TestBuildTarExcludes(t *testing.T) {
 	}
 }
 
+// realTarball writes ents as a .tar.bz2 for the real `tar -I lbzip2`.
+func realTarball(t *testing.T, ents []ent) string {
+	t.Helper()
+	requireGNUTar(t)
+	if _, err := exec.LookPath("lbzip2"); err != nil {
+		t.Skip("lbzip2 not available")
+	}
+	p := filepath.Join(t.TempDir(), "image.tar")
+	if err := os.WriteFile(p, buildTar(t, ents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("lbzip2", p).CombinedOutput(); err != nil { //nolint:gosec // test-built path
+		t.Fatalf("lbzip2: %v: %s", err, out)
+	}
+	return p + ".bz2"
+}
+
+// recordingRunner runs commands for real and remembers them.
+type recordingRunner struct {
+	executor.Runner
+	calls []executor.CommandSpec
+}
+
+func (r *recordingRunner) Run(ctx context.Context, spec executor.CommandSpec) (executor.CommandResult, error) {
+	r.calls = append(r.calls, spec)
+	return r.Runner.Run(ctx, spec)
+}
+
+func newRecordingRunner(t *testing.T) *recordingRunner {
+	t.Helper()
+	logger, err := txlog.Init(txlog.Options{Tool: "extract-test", LogDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = logger.Close() })
+	return &recordingRunner{Runner: executor.New(executor.Options{Logger: logger})}
+}
+
+var extractTestImage = []ent{
+	{"./", "", "", tar.TypeDir, 0o755}, {"./etc/", "", "", tar.TypeDir, 0o755}, {"./etc/os-release", "NAME=test\n", "", tar.TypeReg, 0o644},
+	{"./var/", "", "", tar.TypeDir, 0o755}, {"./var/log/", "", "", tar.TypeDir, 0o755}, {"./var/log/x", "log\n", "", tar.TypeReg, 0o644},
+	{"./home/", "", "", tar.TypeDir, 0o755}, {"./home/u", "home\n", "", tar.TypeReg, 0o644},
+}
+
 func TestExtractIssuesTarWithExcludesAndACLs(t *testing.T) {
 	sysroot := t.TempDir()
-	// Pre-create etc/os-release so the post-extract sanity check passes.
-	if err := os.MkdirAll(filepath.Join(sysroot, "etc"), 0o750); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sysroot, "etc/os-release"), []byte("NAME=test\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	tar := filepath.Join(t.TempDir(), "image.tar.bz2")
-	if err := os.WriteFile(tar, []byte("dummy"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	f := executor.NewFakeRunner(executor.FakeResponse{})
-	f.AddMatch(executor.FakeMatch{
-		Path: "tar", ArgsPrefix: []string{"-I", "lbzip2", "--acls", "--numeric-owner"},
-		Response: executor.FakeResponse{},
-	})
-
+	tarball := realTarball(t, extractTestImage)
+	r := newRecordingRunner(t)
 	if err := Extract(context.Background(), ExtractOptions{
-		Runner:      f,
+		Runner:      r,
 		Sysroot:     sysroot,
-		TarballPath: tar,
+		TarballPath: tarball,
 		TarExcludes: []string{"--exclude=./var/log", "--exclude=./home/*"},
 		ACLs:        true,
 		RemoveAfter: true,
@@ -271,55 +301,46 @@ func TestExtractIssuesTarWithExcludesAndACLs(t *testing.T) {
 		t.Fatalf("Extract: %v", err)
 	}
 
-	calls := f.Calls()
-	if len(calls) != 1 || calls[0].Path != "tar" {
-		t.Fatalf("expected one tar call; got %+v", calls)
+	if len(r.calls) != 1 || r.calls[0].Path != "tar" {
+		t.Fatalf("expected one tar call; got %+v", r.calls)
 	}
-	args := strings.Join(calls[0].Args, " ")
-	for _, want := range []string{"--acls", "--numeric-owner", "--exclude=./var/log", "--exclude=./home/*", "-xf", tar, "-C", sysroot} {
+	args := strings.Join(r.calls[0].Args, " ")
+	for _, want := range []string{"-I lbzip2 --acls --numeric-owner", "--exclude=./var/log", "--exclude=./home/*", "-xf", tarball, "-C", sysroot} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("tar args missing %q: %s", want, args)
 		}
 	}
-	// Tarball should be removed after a successful extract.
-	if _, err := os.Stat(tar); err == nil {
+	if _, ok := read(sysroot, "etc/os-release"); !ok {
+		t.Fatal("etc/os-release was not extracted")
+	}
+	for _, rel := range []string{"var/log", "home/u"} {
+		if _, err := os.Lstat(filepath.Join(sysroot, rel)); err == nil {
+			t.Errorf("%s is excluded but was extracted", rel)
+		}
+	}
+	if _, err := os.Stat(tarball); err == nil {
 		t.Fatal("tarball should be removed after extract")
 	}
 }
 
 func TestExtractNoACLs(t *testing.T) {
 	sysroot := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(sysroot, "etc"), 0o750); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(sysroot, "etc/os-release"), []byte("NAME=test\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	tar := filepath.Join(t.TempDir(), "image.tar.bz2")
-	if err := os.WriteFile(tar, []byte("dummy"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	f := executor.NewFakeRunner(executor.FakeResponse{})
-	f.AddMatch(executor.FakeMatch{
-		Path: "tar", ArgsPrefix: []string{"-I", "lbzip2", "--no-acls"},
-		Response: executor.FakeResponse{},
-	})
+	r := newRecordingRunner(t)
 	if err := Extract(context.Background(), ExtractOptions{
-		Runner: f, Sysroot: sysroot, TarballPath: tar, ACLs: false,
+		Runner: r, Sysroot: sysroot, TarballPath: realTarball(t, extractTestImage), ACLs: false,
 	}); err != nil {
 		t.Fatalf("Extract: %v", err)
+	}
+	if args := strings.Join(r.calls[0].Args, " "); !strings.HasPrefix(args, "-I lbzip2 --no-acls") {
+		t.Fatalf("tar args: %s", args)
 	}
 }
 
 func TestExtractFailsWithoutOSRelease(t *testing.T) {
-	sysroot := t.TempDir() // no /etc/os-release
-	tar := filepath.Join(t.TempDir(), "image.tar.bz2")
-	if err := os.WriteFile(tar, []byte("dummy"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	f := executor.NewFakeRunner(executor.FakeResponse{})
+	sysroot := t.TempDir()
+	tarball := realTarball(t, []ent{{"./", "", "", tar.TypeDir, 0o755}, {"./bin", "x\n", "", tar.TypeReg, 0o755}})
 	err := Extract(context.Background(), ExtractOptions{
-		Runner: f, Sysroot: sysroot, TarballPath: tar, ACLs: true,
+		Runner: newRecordingRunner(t), Sysroot: sysroot, TarballPath: tarball, ACLs: true,
 	})
 	if err == nil || !strings.Contains(err.Error(), "os-release") {
 		t.Fatalf("expected os-release error; got %v", err)

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -118,38 +119,20 @@ func PatternsBase(patterns []Pattern) []string {
 	return out
 }
 
-// NormalizeFilterPath turns an operator-written filter path into the
-// sysroot-relative form every matcher here expects ("var/log", "etc/ssh/*"):
-// surrounding space, leading "/" and "./" are stripped and runs of "/" are
-// collapsed. Operators naturally write absolute paths ("/var/log"), and Luna
-// shows them that way; before this, such a path matched nothing (the tar
-// exclude became ".//var/log" and PrepareSysroot never saw it as preserved),
-// so the "preserved" data was deleted without a warning. It returns "" for a
-// path that is empty or "/" (that would mean "everything") or that contains a
-// ".." component (it could point outside the sysroot); callers drop those.
+// NormalizeFilterPath turns an operator-written filter path ("/var/log") into
+// the sysroot-relative form every matcher expects ("var/log"); an absolute path
+// would otherwise match nothing and its data be deleted. It returns "" for an
+// empty or "/" path (everything) or one with a ".." component; callers drop those.
 func NormalizeFilterPath(raw string) string {
 	p := strings.TrimSpace(raw)
 	for strings.Contains(p, "//") {
 		p = strings.ReplaceAll(p, "//", "/")
 	}
-	for {
-		switch {
-		case strings.HasPrefix(p, "/"):
-			p = p[1:]
-		case strings.HasPrefix(p, "./"):
-			p = p[2:]
-		default:
-			goto done
-		}
+	for strings.HasPrefix(p, "/") || strings.HasPrefix(p, "./") {
+		p = strings.TrimPrefix(strings.TrimPrefix(p, "/"), "./")
 	}
-done:
-	if p == "" || p == "." {
+	if p == "" || p == "." || slices.Contains(strings.Split(p, "/"), "..") {
 		return ""
-	}
-	for _, c := range strings.Split(p, "/") {
-		if c == ".." {
-			return ""
-		}
 	}
 	return p
 }
@@ -167,13 +150,10 @@ func NormalizeFilterPaths(raw []string) (paths, dropped []string) {
 	return paths, dropped
 }
 
-// ResolveInSysroot follows symlinks in every component of rel (a
-// sysroot-relative path, possibly ending in a glob) inside sysroot: absolute
-// link targets are taken relative to the sysroot, relative ones relative to
-// the link's directory. Resolution stops at the first component with a
-// wildcard; the rest is appended unchanged. FirstSymlinkResolver only followed
-// the first component, so a preserve of "var/mail" (-> spool/mail) protected
-// only the link and the mail itself was deleted.
+// ResolveInSysroot follows symlinks in every component of rel inside sysroot
+// (absolute targets relative to the sysroot), up to the first wildcard
+// component. Following only the first component protected a "var/mail" link
+// but not the mail it points to.
 func ResolveInSysroot(sysroot, rel string) string {
 	parts := strings.Split(strings.Trim(rel, "/"), "/")
 	var done []string
@@ -208,8 +188,7 @@ func ResolveInSysroot(sysroot, rel string) string {
 			tparts = strings.Split(target, "/")
 		}
 		// resolve the target's components next, then the rest of rel
-		parts = append(append(append([]string{}, parts[:i+1]...), tparts...), parts[i+1:]...)
-		parts = append(parts[:i], parts[i+1:]...)
+		parts = append(append(append([]string{}, parts[:i]...), tparts...), parts[i+1:]...)
 		i--
 	}
 	return strings.Join(done, "/")
@@ -233,14 +212,9 @@ func ExpandFilterPaths(sysroot string, paths []string) []string {
 }
 
 // ValidateFilterPaths refuses filter paths whose meaning differs between this
-// package's matcher and GNU tar, or that would protect (and exclude from the
-// extract) the whole image:
-//   - '[', ']' and '\' are literal here but special to tar's --exclude, so a
-//     path could be kept on disk and still be overwritten by tar;
-//   - a wildcard in the first component ("*", "*/x", "***") matches every
-//     top-level directory: the extract would install nothing and still pass;
-//   - preserve_empty takes literal directories only (a glob there created a
-//     directory literally named "*" and wiped nothing).
+// package's matcher and GNU tar ('[', ']', '\'), that would exclude the whole
+// image (a wildcard in the first component), or a glob in preserve_empty
+// (which takes literal directories).
 func ValidateFilterPaths(kind string, paths []string) error {
 	for _, p := range paths {
 		if strings.ContainsAny(p, "[]\\") {

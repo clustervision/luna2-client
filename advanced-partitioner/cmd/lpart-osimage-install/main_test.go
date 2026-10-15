@@ -406,3 +406,30 @@ func TestResolveStreamPolicy(t *testing.T) {
 		})
 	}
 }
+
+// The sync sweep converges only the os set's volumes: the set with role "os",
+// or the one holding "/" when no role is written.
+func TestStorageResultOSMountpoints(t *testing.T) {
+	sr := filepath.Join(t.TempDir(), "storage-result.json")
+	body := `{"version":2,"sets":[
+        {"name":"os","role":"os","filesystems":[{"mount":"/"},{"mount":"/boot"},{"mount":"/boot/efi"},{"mount":"swap"}]},
+        {"name":"scratch","filesystems":[{"mount":"/scratch"}]},
+        {"name":"data","role":"data","persistent":true,"filesystems":[{"mount":"/data"}]}
+    ]}`
+	if err := os.WriteFile(sr, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := readStorageResultSummary(sr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(relMounts(s.OSMountpoints), ","); got != "boot,boot/efi" {
+		t.Fatalf("os mountpoints = %q, want boot,boot/efi", got)
+	}
+	if err := os.WriteFile(sr, []byte(`{"version":2,"filesystems":[{"mount":"/"},{"mount":"/var"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = readStorageResultSummary(sr); err != nil || strings.Join(relMounts(s.OSMountpoints), ",") != "var" {
+		t.Fatalf("single set holding /: os mountpoints %v, err %v", s.OSMountpoints, err)
+	}
+}

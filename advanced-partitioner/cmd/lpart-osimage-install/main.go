@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
@@ -465,12 +466,6 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	if refresh && !f.SkipExtract {
 		logger.SetStage("sync")
-		skip := []string{}
-		for _, mp := range append(append([]string{}, srSummary.PersistentMountpoints...), srSummary.OtherMountpoints...) {
-			if c := strings.Trim(mp, "/"); c != "" {
-				skip = append(skip, c)
-			}
-		}
 		res, serr := osimage.SyncExtract(context.Background(), osimage.SyncOptions{
 			Logger:      logger,
 			Sysroot:     f.Sysroot,
@@ -478,8 +473,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			ACLs:        acls,
 			TarExcludes: excludes,
 			Protect: osimage.Protection{
-				Preserve: preserve, PreserveEmpty: preserveEmpty, NoNewFiles: noNew, KeepExtra: keepExtra, SkipMounts: skip,
+				Preserve: preserve, PreserveEmpty: preserveEmpty, NoNewFiles: noNew, KeepExtra: keepExtra,
+				SkipMounts: relMounts(srSummary.PersistentMountpoints, srSummary.OtherMountpoints),
 			},
+			OSMounts:    relMounts(srSummary.OSMountpoints),
 			ImageWins:   imageWins,
 			Verify:      f.Verify,
 			DryRun:      f.DryRun,
@@ -487,8 +484,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			RemoveAfter: true,
 		})
 		if serr != nil {
-			var ve *osimage.SyncVerifyError
-			if errors.As(serr, &ve) || strings.Contains(serr.Error(), "operator review required") {
+			if strings.Contains(serr.Error(), "operator review required") {
 				return cli.ExitSafetyRefusal(stderr, toolName, "sync", "%v", serr)
 			}
 			return extractFailure(stderr, serr, oom0, fstype, cachePath)
@@ -724,6 +720,17 @@ func resolveStreamPolicy(flagVal, cmdlinePath string) (policy, note string) {
 	}
 }
 
+// relMounts turns absolute mountpoints into sysroot-relative ones, dropping "/".
+func relMounts(lists ...[]string) []string {
+	out := []string{}
+	for _, mp := range slices.Concat(lists...) {
+		if c := strings.Trim(mp, "/"); c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func nonEmpty(s, fallback string) string {
 	if s == "" {
 		return fallback
@@ -745,6 +752,9 @@ type storageResultSummary struct {
 	// OtherMountpoints are the mountpoints of non-os, non-persistent sets
 	// (data sets): the sync sweep never enters them.
 	OtherMountpoints []string
+	// OSMountpoints are the os set's own volumes, the only mounts the sync
+	// sweep converges.
+	OSMountpoints []string
 }
 
 func readStorageResultSummary(path string) (storageResultSummary, error) {
@@ -773,10 +783,8 @@ func readStorageResultSummary(path string) (storageResultSummary, error) {
 		return out, fmt.Errorf("parse %s: %w", path, err)
 	}
 	collect := func(s setProbe) {
-		// Only the set that holds "/" decides whether the OS extract is a first
-		// install: a newly created data set (first_install=true) next to a
-		// healthy os set used to turn the OS refresh into a full extract with
-		// the preserve filter dropped.
+		// Only the set that holds "/" decides first_install: a new data set next
+		// to a healthy os set must not turn the refresh into a full extract.
 		holdsRoot := false
 		for _, f := range s.Filesystems {
 			if f.Mount == "/" {
@@ -785,6 +793,13 @@ func readStorageResultSummary(path string) (storageResultSummary, error) {
 		}
 		if s.FirstInstall && (holdsRoot || len(probe.Sets) == 0) {
 			out.FirstInstall = true
+		}
+		if holdsRoot || s.Role == "os" {
+			for _, f := range s.Filesystems {
+				if f.Mount != "" && f.Mount != "swap" {
+					out.OSMountpoints = append(out.OSMountpoints, f.Mount)
+				}
+			}
 		}
 		if s.Persistent {
 			for _, f := range s.Filesystems {

@@ -22,7 +22,7 @@ import (
 //
 //	"keep_extra": ["var/log", "home"]      image files refreshed, files the image lacks kept
 //	"image_wins": ["etc/ssh/sshd_config"]  taken from the image even inside a preserved tree
-//	"verify":     "metadata" | "content" | "none"   (default metadata)
+//	"verify":     "none" | "metadata" | "content"   (default none; mismatches only warn)
 type FilterConfig struct {
 	Preserve      []string `json:"preserve,omitempty"`
 	PreserveEmpty []string `json:"preserve_empty,omitempty"`
@@ -40,8 +40,7 @@ func (e *ErrFilterConfig) Error() string { return e.Err.Error() }
 func (e *ErrFilterConfig) Unwrap() error { return e.Err }
 
 // LoadFilterConfig reads and decodes a filter config file. Unknown keys are an
-// error: a typo such as "preseve" used to be ignored silently, so the paths it
-// meant to protect were deleted without a warning.
+// error: a typo such as "preseve" would silently drop the protection it meant.
 func LoadFilterConfig(path string) (*FilterConfig, error) {
 	body, err := os.ReadFile(path) //nolint:gosec // operator-supplied config
 	if err != nil {
@@ -50,8 +49,7 @@ func LoadFilterConfig(path string) (*FilterConfig, error) {
 	if len(bytes.TrimSpace(body)) == 0 {
 		return &FilterConfig{}, nil
 	}
-	// one JSON object, no repeated keys: a second "preserve" used to replace
-	// the first list silently, and data after the object was ignored
+	// one JSON object, no repeated keys: a second "preserve" would replace the first
 	if err := jsonstrict.Check(body); err != nil {
 		return nil, &ErrFilterConfig{fmt.Errorf("osimage_filter: invalid (%w)", err)}
 	}

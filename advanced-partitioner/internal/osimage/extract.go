@@ -408,14 +408,9 @@ type ExtractOptions struct {
 	RemoveAfter bool
 }
 
-// CapabilityXattrArgs restores file capabilities (security.capability) from
-// the image. The daemon packs with --xattrs --selinux --acls, but the extract
-// restored none of them, so every capability was lost and only the install
-// template's fix_capabilities put back a fixed list of nine binaries --
-// newuidmap/newgidmap (rootless podman, apptainer user namespaces), mtr-packet
-// and others stayed broken. Only security.capability: SELinux labels are set
-// by the template's restorecon afterwards, and user.* xattrs are not supported
-// on tmpfs (the memboot RAM root) by the el8 kernel.
+// CapabilityXattrArgs restores file capabilities from the image. Only
+// security.capability: SELinux labels come from the template's restorecon, and
+// the el8 kernel's tmpfs (the memboot root) does not take user.* xattrs.
 var CapabilityXattrArgs = []string{"--xattrs", "--xattrs-include=security.capability"}
 
 // Extract runs tar -I lbzip2 --acls/--no-acls --numeric-owner with the

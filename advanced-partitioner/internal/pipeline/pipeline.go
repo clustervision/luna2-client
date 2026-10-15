@@ -284,10 +284,8 @@ func (p *Pipeline) runPre() error {
 const SanitizeDoneMarker = "sanitize.done"
 
 // partOutputs are the files the part phase produces. The install tmpfs
-// survives the boot wrapper's 30 s retries, so each is removed before the
-// phase that writes it: a sanitize (which writes no storage results) or a
-// failed step must never leave the previous attempt's copy to be read as
-// this attempt's (the dashboard, the post phase's bootloader finalise).
+// survives the boot wrapper's retries, so they are removed first: a previous
+// attempt's copy must never be read as this attempt's.
 var partOutputs = []string{
 	SanitizeDoneMarker,
 	DegradedMarker,
