@@ -46,6 +46,7 @@ import (
 const toolName = "lpart-bootloader-finalise"
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, toolName)
 	cli.EnsureInstallerPath()
 	os.Exit(run(os.Args, os.Stdout, os.Stderr))
 }

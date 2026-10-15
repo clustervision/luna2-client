@@ -100,3 +100,34 @@ echo 'mount: /sysroot: wrong fs type' >&2; exit 1`)
 		t.Fatalf("the banner shows the start of stderr instead of its end:\n%s", got)
 	}
 }
+
+// A panic in the phase goroutine is a fatal failure with its own reason, not
+// the runtime's exit 2 (a safety refusal) taking the whole process down.
+func TestRunTurnsAPanicIntoAFatalFailure(t *testing.T) {
+	dir := t.TempDir()
+	rt := filepath.Join(dir, "runtime")
+	if err := os.MkdirAll(rt, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rt, "install-context.json"), []byte(`{"install_mode":"full"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(rt, "storage-result.json"), []byte(`{"sets":[]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A nil context makes the first step panic inside the phase goroutine.
+	var nilCtx context.Context
+	p := New(nilCtx, Options{Phase: PhasePost, RuntimeDir: rt, LogDir: dir, BinDir: dir})
+	go func() {
+		for range p.Events() {
+		}
+	}()
+	p.run()
+	res := p.Result()
+	if !res.Done || !res.Failed || res.Class != FailFatal || !strings.HasPrefix(res.Message, "internal error: ") {
+		t.Fatalf("result = %+v, want a fatal internal error", res)
+	}
+	if got := failureBanner(t, dir); !strings.Contains(got, "reason: internal error: ") {
+		t.Fatalf("failure file does not name the internal error:\n%s", got)
+	}
+}

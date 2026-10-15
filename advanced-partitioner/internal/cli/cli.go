@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime/debug"
 
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
 )
@@ -188,4 +189,17 @@ func ExitFatalConfig(stderr io.Writer, tool, reason, format string, args ...any)
 	msg := fmt.Sprintf(format, args...)
 	_, _ = fmt.Fprintf(stderr, "%s: fatal_config=%s %s\n", tool, reason, msg)
 	return ExitFatalConfigCode
+}
+
+// osExit is replaced in tests.
+var osExit = os.Exit
+
+// ExitOnPanic, deferred first in a tool's main, turns a panic into exit 3.
+// An unrecovered panic exits 2, the safety-refusal code, so a crash parked the
+// node as a refusal. The stack goes first: the verdict line must be the last.
+func ExitOnPanic(stderr io.Writer, tool string) {
+	if r := recover(); r != nil {
+		_, _ = stderr.Write(debug.Stack())
+		osExit(ExitFatalConfig(stderr, tool, "internal-error", "internal error: %v", r))
+	}
 }

@@ -1,9 +1,14 @@
 package cli
 
 import (
+	"bytes"
 	"flag"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -125,4 +130,56 @@ func TestNewLoggerHonoursDebugFlag(t *testing.T) {
 		t.Fatal("nil logger")
 	}
 	l.Debug("ok", slog.String("k", "v"))
+}
+
+// A panic exits 3 with the stack and an internal-error verdict as the last
+// line, never the runtime's exit 2 (the safety-refusal code).
+func TestExitOnPanicExitsFatal(t *testing.T) {
+	code := -1
+	osExit = func(c int) { code = c }
+	defer func() { osExit = os.Exit }()
+	var stderr bytes.Buffer
+	func() {
+		defer ExitOnPanic(&stderr, "lpart-x")
+		panic("boom")
+	}()
+	if code != ExitFatalConfigCode {
+		t.Fatalf("exit = %d, want %d", code, ExitFatalConfigCode)
+	}
+	lines := strings.Split(strings.TrimSpace(stderr.String()), "\n")
+	if want := "lpart-x: fatal_config=internal-error internal error: boom"; lines[len(lines)-1] != want {
+		t.Errorf("last line = %q, want %q", lines[len(lines)-1], want)
+	}
+	if !strings.Contains(stderr.String(), "goroutine ") {
+		t.Errorf("no stack in stderr:\n%s", stderr.String())
+	}
+}
+
+// Every lpart tool defers ExitOnPanic as the first statement of main.
+func TestEveryToolMainExitsFatalOnPanic(t *testing.T) {
+	mains, err := filepath.Glob("../../cmd/*/main.go")
+	if err != nil || len(mains) == 0 {
+		t.Fatalf("no tool mains found: %v", err)
+	}
+	for _, path := range mains {
+		f, err := parser.ParseFile(token.NewFileSet(), path, nil, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ok := false
+		for _, d := range f.Decls {
+			fn, isFn := d.(*ast.FuncDecl)
+			if !isFn || fn.Name.Name != "main" || fn.Recv != nil || len(fn.Body.List) == 0 {
+				continue
+			}
+			if ds, isDefer := fn.Body.List[0].(*ast.DeferStmt); isDefer {
+				if sel, isSel := ds.Call.Fun.(*ast.SelectorExpr); isSel && sel.Sel.Name == "ExitOnPanic" {
+					ok = true
+				}
+			}
+		}
+		if !ok {
+			t.Errorf("%s: main does not start with defer cli.ExitOnPanic", path)
+		}
+	}
 }

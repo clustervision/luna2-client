@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -222,6 +223,7 @@ func (p *Pipeline) Wait() { <-p.finished }
 func (p *Pipeline) run() {
 	defer close(p.finished)
 	defer close(p.events)
+	defer p.recoverPanic()
 	// Clear the previous attempt's failure file: the boot wrapper prints
 	// whatever is there, so a stale one would be read as this attempt's reason.
 	if err := os.Remove(p.failurePath()); err != nil && !os.IsNotExist(err) {
@@ -248,6 +250,21 @@ func (p *Pipeline) run() {
 	}
 	p.setResult(Result{Done: true})
 	p.emit(engine.InstallerEvent{Time: time.Now(), Type: engine.EvInstallerDone, Stream: engine.StreamSystem, Message: string(p.opts.Phase) + " phase complete"})
+}
+
+// recoverPanic turns a panic in the phase goroutine into a fatal failure: the
+// recover in main cannot see it, and the runtime's exit 2 is a safety refusal.
+func (p *Pipeline) recoverPanic() {
+	r := recover()
+	if r == nil {
+		return
+	}
+	msg := fmt.Sprintf("internal error: %v", r)
+	p.info(msg + "\n" + string(debug.Stack()))
+	p.stepStderr = nil
+	p.writeFailure("internal", msg)
+	p.setResult(Result{Done: true, Failed: true, Class: FailFatal, Message: msg})
+	p.emit(engine.InstallerEvent{Time: time.Now(), Type: engine.EvInstallerFailed, Stream: engine.StreamSystem, Message: msg, Data: FailFatal})
 }
 
 // --- phases ---------------------------------------------------------------

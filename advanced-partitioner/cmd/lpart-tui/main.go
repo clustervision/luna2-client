@@ -19,12 +19,14 @@ import (
 	"fmt"
 	"os"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/engine"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/eventbus"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installerui"
 )
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, "lpart-tui")
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "lpart-tui:", err)
 		os.Exit(1)
