@@ -393,6 +393,9 @@ func loadStorageResult(path string) (result.StorageResult, error) {
 		for i := range multi.Sets {
 			s := &multi.Sets[i]
 			if s.Role == "os" {
+				if osSet != nil {
+					return result.StorageResult{}, fatalConfig("storage-result-invalid", "more than one os set in storage-result sets[] (%q and %q)", osSet.Name, s.Name)
+				}
 				osSet = s
 				continue
 			}

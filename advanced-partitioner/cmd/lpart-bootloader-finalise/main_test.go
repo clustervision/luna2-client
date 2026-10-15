@@ -652,6 +652,20 @@ func TestDeterministicFailuresExit3(t *testing.T) {
 	}
 }
 
+// Two os sets cannot both be booted: the result is invalid (exit 3), not
+// silently reduced to the last one.
+func TestTwoOSSetsInStorageResultExit3(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "storage-result.json")
+	body := `{"version":2,"sets":[{"name":"os","role":"os"},{"name":"os2","role":"os"}]}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stderr, rc := runEnv(t, "--result", p)
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=storage-result-invalid more than one os set") {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+}
+
 func TestInvalidStorageResultExit3(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "storage-result.json")
 	if err := os.WriteFile(p, []byte("{not json"), 0o600); err != nil {
