@@ -70,6 +70,7 @@ function luna_init () {
     fi
 }
 
+LUNA_PROGRESS_STOP=/tmp/luna_progress.stop
 function luna_start () {
     local luna_ip
     local luna_gw
@@ -140,10 +141,13 @@ function luna_start () {
     # install log to the loghost every 20s, so an install that HANGS (never
     # reaches luna_finish/retry to flush its log) is still diagnosable on the
     # controller -- the last snapshot before the hang shows where it stopped.
+    # A park sets $LUNA_PROGRESS_STOP: one more send carries the park banner,
+    # then the loop ends instead of resending it every 20s for as long as it parks.
     ( _plh=$(getargs luna.loghost=)
       [ -n "$_plh" ] && while sleep 20; do
           readable_log < /tmp/luna_install.log 2>/dev/null | tail -n 120 2>/dev/null \
             | logger -d -n "$_plh" -P 514 -t luna-progress 2>/dev/null
+          [ -e "$LUNA_PROGRESS_STOP" ] && break
       done ) &
     # Bounded + instrumented settle: on ubuntu26/resolute an unbounded settle
     # here hung 30-52 MINUTES intermittently (initqueue spinner forever, no
@@ -545,6 +549,7 @@ LUNA_SANITIZE_MARKER=/tmp/install_files/runtime/sanitize.done
 function luna_sanitize_stop () {
     local rc="${1:-0}" _line
     local ctty="${luna_ctty:-/dev/tty1}"
+    : > "$LUNA_PROGRESS_STOP"
     echo "Luna2: ============================================================"
     echo "Luna2: SANITIZE FINISHED -- lpart-storage-prepare reported:"
     if [ -s "$LUNA_SANITIZE_MARKER" ]; then
@@ -590,6 +595,7 @@ function lpart_park_state () {
 function fatal_park () {
     local rc="${1:-?}" kind
     local ctty="${luna_ctty:-/dev/tty1}"
+    : > "$LUNA_PROGRESS_STOP"
     echo ""
     echo "Luna2: ============================================================"
     echo "Luna2: INSTALL FAILED (exit ${rc}) -- NOT retrying."
