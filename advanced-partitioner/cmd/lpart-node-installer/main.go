@@ -145,34 +145,46 @@ func run() error {
 	// the running step's children (mkfs, tar, sgdisk, blkdiscard) writing to
 	// the disks into the next install attempt. Stop the phase and wait for it.
 	stopPipeline(cancel, pl, os.Stderr)
-	if err != nil {
-		return err
-	}
 
-	// The AUTHORITATIVE outcome is pipeline.Result(), recorded out-of-band
-	// of the lossy display bus (FTA Cluster B): a dropped terminal event or
-	// an operator quitting the TUI mid-install can never turn a failed or
-	// unfinished install into exit 0, and a safety refusal maps to exit 2 and
-	// a fatal class to exit 3 so luna2-start.sh parks instead of retrying forever.
-	res := pl.Result()
+	code, line := phaseExit(pl.Result(), renderExit, err)
+	if line != "" {
+		fmt.Fprintln(os.Stderr, line)
+	}
+	if code != 0 {
+		os.Exit(code)
+	}
+	return nil
+}
+
+// phaseExit is the exit code and console line once the renderer has returned
+// and the phase has stopped.
+//
+// The AUTHORITATIVE outcome is pipeline.Result(), recorded out-of-band
+// of the lossy display bus (FTA Cluster B): a dropped terminal event or
+// an operator quitting the TUI mid-install can never turn a failed or
+// unfinished install into exit 0, and a safety refusal maps to exit 2 and
+// a fatal class to exit 3 so luna2-start.sh parks instead of retrying forever.
+// A render error is read after the verdict of a failed phase, so it cannot
+// turn a park into a retry.
+func phaseExit(res pipeline.Result, renderExit int, renderErr error) (int, string) {
 	switch {
-	case res.Done && !res.Failed:
+	case res.Done && res.Failed:
+		code, line := failureExit(res.Class)
+		if renderErr != nil {
+			line = fmt.Sprintf("lpart-node-installer: %v\n%s", renderErr, line)
+		}
+		return code, line
+	case renderErr != nil:
+		return 1, fmt.Sprintf("lpart-node-installer: %v", renderErr)
+	case res.Done:
 		// Success per the pipeline; keep any non-zero renderer verdict
 		// (e.g. UI crash) visible rather than masking it.
-		if renderExit != 0 {
-			os.Exit(renderExit)
-		}
-	case res.Done:
-		code, line := failureExit(res.Class)
-		fmt.Fprintln(os.Stderr, line)
-		os.Exit(code)
+		return renderExit, ""
 	default:
 		// No terminal state: the pipeline was interrupted (quit/SIGINT/
 		// render exit while steps were still running). Never success.
-		fmt.Fprintln(os.Stderr, "lpart-node-installer: install interrupted before completion")
-		os.Exit(1)
+		return 1, "lpart-node-installer: install interrupted before completion"
 	}
-	return nil
 }
 
 // phase is the part of *pipeline.Pipeline that stopPipeline needs.
