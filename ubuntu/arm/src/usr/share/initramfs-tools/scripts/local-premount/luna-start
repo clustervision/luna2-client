@@ -114,8 +114,9 @@ luna_start() {
     echo "Luna2: Starting ssh"
     echo "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin" >> /etc/passwd
     echo sshd:x:74: >> /etc/group
-    mkdir -p /var/empty/sshd
-    /usr/sbin/sshd > /dev/null 2>&1
+    # Debian's sshd refuses to start without /run/sshd (its privilege-separation dir).
+    mkdir -p /var/empty/sshd /run/sshd
+    /usr/sbin/sshd > /dev/null 2>&1 || echo "Luna2: sshd did not start: no ssh into this ramdisk"
     echo "Luna2: Start shell on tty2"
     luna_ctty2=/dev/tty2
     setsid -c /bin/sh -i -l 0<>$luna_ctty2 1<>$luna_ctty2 2<>$luna_ctty2 &
@@ -380,7 +381,7 @@ fetch_token() {
 print_failure_reason() {
     [ -s "$LUNA_FAILURE_FILE" ] || return 0
     echo "Luna2: Reason:"
-    head -n 15 "$LUNA_FAILURE_FILE" | sed 's/^/Luna2:   /'
+    awk 'NR <= 15 { print "Luna2:   " $0 }' "$LUNA_FAILURE_FILE"
 }
 
 if [ "x$ROOT" = "xluna" ]; then
