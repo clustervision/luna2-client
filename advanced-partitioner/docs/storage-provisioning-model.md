@@ -222,7 +222,7 @@ The guarantees that fall out of this:
 - `auto` may recreate the OS set, which carries no user data. DATA sets halt rather than be wiped.
 - No mode wipes a disk on a mismatch except the OS set under `auto` or `full`. This closes the case where a renumbered disk triggers an accidental wipe.
 
-There is one more behaviour worth stating plainly. Because `memboot` consults the disk layout for DATA sets, "run the OS from RAM but keep my local data" is expressed directly: a `memboot` node with one persistent DATA set. The data is partitioned and formatted by no one, only mounted, and the mount is written into the RAM `/etc/fstab` during the post phase. The set's volumes are the single source of truth for the mounts. The image lay down also excludes persistent mountpoints, so nothing can write into them. Wiping such data on every boot is not a default and is not expressible without a deliberate, separate choice.
+There is one more behaviour worth stating plainly. Because `memboot` consults the disk layout for DATA sets, "run the OS from RAM but keep my local data" is expressed directly: a `memboot` node with one persistent DATA set. The data is partitioned and formatted by no one, only mounted under `/sysroot`, and it stays mounted across the switch to the RAM root. `memboot` runs no bootloader finalise, so the mount is not written into `/etc/fstab`; `auto` with a data-only layout takes the same RAM-root path and does write it. The set's volumes are the single source of truth for the mounts. The image lay down also excludes persistent mountpoints, so nothing can write into them. Wiping such data on every boot is not a default and is not expressible without a deliberate, separate choice.
 
 ### 5.3 Disk selection with tags and size
 

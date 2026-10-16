@@ -203,7 +203,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	if bctx.BootMethod == "none" {
 		// Three ways to get here, and the operator has to be told which: a RAM
-		// root with no disk, a firmware with no UEFI boot path, or the OS set
+		// root with no disk (auto with no os set: install_mode=memboot never
+		// runs finalise), a firmware with no UEFI boot path, or the OS set
 		// asking for none. Only the last leaves a previous install behind to
 		// remove.
 		switch {
