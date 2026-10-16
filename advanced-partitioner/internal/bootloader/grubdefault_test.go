@@ -3,6 +3,7 @@ package bootloader
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -123,6 +124,27 @@ func TestGrubDefaultFileShellForms(t *testing.T) {
 	}
 	if !strings.Contains(got, "GRUB_CMDLINE_LINUX=\"rd.auto crashkernel=auto console=ttyS0,115200\"\n") {
 		t.Errorf("command line:\n%s", got)
+	}
+}
+
+// grub2-mkconfig sources the file with set -e: Luna options carrying shell
+// syntax must reach GRUB_CMDLINE_LINUX unchanged, not break or run in it.
+func TestGrubDefaultFileSourcesLunaOptionsVerbatim(t *testing.T) {
+	luna := lunaOptionsOf(t, labInstallerCmdline+` dyndbg="file foo.c +p" a=$HOME b=`+"`id`"+` c=x\y d='q' quiet`)
+	file := filepath.Join(t.TempDir(), "grub")
+	if err := os.WriteFile(file, []byte(grubDefaultFile("", "rd.auto", luna, "saved")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sh", "-ec", `. "$1"; printf %s "$GRUB_CMDLINE_LINUX"`, "sh", file).CombinedOutput() //nolint:gosec // test-built path
+	if err != nil {
+		t.Fatalf("sourcing the file failed: %v: %s", err, out)
+	}
+	if want := "rd.auto " + luna; string(out) != want {
+		t.Fatalf("GRUB_CMDLINE_LINUX = %q, want %q", out, want)
+	}
+	once := grubDefaultFile("", "rd.auto", luna, "saved")
+	if twice := grubDefaultFile(once, "rd.auto", luna, "saved"); twice != once {
+		t.Fatalf("second run changed the file:\n%s\n%s", once, twice)
 	}
 }
 

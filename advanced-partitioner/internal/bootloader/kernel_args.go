@@ -39,7 +39,11 @@ func KernelArgs(sr result.StorageResult) string {
 }
 
 // GrubCmdlineValue formats the GRUB_CMDLINE_LINUX= line that goes into
-// /etc/default/grub. Mirrors bootloader_grub_cmdline_value.
+// /etc/default/grub. Mirrors bootloader_grub_cmdline_value. The file is
+// sourced by sh, so a quoted Luna option must not end the value early.
 func GrubCmdlineValue(kernelArgs string) string {
-	return `GRUB_CMDLINE_LINUX="` + kernelArgs + `"`
+	return `GRUB_CMDLINE_LINUX="` + grubQuoteEscaper.Replace(kernelArgs) + `"`
 }
+
+// grubQuoteEscaper escapes what stays special inside sh double quotes.
+var grubQuoteEscaper = strings.NewReplacer(`\`, `\\`, `"`, `\"`, "$", `\$`, "`", "\\`")
