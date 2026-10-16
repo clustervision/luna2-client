@@ -100,10 +100,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.ClearScreen
 
 	case keyMatch(msg, m.keys.Shell):
-		// Hand off to /bin/bash. The install keeps running in the background
-		// (the installer is a separate process); the dashboard redraws on
-		// return. Type 'exit' to come back.
-		m.appendSystemLine("shell: install continues in the background; type 'exit' to return")
+		// Hand off to /bin/bash; the dashboard redraws on return. Nothing reads
+		// the step output meanwhile, so a chatty step blocks once the buffers fill.
+		m.appendSystemLine("shell: the install may pause while the shell is open; type 'exit' to return")
 		return m, tea.Sequence(
 			tea.ExecProcess(execBash(), func(err error) tea.Msg {
 				return shellResumeMsg{}
