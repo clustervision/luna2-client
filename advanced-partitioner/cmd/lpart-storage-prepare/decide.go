@@ -254,6 +254,8 @@ func (sp *setProcessor) planSet(ctx context.Context, mode installcontext.Mode, c
 			"set %q: the health probe could not decide (a filesystem checker did not run) and install_mode=%s neither mounts nor wipes an unverified set; halting -- operator review required",
 			set.Name, mode)
 	}
+	// A retry after a half-failed first create parks here too: nothing proves the
+	// leftovers are this boot's own and not data, so the fence holds (fail-safe).
 	if halt {
 		return p, safetyRefusalf("data-fence",
 			"set %q is %s and install_mode=%s will not wipe it (data fence); halting -- operator review required",
