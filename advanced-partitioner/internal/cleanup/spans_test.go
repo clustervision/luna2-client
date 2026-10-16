@@ -24,7 +24,10 @@ func spanCleaner(t *testing.T, pvs, mdstat, name, tran string) (*Cleaner, *execu
 	if err := os.WriteFile(stat, []byte(mdstat), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	md := &fakeMDDetail{bySource: map[string][]string{"/dev/md0": {"/dev/sda1", "/dev/sdc1"}}}
+	md := &fakeMDDetail{bySource: map[string][]string{
+		"/dev/md0": {"/dev/sda1", "/dev/sdc1"},
+		"/dev/md5": {"/dev/sdc1", "/dev/sdd1"},
+	}}
 	return New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep, MDStatPath: stat,
 		MDAdmDetail: md.detail, Stat: statNotExist}), f
 }
@@ -91,5 +94,26 @@ func TestCleanupAcceptsSpansInsideSelection(t *testing.T) {
 	c, _ := spanCleaner(t, "  /dev/sda2 os\n", "md0 : active raid1 sda1[0] sda3[1]\n", "node7:data", "sata")
 	if err := runSpan(c); err != nil {
 		t.Fatalf("nothing reaches outside the selected disks: %v", err)
+	}
+}
+
+// A VG whose md PV lies wholly on other disks reaches outside the selection
+// like a plain PV there: refused, nothing touched.
+func TestCleanupRefusesVGWithMDPVOutsideDisks(t *testing.T) {
+	c, f := spanCleaner(t, "  /dev/sda2 os\n  /dev/md5 os\n", "md5 : active raid1 sdc1[0] sdd1[1]\n", "", "sata")
+	err := runSpan(c)
+	if err == nil {
+		t.Fatal("a VG with an md PV outside the selected disks must refuse")
+	}
+	assertProtected(t, err)
+	assertNoDestruction(t, f)
+}
+
+// An md PV that reaches the selection is left to the array check: lpart's own
+// leftover array under its VG is still torn down.
+func TestCleanupAcceptsVGOnOwnArrayReachingSelection(t *testing.T) {
+	c, _ := spanCleaner(t, "  /dev/md0 os\n", "md0 : active raid1 sda1[0] sdc1[1]\n", "any:os", "sata")
+	if err := runSpan(c); err != nil {
+		t.Fatalf("lpart's own array reaching the selection must be torn down: %v", err)
 	}
 }

@@ -21,7 +21,7 @@ func (c *Cleaner) refuseOutsideSpans(ctx context.Context, selected map[string]st
 			}
 		}
 		for pv, vg := range all {
-			if touched[vg] && !IsMDDevice(filepath.Base(pv)) && !PartitionOnSelectedDisk(pv, selected) {
+			if touched[vg] && !c.reachesSelected(ctx, pv, selected) {
 				return protectedf(
 					"cleanup: VG %q also has physical volume %s outside the selected disks; lpart never builds a VG across disks, so it is not removed -- refusing",
 					vg, pv)
