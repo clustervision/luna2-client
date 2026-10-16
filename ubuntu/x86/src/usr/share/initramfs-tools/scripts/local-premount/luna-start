@@ -426,7 +426,7 @@ fetch_token() {
 }
 
 # lpart leaves the reason for a refused or failed install here. The dracut hook
-# (95luna/luna-installer.sh) prints the same file in the same words; keep them in step.
+# (95luna/luna-installer.sh) prints the same file, but wrapped and capped differently.
 print_failure_reason() {
     [ -s "$LUNA_FAILURE_FILE" ] || return 0
     echo "Luna2: Reason:"
