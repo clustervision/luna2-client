@@ -1,0 +1,3 @@
+# The node's initramfs carries its ssh host keys and luna.ini: keep it
+# readable by root only.
+UMASK=0077
