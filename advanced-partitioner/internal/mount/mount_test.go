@@ -298,3 +298,16 @@ func TestFindmntTargetsAreDecoded(t *testing.T) {
 		t.Errorf("a source mounted below the sysroot is not mounted elsewhere: %v", err)
 	}
 }
+
+// The SOURCE column is escaped too: the device mounted at a target must come
+// back as its real path, or the re-entrancy check sees a different source.
+func TestFindmntSourceIsDecoded(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-M", "/sysroot/data", "-o", "SOURCE"},
+		Response: executor.FakeResponse{Stdout: []byte("/dev/disk/by-label/my\\x20data\n")}})
+	m := New(Options{Runner: f, Sysroot: "/sysroot"})
+	got, mounted := m.mountedSource(context.Background(), "/sysroot/data")
+	if !mounted || got != "/dev/disk/by-label/my data" {
+		t.Errorf("mountedSource = %q, %v, want /dev/disk/by-label/my data, true", got, mounted)
+	}
+}

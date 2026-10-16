@@ -849,3 +849,17 @@ func TestFindmntTargetsAreDecoded(t *testing.T) {
 		t.Errorf("findmntTargetForSource = %q, want /sysroot/däta", mt)
 	}
 }
+
+// The SOURCE column is escaped the same way: a mount of a selected disk's
+// partition is only recognised as the set's own once its source is decoded.
+func TestFindmntSourcesAreDecoded(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET,SOURCE"},
+		Response: executor.FakeResponse{Stdout: []byte("/sysroot /dev/sda1\n/sysroot/data /dev/my\\x20disk1\n")}})
+	c := New(Options{Runner: f, Sysroot: "/sysroot", CommandAvailable: alwaysAvailable})
+	selected := map[string]struct{}{"/dev/my disk": {}}
+	got := c.findSysrootMounts(context.Background(), "", false, selected)
+	if len(got) != 1 || got[0] != "/sysroot/data" {
+		t.Errorf("findSysrootMounts = %q, want [/sysroot/data]", got)
+	}
+}
