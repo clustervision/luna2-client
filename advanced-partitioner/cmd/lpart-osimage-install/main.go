@@ -27,6 +27,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -317,7 +318,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// mountpoint becomes "./<mountpoint>" plus "./<mountpoint>/*" so
 	// both the directory entry and its contents survive the extract.
 	for _, mp := range srSummary.PersistentMountpoints {
-		clean := strings.TrimPrefix(mp, "/")
+		// tar matches members literally: "/home/" or "//home" would exclude nothing.
+		clean := strings.Trim(path.Clean("/"+mp), "/")
 		if clean == "" {
 			continue
 		}

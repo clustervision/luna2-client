@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -251,6 +252,64 @@ func TestPersistentMountpointsAddedToExcludes(t *testing.T) {
 	}
 	if !strings.Contains(logBody, "--exclude=./data") {
 		t.Fatalf("missing --exclude=./data in tar_excludes; got:\n%s", logBody)
+	}
+}
+
+// A persistent mountpoint written non-canonically still keeps the image out:
+// GNU tar, given the logged excludes, leaves the files below it alone.
+func TestPersistentMountpointExcludesAreCanonical(t *testing.T) {
+	tmp := t.TempDir()
+	ic := filepath.Join(tmp, "install-context.json")
+	if err := os.WriteFile(ic, []byte(`{"install_mode":"auto","osimage_sync":"Full"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sr := filepath.Join(tmp, "storage-result.json")
+	body := `{"version":2,"sets":[
+        {"name":"os","role":"os","persistent":false,"filesystems":[{"mount":"/","device":"tmpfs","fs":"tmpfs"}]},
+        {"name":"data","role":"data","persistent":true,"filesystems":[
+            {"mount":"/home/","device":"/dev/data/a","fs":"xfs"},
+            {"mount":"//srv","device":"/dev/data/b","fs":"xfs"},
+            {"mount":"/opt/./x","device":"/dev/data/c","fs":"xfs"}]}
+    ]}`
+	if err := os.WriteFile(sr, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := writeInstallScript(t, `LUNA_TOKEN="x"`+"\n"+`luna_url="http://controller/files/image.tar.bz2"`+"\n")
+	stderr, logBody, rc := runEnvWithLog(t, "--install-context", ic, "--storage-result", sr, "--skip-sysroot-check",
+		"--skip-download", "--allow-non-installer", "--luna-install-script", script, "--luna-token", "envtoken")
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+	_, rest, ok := strings.Cut(logBody, `tar_excludes="`)
+	if !ok {
+		t.Fatalf("no tar_excludes in the log:\n%s", logBody)
+	}
+	excludes, _, _ := strings.Cut(rest, `"`)
+
+	src, dst := filepath.Join(tmp, "image"), filepath.Join(tmp, "sysroot")
+	files := []string{"home/alice/.bashrc", "srv/www/index", "opt/x/state"}
+	for _, f := range files {
+		for root, body := range map[string]string{src: "image", dst: "USERDATA"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(root, f)), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, f), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	tarball := filepath.Join(tmp, "image.tar")
+	if out, err := exec.Command("tar", "-cf", tarball, "-C", src, ".").CombinedOutput(); err != nil { //nolint:gosec // test paths
+		t.Fatalf("build image: %v: %s", err, out)
+	}
+	args := append(strings.Fields(excludes), "-xf", tarball, "-C", dst)
+	if out, err := exec.Command("tar", args...).CombinedOutput(); err != nil { //nolint:gosec // test paths
+		t.Fatalf("extract: %v: %s", err, out)
+	}
+	for _, f := range files {
+		if got, _ := os.ReadFile(filepath.Join(dst, f)); string(got) != "USERDATA" { //nolint:gosec // test path
+			t.Errorf("%s overwritten by the image (excludes %q)", f, excludes)
+		}
 	}
 }
 
