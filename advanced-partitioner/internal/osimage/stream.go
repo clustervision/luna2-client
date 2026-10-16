@@ -28,8 +28,8 @@ import (
 // eopts.Sysroot in a single `curl | tar` pipe. dopts supplies the URL,
 // auth token, TLS policy, NIC pinning and watchdog; eopts supplies the
 // sysroot, excludes and ACL mode (TarballPath is ignored). The pipe runs
-// under `set -o pipefail`, so a curl failure fails the whole step even
-// when tar exits 0 on the truncated stream.
+// under `set -o pipefail` where the shell has it; busybox ash (Ubuntu) does
+// not and goes on with tar's status, which a truncated stream still fails.
 //
 // curl's --retry is deliberately OMITTED here (unlike downloadHTTP): a
 // mid-stream retry would restart the byte stream into a tar that already
