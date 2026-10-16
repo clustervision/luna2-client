@@ -129,7 +129,7 @@ func TestEraseAllRequiresDisks(t *testing.T) {
 
 func TestEraseAllRequiresRunner(t *testing.T) {
 	s := New(Options{})
-	if _, err := s.EraseAll(context.Background(), []string{"/dev/sda"}); err == nil {
+	if _, err := s.EraseAll(context.Background(), []Disk{{Path: "/dev/sda"}}); err == nil {
 		t.Fatal("expected error for nil runner")
 	}
 }

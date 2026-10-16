@@ -8,6 +8,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io"
 	"os"
 	"strings"
 	"testing"
@@ -116,12 +117,15 @@ func raidOSSet(raid string, devs ...string) v2.Set {
 
 // --- item 5 (refined): a dead raid member ---------------------------------
 
-// A raid1 os set with one dead member, mounted (sync, healthy verdict): the
-// node keeps booting on the surviving disk, degraded, with a loud warning.
+// A raid1 os set with one dead member and allow_degraded, mounted (sync,
+// healthy verdict): the node keeps booting on the surviving disk, degraded,
+// with a loud warning.
 func TestDegradedRaidMountContinuesWithPresentMember(t *testing.T) {
 	sp, f := testProcessor(t, "/dev/vdb")
 	withVerdict(sp, storagehealth.VerdictHealthy)
-	cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("1", "/dev/vda", "/dev/vdb")}}
+	osSet := raidOSSet("1", "/dev/vda", "/dev/vdb")
+	osSet.AllowDegraded = true
+	cfg := &v2.Config{Version: 2, Sets: []v2.Set{osSet}}
 	if err := sp.reserveManualSets(context.Background(), cfg); err != nil {
 		t.Fatalf("a raid1 set with one member present must be tolerated: %v", err)
 	}
@@ -139,8 +143,54 @@ func TestDegradedRaidMountContinuesWithPresentMember(t *testing.T) {
 	}
 }
 
-// The same dead member under a create (full, or auto on a broken os set) is a
-// fatal config error naming the device, before any disk is touched.
+// Without allow_degraded the same dead member parks the node: a safety
+// refusal (reason degraded) in every mode, before any disk is touched.
+func TestDegradedRaidWithoutAllowParks(t *testing.T) {
+	for _, mode := range []installcontext.Mode{installcontext.ModeSync, installcontext.ModeAuto, installcontext.ModeFull} {
+		t.Run(string(mode), func(t *testing.T) {
+			sp, f := testProcessor(t, "/dev/vdb")
+			withVerdict(sp, storagehealth.VerdictHealthy)
+			cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("1", "/dev/vda", "/dev/vdb")}}
+			_, _, err := sp.runDecision(context.Background(), mode, cfg, "uefi", false, true)
+			wantSafety(t, err, "degraded")
+			if d := destructive(f); d != "" {
+				t.Fatalf("a refused degraded set touched a disk: %s", d)
+			}
+		})
+	}
+}
+
+// An array the probe found missing a member (disk present, member gone) parks
+// the node like a missing disk does, before any disk is touched.
+func TestDegradedVerdictParks(t *testing.T) {
+	sp, f := testProcessor(t)
+	withVerdict(sp, storagehealth.VerdictDegraded)
+	cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("1", "/dev/vda", "/dev/vdb")}}
+	_, _, err := sp.runDecision(context.Background(), installcontext.ModeSync, cfg, "uefi", false, true)
+	wantSafety(t, err, "degraded")
+	if d := destructive(f); d != "" {
+		t.Fatalf("a degraded set touched a disk: %s", d)
+	}
+}
+
+// The degraded refusal advises allow_degraded only when the set lacks it.
+func TestDegradedVerdictAdvisesOnlyWhatIsMissing(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		sp, _ := testProcessor(t)
+		withVerdict(sp, storagehealth.VerdictDegraded)
+		set := raidOSSet("1", "/dev/vda", "/dev/vdb")
+		set.AllowDegraded = allow
+		_, _, err := sp.runDecision(context.Background(), installcontext.ModeSync, &v2.Config{Version: 2, Sets: []v2.Set{set}}, "uefi", false, true)
+		wantSafety(t, err, "degraded")
+		if advised := strings.Contains(err.Error(), "set allow_degraded"); advised == allow {
+			t.Errorf("allow_degraded=%v: advice to set it = %v: %v", allow, advised, err)
+		}
+	}
+}
+
+// With allow_degraded, the same dead member under a create (full, or auto on a
+// broken os set) is still a fatal config error naming the device, before any
+// disk is touched: a create needs every device.
 func TestDegradedRaidCreateIsFatalBeforeTouchingDisks(t *testing.T) {
 	for _, c := range []struct {
 		mode    installcontext.Mode
@@ -156,7 +206,9 @@ func TestDegradedRaidCreateIsFatalBeforeTouchingDisks(t *testing.T) {
 		t.Run(string(c.mode)+"/"+string(c.verdict), func(t *testing.T) {
 			sp, f := testProcessor(t, "/dev/vdb")
 			withVerdict(sp, c.verdict)
-			cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("1", "/dev/vda", "/dev/vdb")}}
+			osSet := raidOSSet("1", "/dev/vda", "/dev/vdb")
+			osSet.AllowDegraded = true
+			cfg := &v2.Config{Version: 2, Sets: []v2.Set{osSet}}
 			_, _, err := sp.runDecision(context.Background(), c.mode, cfg, "uefi", false, true)
 			wantFatal(t, err, "device-missing")
 			if !strings.Contains(err.Error(), "/dev/vdb") {
@@ -209,7 +261,7 @@ func TestMissingDeviceNonRedundantIsFatal(t *testing.T) {
 // member stays protected.
 func TestDegradedPersistentSetStaysProtected(t *testing.T) {
 	sp, _ := testProcessor(t, "/dev/vdc")
-	data := v2.Set{Name: "data", Role: "data", Selection: "manual", Raid: "1", Persistent: true,
+	data := v2.Set{Name: "data", Role: "data", Selection: "manual", Raid: "1", Persistent: true, AllowDegraded: true,
 		Devices: []string{"/dev/vdb", "/dev/vdc"},
 		Volumes: []v2.Volume{{Name: "d", Mountpoint: "/data", FS: "xfs", Size: "100%", Provider: "lvm"}}}
 	cfg := &v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("none", "/dev/vda"), data}}
@@ -304,11 +356,11 @@ func TestRaidCountCountsSparesOut(t *testing.T) {
 func TestDiscoverUnmetIsFatalUnlessPoolFailed(t *testing.T) {
 	set := &v2.Set{Name: "os", Role: "os", Selection: "discover", Raid: "1", Match: &v2.Match{Tags: []string{"ssd"}},
 		Volumes: []v2.Volume{{Name: "root", Mountpoint: "/", FS: "xfs", Provider: "lvm", Size: "100%"}}}
-	sp := &setProcessor{logger: silentLogger(t), pool: []discover.Device{{Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(100), Tags: []string{"ssd"}}}}
-	wantFatal(t, sp.resolveDiscover(set), "discover-unmet")
+	sp := &setProcessor{logger: silentLogger(t), runner: executor.NewFakeRunner(executor.FakeResponse{}), pool: []discover.Device{{Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(100), Tags: []string{"ssd"}}}}
+	wantFatal(t, sp.resolveDiscover(context.Background(), set), "discover-unmet")
 
 	sp.poolErr = errors.New("lsblk: exit status 1")
-	err := sp.resolveDiscover(set)
+	err := sp.resolveDiscover(context.Background(), set)
 	var fe *fatalConfigError
 	if err == nil || errors.As(err, &fe) {
 		t.Fatalf("with a failed pool listing the shortfall is retryable, got %v", err)
@@ -316,7 +368,7 @@ func TestDiscoverUnmetIsFatalUnlessPoolFailed(t *testing.T) {
 
 	bad := &v2.Set{Name: "os", Role: "os", Selection: "discover", Raid: "none", Match: &v2.Match{MinSize: "lots"},
 		Volumes: set.Volumes}
-	wantFatal(t, (&setProcessor{logger: silentLogger(t)}).resolveDiscover(bad), "match-invalid")
+	wantFatal(t, (&setProcessor{logger: silentLogger(t)}).resolveDiscover(context.Background(), bad), "match-invalid")
 }
 
 // Resolution failures keep the exit contract: absent / invalid device -> 3,
@@ -409,6 +461,25 @@ func TestForeignSameNameVGRefusedBeforeCleanup(t *testing.T) {
 	}
 }
 
+// A failed foreign-VG probe is retried (exit 1) before any set is cleaned,
+// not skipped: skipping left the refusal to the builder, after the wipe.
+func TestForeignVGProbeErrorRetriesBeforeCleanup(t *testing.T) {
+	sp, f := testProcessor(t)
+	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "vg_uuid,vg_name,pv_name"},
+		Response: executor.FakeResponse{Err: errors.New("exit status 5")}})
+	_, _, err := sp.runDecision(context.Background(), installcontext.ModeFull,
+		&v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("none", "/dev/vda")}}, "uefi", false, true)
+	if err == nil {
+		t.Fatal("a failed pvs probe must fail the run")
+	}
+	if code := exitForError(io.Discard, err); code != 1 {
+		t.Fatalf("exit = %d, want 1 (retryable): %v", code, err)
+	}
+	if d := destructive(f); d != "" {
+		t.Fatalf("probe failure must precede cleanup; ran %s", d)
+	}
+}
+
 // --- item 1: mount-existing records the boot partition numbers -------------
 
 // A refreshed os set (no Layout built) must still report its ESP and BIOS
@@ -477,5 +548,96 @@ func TestMembootIgnoresMissingOSSetDevice(t *testing.T) {
 	res, _, err := sp.runDecision(context.Background(), installcontext.ModeMemboot, cfg, "uefi", true, false)
 	if err != nil || len(res) != 1 || res[0].StorageType != "memory" {
 		t.Fatalf("memboot must ignore the os set's devices: %+v %v", res, err)
+	}
+}
+
+// selection=discover picks the disks that carry the set's own volume group or
+// md array before the identity order: an upgrade that changed the order must
+// not move an installed set to other disks.
+func TestResolveDiscoverPrefersTheSetsOwnDisks(t *testing.T) {
+	pool := func() []discover.Device {
+		return []discover.Device{
+			{Name: "sda", Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(100), WWN: "0xa"},
+			{Name: "sdb", Path: "/dev/sdb", KernelPath: "/dev/sdb", Size: gib(100), WWN: "0xb"},
+			{Name: "sdc", Path: "/dev/sdc", KernelPath: "/dev/sdc", Size: gib(100), WWN: "0xc"},
+		}
+	}
+	for _, c := range []struct {
+		name string
+		set  v2.Set
+		stub func(f *executor.FakeRunner)
+		want []string
+	}{
+		{"vg", v2.Set{Name: "os", Role: "os", Selection: "discover", Raid: "none", Count: 1, Volumes: raidOSSet("none").Volumes},
+			func(f *executor.FakeRunner) {
+				f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "vg_uuid,vg_name,pv_name"},
+					Response: executor.FakeResponse{Stdout: []byte("  OSUUID os /dev/sdc3\n")}})
+				f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/sdc"},
+					Response: executor.FakeResponse{Stdout: []byte("sdc\nsdc3\n")}})
+			}, []string{"/dev/sdc"}},
+		{"md", v2.Set{Name: "scratch", Role: "data", Selection: "discover", Raid: "1", Count: 2,
+			Volumes: []v2.Volume{{Name: "s", Mountpoint: "/scratch", FS: "xfs", Size: "100%", Provider: "lvm"}}},
+			func(f *executor.FakeRunner) {
+				for _, d := range []string{"sdb", "sdc"} {
+					f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME,TYPE", "/dev/" + d},
+						Response: executor.FakeResponse{Stdout: []byte(d + " disk\n" + d + "1 part\n")}})
+					f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine", "/dev/" + d + "1"},
+						Response: executor.FakeResponse{Stdout: []byte("           Name : any:scratch  (local to host any)\n")}})
+				}
+				f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine"},
+					Response: executor.FakeResponse{Err: errors.New("no md superblock")}})
+			}, []string{"/dev/sdb", "/dev/sdc"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sp, f := testProcessor(t)
+			c.stub(f)
+			sp.pool = pool()
+			set := c.set
+			if err := sp.resolveDiscover(context.Background(), &set); err != nil {
+				t.Fatalf("resolveDiscover: %v", err)
+			}
+			if strings.Join(set.Devices, " ") != strings.Join(c.want, " ") {
+				t.Fatalf("devices = %v, want %v (the set's own disks)", set.Devices, c.want)
+			}
+		})
+	}
+}
+
+// FC/iSCSI LUNs are shared storage: a discover set takes one only with
+// include_san, and sanitize never erases one.
+func TestSANLunsOnlyWithIncludeSANAndNeverSanitized(t *testing.T) {
+	pool := func() []discover.Device {
+		return []discover.Device{
+			{Name: "sda", Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(100), WWN: "0xb"},
+			{Name: "sdb", Path: "/dev/sdb", KernelPath: "/dev/sdb", Size: gib(50), WWN: "0xa", Transport: "fc"},
+		}
+	}
+	for _, include := range []bool{false, true} {
+		sp, _ := testProcessor(t)
+		sp.pool = pool()
+		set := v2.Set{Name: "scratch", Role: "data", Selection: "discover", Raid: "none", Count: 1, IncludeSAN: include,
+			Volumes: []v2.Volume{{Name: "s", Mountpoint: "/scratch", FS: "xfs", Size: "100%", Provider: "lvm"}}}
+		if err := sp.resolveDiscover(context.Background(), &set); err != nil {
+			t.Fatalf("include_san=%v: %v", include, err)
+		}
+		want := "/dev/sda"
+		if include {
+			want = "/dev/sdb" // smaller, so first once it is eligible
+		}
+		if len(set.Devices) != 1 || set.Devices[0] != want {
+			t.Fatalf("include_san=%v: devices = %v, want [%s]", include, set.Devices, want)
+		}
+	}
+
+	sp, f := testProcessor(t)
+	sp.pool = pool()
+	sp.sanitizeReadBack = func(string) (bool, error) { return true, nil }
+	if _, _, err := sp.runSanitize(context.Background(), false); err != nil {
+		t.Fatalf("runSanitize: %v", err)
+	}
+	for _, c := range f.Calls() {
+		if strings.Contains(strings.Join(c.Args, " "), "/dev/sdb") && (c.Path == "blkdiscard" || c.Path == "wipefs" || c.Path == "sgdisk") {
+			t.Fatalf("sanitize touched the SAN LUN: %s %v", c.Path, c.Args)
+		}
 	}
 }

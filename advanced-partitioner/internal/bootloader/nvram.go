@@ -32,12 +32,11 @@ func efibootmgrChrootPath(sysroot string) string {
 	return ""
 }
 
-// pxeAllowlist mirrors the bash awk allow-pass in
-// clear_uefi_nvram_entries: "anything matching PXE|Network|Luna|iPXE
-// must NOT be deleted". This is the safety net that keeps the network
-// boot path alive when an operator runs the clear_uefi_nvram path on
-// the tmpfs OS.
-var pxeAllowRE = regexp.MustCompile(`PXE|Network|Luna|iPXE`)
+// pxeAllowRE is the safety net that keeps the network boot path alive
+// when an operator runs the clear_uefi_nvram path: an entry whose label
+// matches is never deleted. Case-insensitive and wider than the bash
+// predecessor's PXE|Network|Luna|iPXE, which deleted HTTP boot entries.
+var pxeAllowRE = regexp.MustCompile(`(?i)PXE|Network|HTTP|IPv4|IPv6|iPXE|Luna`)
 
 // bootEntryRE matches a line like "Boot0001* TrinityX sda" or
 // "Boot0042  Linux Boot Manager". The first group is the four-hex
@@ -70,8 +69,8 @@ var trailingEntryRE = regexp.MustCompile(
 var bootNextRE = regexp.MustCompile(`^BootNext:\s*(.+)\s*$`)
 
 // ClearUEFINVRAMEntries deletes UEFI boot entries whose label does NOT
-// match PXE|Network|Luna|iPXE. Used by tmpfs-root + clear_uefi_nvram=true
-// to wipe stale local-install entries before reboot. Mirrors
+// match pxeAllowRE. Used whenever clear_uefi_nvram=true, for every boot
+// method, to wipe stale local-install entries before reboot. Mirrors
 // lib/bootloader_common.sh::clear_uefi_nvram_entries.
 func ClearUEFINVRAMEntries(ctx context.Context, runner executor.Runner, sysroot, firmwareMode string) error {
 	if firmwareMode != "uefi" {
@@ -101,7 +100,7 @@ func ClearUEFINVRAMEntries(ctx context.Context, runner executor.Runner, sysroot,
 }
 
 // parseClearableBootNums returns the four-hex boot numbers whose label
-// is NOT in the PXE/Network/Luna/iPXE allowlist. Exported as an
+// does not match pxeAllowRE. Exported as an
 // internal helper for tests.
 func parseClearableBootNums(efibootmgrOutput string) []string {
 	var out []string
@@ -181,14 +180,9 @@ type RegisterUEFIEntriesOptions struct {
 	BootDevices   []string
 	RegisterNVRAM string // "auto"|"yes"|"no"
 	// ESPPartition is the GPT partition number of the ESP on each boot
-	// disk (from storage-result esp_partition). 0 (a result that did not
-	// record it, e.g. a mount-existing layout) means detect it per disk
-	// (detectESPPartition), and only when that finds nothing assume 1.
+	// disk (from storage-result esp_partition); 0 falls back to 1.
 	ESPPartition int
-	// ESPDevice is the /boot/efi filesystem's device from the storage result
-	// (a partition or its md mirror); it disambiguates the detection.
-	ESPDevice   string
-	SnapshotDir string // optional; if non-empty, efibootmgr -v captures are written here
+	SnapshotDir  string // optional; if non-empty, efibootmgr -v captures are written here
 	// BootOrder is "first" or "last" (empty = last), from the os set's
 	// bootloader key.
 	BootOrder string
@@ -316,23 +310,12 @@ func RegisterUEFIEntries(ctx context.Context, opts RegisterUEFIEntriesOptions) e
 
 	// 2. Create one TrinityX entry per boot disk. The ESP partition number
 	// comes from the storage result (FTA D11 — it used to be hardcoded 1,
-	// an assumption of the current layout builder rather than a fact), or is
-	// read from the disk when the result did not record it.
+	// an assumption of the current layout builder rather than a fact).
+	espPart := opts.ESPPartition
+	if espPart <= 0 {
+		espPart = 1
+	}
 	for _, disk := range opts.BootDevices {
-		espPart := opts.ESPPartition
-		if espPart <= 0 {
-			espPart = detectESPPartition(ctx, opts.Runner, disk, opts.ESPDevice)
-			switch {
-			case espPart > 0 && opts.Logger != nil:
-				opts.Logger.Info(fmt.Sprintf("ESP partition number not in the storage result; detected partition %d on %s", espPart, disk))
-			case espPart <= 0:
-				espPart = 1
-				if opts.Logger != nil {
-					opts.Logger.Warn("ESP partition number neither in the storage result nor detectable on " + disk +
-						" (no EF00 partition, none mounted at /boot/efi); assuming partition 1")
-				}
-			}
-		}
 		label := fmt.Sprintf("%s %s", BootloaderID, filepath.Base(disk))
 		if _, err := opts.Runner.Run(ctx, executor.CommandSpec{
 			Path: eb, Chroot: opts.Sysroot,

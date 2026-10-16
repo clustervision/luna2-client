@@ -2,6 +2,7 @@ package bootloader
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fsops"
 	"os"
@@ -9,6 +10,8 @@ import (
 	"regexp"
 	"strings"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
 )
 
@@ -37,7 +40,8 @@ import (
 //
 // The boot-context wrapper produces sr; pass sr.MountedTargetRoot as
 // sysroot here so test fixtures don't have to mirror the /sysroot prefix.
-func WriteFstab(fs fsops.FS, sysroot string, sr result.StorageResult) error {
+// runner reads back the UUID of a filesystem the result has none for.
+func WriteFstab(fs fsops.FS, runner executor.Runner, sysroot string, sr result.StorageResult) error {
 	if sysroot == "" {
 		return fmt.Errorf("bootloader.WriteFstab: sysroot is required")
 	}
@@ -52,6 +56,9 @@ func WriteFstab(fs fsops.FS, sysroot string, sr result.StorageResult) error {
 	ours := make([]string, 0, len(sr.Filesystems))
 	ourMounts := make([]string, 0, len(sr.Filesystems))
 	for _, fsEnt := range sr.Filesystems {
+		if fsEnt.UUID == "" && fsEnt.FS != "tmpfs" {
+			fsEnt.UUID = recoverUUID(runner, fs.Logger, fsEnt)
+		}
 		line, err := fstabLineFor(fsEnt)
 		if err != nil {
 			return err
@@ -103,6 +110,32 @@ func fstabLineFor(fs result.Filesystem) (string, error) {
 	dump, pass := dumpAndPassFor(fs.FS, fs.Mount)
 	return fmt.Sprintf("UUID=%s %s %s defaults %d %d",
 		fs.UUID, fs.Mount, fs.FS, dump, pass), nil
+}
+
+// recoverUUID reads the UUID of a filesystem the storage result recorded
+// without one, after giving udev a bounded time to catch up with the new
+// filesystem. "" when blkid does not report one either.
+func recoverUUID(runner executor.Runner, logger *txlog.Logger, fs result.Filesystem) string {
+	if fs.Device == "" {
+		return ""
+	}
+	ctx := context.Background()
+	_, _ = runner.Run(ctx, executor.CommandSpec{
+		Path: "udevadm", Args: []string{"settle", "--timeout=10"},
+		CaptureStdout: true, CaptureStderr: true, Quiet: true,
+	})
+	res, err := runner.Run(ctx, executor.CommandSpec{
+		Path: "blkid", Args: []string{"-p", "-s", "UUID", "-o", "value", fs.Device},
+		CaptureStdout: true, CaptureStderr: true, Quiet: true,
+	})
+	if err != nil {
+		return ""
+	}
+	uuid := strings.TrimSpace(string(res.Stdout))
+	if uuid != "" && logger != nil {
+		logger.Warn(fmt.Sprintf("storage result has no UUID for %s (%s); recovered %s from blkid", fs.Mount, fs.Device, uuid))
+	}
+	return uuid
 }
 
 func dumpAndPassFor(fs, mount string) (int, int) {

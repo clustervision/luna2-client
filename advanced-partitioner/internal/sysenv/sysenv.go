@@ -75,7 +75,7 @@ func RequireInstallerEnv(opts Options) error {
 }
 
 // KernelParam returns the value of a `key=value` token on the kernel cmdline
-// — the Go equivalent of luna2-start.sh's `getargs key=`. The path defaults to
+// — the Go equivalent of luna-installer.sh's `getargs key=`. The path defaults to
 // CmdlinePath; tests inject Options.CmdlinePath. ok is false when the file is
 // unreadable or the key is absent. The first occurrence wins, matching kernel
 // last-wins-at-parse but getargs first-match behaviour used by the bash client.
@@ -111,8 +111,20 @@ func shortHost(h string) string {
 	return strings.ToLower(h)
 }
 
+// compareHosts returns the two names in the form they were compared in: in
+// full when both carry a domain, as short names otherwise.
+func compareHosts(current, expected string) (string, string, bool) {
+	a := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(current)), ".")
+	b := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(expected)), ".")
+	if !strings.Contains(a, ".") || !strings.Contains(b, ".") {
+		a, b = shortHost(a), shortHost(b)
+	}
+	return a, b, a == b
+}
+
 // RequireExpectedHost ensures the local hostname matches expected when
-// non-empty. Mirrors require_expected_host. Both sides are compared as short
+// non-empty. Mirrors require_expected_host. When both names carry a domain
+// they are compared in full (node001.a is not node001.b); otherwise as short
 // names: the pipeline passes $_HOSTNAME, which Luna may set to the FQDN
 // ("node001.cluster"), and stripping the domain only from the local name
 // refused every such node as a "mismatch".
@@ -128,12 +140,10 @@ func RequireExpectedHost(expected string, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("hostname: %w", err)
 	}
-	// os.Hostname returns the FQDN on some kernels; the bash version
-	// uses `hostname -s`. Compare short names on BOTH sides.
-	if shortHost(current) != shortHost(expected) {
+	if a, b, same := compareHosts(current, expected); !same {
 		return fmt.Errorf(
 			"%w: refusing destructive execution on host %s; expected %s",
-			ErrHostMismatch, shortHost(current), expected)
+			ErrHostMismatch, a, b)
 	}
 	return nil
 }

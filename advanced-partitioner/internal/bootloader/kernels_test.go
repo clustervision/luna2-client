@@ -110,7 +110,7 @@ func TestDracutAllKernelsFailurePolicy(t *testing.T) {
 		f := executor.NewFakeRunner(executor.FakeResponse{})
 		f.AddMatch(executor.FakeMatch{
 			Path:       "chroot",
-			ArgsPrefix: []string{sysroot, "/usr/bin/env", "dracut", "-f", "--omit", "luna", "--kver", tc.failing},
+			ArgsPrefix: append([]string{sysroot, "/usr/bin/env"}, dracutArgs(tc.failing)...),
 			Response:   executor.FakeResponse{ExitCode: 1, Err: errors.New("exit 1")},
 		})
 		def, err := dracutAllKernels(context.Background(), AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot}}, true)
@@ -205,6 +205,23 @@ func TestRegenerateInitramfsRemovesImageLVMDevicesFile(t *testing.T) {
 	}
 }
 
+// A reused root (install_mode local) keeps its LVM devices file: it was set up
+// for this node, by lpart or by the site, and is not the image host's.
+func TestRegenerateInitramfsKeepsDevicesFileOnReusedRoot(t *testing.T) {
+	pinRunningKernel(t, "")
+	sysroot := stageRHELSysroot(t, false)
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	a := &rhelAdapter{deps: AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot, ReusesRoot: true}}}
+	devices := filepath.Join(sysroot, lvmDevicesFile)
+	mustWriteFile(t, devices, "VERSION=1.1.2\n")
+	if err := a.RegenerateInitramfs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(devices); err != nil {
+		t.Fatalf("%s removed on a reused root: %v", lvmDevicesFile, err)
+	}
+}
+
 // An image without grub2-editenv keeps its own saved_entry rather than failing
 // the install on a command that can never succeed.
 func TestSetDefaultBootEntryWithoutEditenv(t *testing.T) {
@@ -216,5 +233,21 @@ func TestSetDefaultBootEntryWithoutEditenv(t *testing.T) {
 	}
 	if len(f.Calls()) != 0 {
 		t.Fatalf("no command expected, got %v", f.Calls())
+	}
+}
+
+// A +debug kernel is not rebuilt while a normal kernel exists (dracut fails on
+// it); an image with only debug kernels still gets its initramfs.
+func TestBootableKernelsSkipsDebugBesideNormal(t *testing.T) {
+	const normal, debug = "6.12.0-55.el10.x86_64", "6.12.0-55.el10.x86_64+debug"
+	sysroot := t.TempDir()
+	stageKernels(t, sysroot, []string{normal, debug})
+	if got := bootableKernels(sysroot); len(got) != 1 || got[0] != normal {
+		t.Fatalf("bootableKernels = %v, want only %s", got, normal)
+	}
+	debugOnly := t.TempDir()
+	stageKernels(t, debugOnly, []string{debug})
+	if got := bootableKernels(debugOnly); len(got) != 1 || got[0] != debug {
+		t.Fatalf("debug-only image: bootableKernels = %v, want %s", got, debug)
 	}
 }

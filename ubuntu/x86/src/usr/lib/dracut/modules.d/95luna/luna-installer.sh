@@ -1,13 +1,11 @@
-# luna-installer.sh -- SHARED Luna install-initramfs logic.
+# luna-installer.sh -- Luna install-initramfs logic for dracut.
 #
-# CANONICAL SHARED SCRIPT. This file is byte-identical in the redhat (dracut
-# 95luna) and ubuntu (initramfs-tools) client trees, and is installed to
-# /usr/share/luna/luna-installer.sh inside the install initramfs. The per-distro
-# entrypoint sources it after setting up logging and the getargs/getargbool
-# helpers:
-#   - redhat/suse : 95luna/luna2-start.sh  (dracut; getargs from dracut-lib.sh)
-#   - ubuntu      : scripts/local-premount/luna-start  (initramfs-tools; shims)
-# Keep the two copies in sync -- edit one, copy to the other.
+# Byte-identical in all six 95luna module copies (redhat, opensuse and ubuntu;
+# x86 and arm): edit one, copy to the others. Installed to
+# /usr/share/luna/luna-installer.sh inside the install initramfs and sourced by
+# 95luna/luna2-start.sh after its logging setup and dracut-lib.sh (getargs).
+# The ubuntu initramfs-tools hook does not use it: its
+# scripts/local-premount/luna-start is a separate implementation.
 #
 # Written by ClusterVision Development team. This file is part of Luna, a
 # cluster provisioning tool, and is free software under the GNU GPL v3+
@@ -70,6 +68,7 @@ function luna_init () {
     fi
 }
 
+LUNA_PROGRESS_STOP=/tmp/luna_progress.stop
 function luna_start () {
     local luna_ip
     local luna_gw
@@ -140,10 +139,13 @@ function luna_start () {
     # install log to the loghost every 20s, so an install that HANGS (never
     # reaches luna_finish/retry to flush its log) is still diagnosable on the
     # controller -- the last snapshot before the hang shows where it stopped.
+    # A park sets $LUNA_PROGRESS_STOP: one more send carries the park banner,
+    # then the loop ends instead of resending it every 20s for as long as it parks.
     ( _plh=$(getargs luna.loghost=)
       [ -n "$_plh" ] && while sleep 20; do
           readable_log < /tmp/luna_install.log 2>/dev/null | tail -n 120 2>/dev/null \
             | logger -d -n "$_plh" -P 514 -t luna-progress 2>/dev/null
+          [ -e "$LUNA_PROGRESS_STOP" ] && break
       done ) &
     # Bounded + instrumented settle: on ubuntu26/resolute an unbounded settle
     # here hung 30-52 MINUTES intermittently (initqueue spinner forever, no
@@ -334,13 +336,16 @@ function luna_trim () {
 function get_credentials {
     LUNA_INI='/trinity/local/luna/node/config/luna.ini'
     if [ -f "$LUNA_INI" ]; then
-        while IFS='=' read -ra line; do
+        while IFS= read -r raw; do
+            line=${raw%%=*}
             if [ ! "$(luna_trim "$line" | grep -E '^(#|;)')" ] && [ "$line" ]; then
                 if [ "$(luna_trim "$line" | grep '^\[')" ]; then
                     section=$(luna_trim "$line" | grep -oE "[A-Z]+")
                 else
-                    key=$(luna_trim "${line[0]}")
-                    value=$(luna_trim "${line[1]}")
+                    key=$(luna_trim "$line")
+                    # split on the first '=' only: a password may hold '=' (base64)
+                    value=""
+                    [ "$raw" != "$line" ] && value=$(luna_trim "${raw#*=}")
                     declare -x "${section}_${key}"="$value"
                 fi
             fi
@@ -383,7 +388,7 @@ function fetch_token {
     fi
     luna_mac=$(getargs luna.mac=)
     luna_nic=$(find_nic "${luna_mac}")
-    luna_curl -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
+    luna_curl -X POST -H "Content-Type: application/json" -d "$json" -s -m 60 --connect-timeout 10 "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
     valid=$(grep token /lunatmp/token.json)
     if [ "$valid" ]; then
         token=$(cat /lunatmp/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
@@ -395,6 +400,17 @@ function fetch_token {
         >&2 echo
         echo "None"
     fi
+}
+
+# The install script reported where it stopped with a token issued when it
+# started, which a long erase outlives: report that state again with a fresh one.
+function luna_post_state () {
+    local _token
+    _token=$(fetch_token 2>/dev/null)
+    [ -n "$_token" ] && [ "$_token" != "None" ] || return 0
+    luna_curl -s -m 10 -X POST -H "x-access-tokens: $_token" -H "Content-Type: application/json" \
+        -d '{"monitor": {"status": {"'"$luna_node"'": {"state": "'"$1"'"}}}}' \
+        "${luna_url}/monitor/node/${luna_node}" > /dev/null 2>&1
 }
 
 # The install pipeline writes the stage, the reason and the failing step's
@@ -443,44 +459,79 @@ function retry_countdown () {
     echo "Luna2: ============================================================"
     echo "Luna2: INSTALLER FAILED -- retrying in ${secs}s."
     print_failure_reason
-    echo "Luna2: Exit ${rc}: a retryable failure; the reason is above. Retrying."
+    echo "Luna2: Exit ${rc}: a retryable failure; the reason is above. Retrying in ${secs}s."
     echo "Luna2: Press any key to drop to a shell (exit to resume, poweroff to stop)."
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: ============================================================"
-    if ! { exec 9<>"$ctty"; } 2>/dev/null; then
+    # The countdown runs on the recovery console and, unless luna.ctty pins it, on tty1
+    # too: a node with a serial and a VGA console has its operator on either one.
+    local _t _fd _fds=() _ttys=() _cand=("$ctty")
+    [ "$ctty" != /dev/tty1 ] && [ -z "$(getargs luna.ctty=)" ] && _cand+=(/dev/tty1)
+    for _t in "${_cand[@]}"; do
+        _tty_opens "$_t" || continue
+        { exec {_fd}<>"$_t"; } 2>/dev/null || continue
+        _fds+=("$_fd"); _ttys+=("$_t")
+    done
+    if [ ${#_fds[@]} -eq 0 ]; then
         sleep "$secs"
         return 0
     fi
-    local i key _quiet=0 _n=0
-    # Input is read from the recovery console only (fd 9), and the first second
-    # is ignored: what is already buffered there (keys pressed during the
-    # install, serial line noise) and what arrives in that second is dropped,
-    # so a stray byte does not take the node into a shell instead of a retry.
-    printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$secs" >"$ctty"
-    while (( _quiet < 10 && _n < 4096 )); do
-        if read -t 0.1 -n 1 -s key <&9; then
-            (( _n++ ))
-        elif (( $? > 128 )); then
-            (( _quiet++ ))            # 0.1 s without input
-        else
-            sleep 1; break            # EOF/error: no input to ignore
-        fi
+    local i k key _quiet _n _wait
+    _wait=1; [ ${#_fds[@]} -gt 1 ] && _wait=0.5    # one second per tick, shared
+    # Input is read from these consoles only, and the first second is ignored: what is
+    # already buffered there (keys pressed during the install, serial line noise) and
+    # what arrives in that second is dropped, so a stray byte does not take the node
+    # into a shell instead of a retry.
+    for k in "${!_fds[@]}"; do
+        printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$secs" >"${_ttys[$k]}"
+        _quiet=0; _n=0
+        while (( _quiet < 10 / ${#_fds[@]} && _n < 4096 )); do
+            if read -t 0.1 -n 1 -s key <&"${_fds[$k]}"; then
+                (( _n++ ))
+            elif (( $? > 128 )); then
+                (( _quiet++ ))        # 0.1 s without input
+            else
+                sleep 0.5; break      # EOF/error: no input to ignore
+            fi
+        done
     done
     for (( i=secs-1; i>0; i-- )); do
-        printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$i" >"$ctty"
-        if read -t 1 -n 1 -s key <&9; then
-            exec 9<&-
-            echo "" >"$ctty"
-            echo "Luna2: Dropping to shell. 'exit' resumes the retry; 'poweroff' stops." >"$ctty"
-            setsid -c /bin/sh -i -l 0<>"$ctty" 1<>"$ctty" 2<>"$ctty"
-            return 0
-        elif (( $? <= 128 )); then
-            sleep 1                   # EOF/error, not a timeout: keep the pause
-        fi
+        for k in "${!_fds[@]}"; do
+            printf 'Luna2: retrying in %2ds (press any key for a shell)\r' "$i" >"${_ttys[$k]}"
+            if read -t "$_wait" -n 1 -s key <&"${_fds[$k]}"; then
+                _t=${_ttys[$k]}
+                for _fd in "${_fds[@]}"; do exec {_fd}<&-; done
+                echo "" >"$_t"
+                echo "Luna2: Dropping to shell. 'exit' resumes the retry; 'poweroff' stops." >"$_t"
+                setsid -c /bin/sh -i -l 0<>"$_t" 1<>"$_t" 2<>"$_t"
+                return 0
+            elif (( $? <= 128 )); then
+                sleep "$_wait"        # EOF/error, not a timeout: keep the pause
+            fi
+        done
     done
-    exec 9<&-
-    echo "" >"$ctty"
+    for k in "${!_fds[@]}"; do
+        echo "" >"${_ttys[$k]}"
+        _fd=${_fds[$k]}; exec {_fd}<&-
+    done
     return 0
+}
+
+# _tty_opens TTY: opening a serial port can wait for its line's carrier and hang the
+# retry; try it in a child and give up on the port after 2 s.
+function _tty_opens () {
+    ( exec 3<>"$1" ) 2>/dev/null &
+    local _p=$! _n
+    for _n in {1..20}; do
+        kill -0 "$_p" 2>/dev/null || break
+        sleep 0.1
+    done
+    if kill -0 "$_p" 2>/dev/null; then
+        kill -9 "$_p" 2>/dev/null
+        wait "$_p" 2>/dev/null
+        return 1
+    fi
+    wait "$_p"
 }
 
 # Non-retryable failure. Some install failures are deterministic: they will fail
@@ -491,13 +542,15 @@ function retry_countdown () {
 # (there is no installed OS to boot): show why, then park the operator in a
 # maintenance shell. 'poweroff' stops the node; exiting the shell re-opens it.
 # install_mode=sanitize finished (marker from lpart-node-installer): report and
-# power the node off. Nothing is left to boot, and returning to the retry loop
+# park the node. Nothing is left to boot, and returning to the retry loop
 # would only start another erase. The marker holds what lpart-storage-prepare
 # reported (the disks it erased, or that there was nothing to erase); print
 # that, never a fixed claim.
 LUNA_SANITIZE_MARKER=/tmp/install_files/runtime/sanitize.done
 function luna_sanitize_stop () {
     local rc="${1:-0}" _line
+    local ctty="${luna_ctty:-/dev/tty1}"
+    : > "$LUNA_PROGRESS_STOP"
     echo "Luna2: ============================================================"
     echo "Luna2: SANITIZE FINISHED -- lpart-storage-prepare reported:"
     if [ -s "$LUNA_SANITIZE_MARKER" ]; then
@@ -507,28 +560,43 @@ function luna_sanitize_stop () {
     else
         echo "Luna2:   (no report was written -- check the install log)"
     fi
-    echo "Luna2: install_mode=sanitize stops the node: powering off in 10 s."
-    echo "Luna2: (install script exit status ${rc}; set another install_mode before the next boot)"
+    echo "Luna2: install_mode=sanitize stops the node here (install script exit"
+    echo "Luna2: status ${rc}): set another install_mode, then reboot the node."
+    echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
     echo "Luna2: ============================================================"
     if [ "$luna_loghost" ]; then
         readable_log < /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
     fi
+    luna_post_state install.sanitized
     sync
-    sleep 10
-    poweroff -f 2>/dev/null
-    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
-    echo o > /proc/sysrq-trigger 2>/dev/null
-    while true; do sleep 60; done
+    while true; do
+        if { exec 9<>"$ctty"; } 2>/dev/null; then
+            exec 9<&-
+            setsid -c /bin/sh -i -l 0<>"$ctty" 1<>"$ctty" 2<>"$ctty"
+        else
+            sleep 3600
+        fi
+    done
 }
 
 LUNA_FATAL_RC=3   # keep in sync with lpart-node-installer exitFatalConfig
 # Exit 2 is the lpart tools' safety_refusal contract (data fence, persistent-
-# set protection): also deterministic, also parks. The node-installer already
-# maps sub-tool exit 2 -> 3; this catches a directly-invoked lpart tool too.
+# set protection): also deterministic, also parks. lpart-node-installer exits
+# 2 for a safety refusal and 3 for a non-retryable configuration error.
 LUNA_SAFETY_RC=2  # keep in sync with internal/cli ExitSafetyRefusal
+# The state the install template reported for lpart's park exit (lpart_phase).
+function lpart_park_state () {
+    if [ "$1" = "$LUNA_SAFETY_RC" ]; then
+        [ -f /tmp/install_files/runtime/degraded.done ] && echo install.degraded || echo install.refused
+    else
+        echo install.fatal
+    fi
+}
+
 function fatal_park () {
-    local rc="${1:-?}"
+    local rc="${1:-?}" kind
     local ctty="${luna_ctty:-/dev/tty1}"
+    : > "$LUNA_PROGRESS_STOP"
     echo ""
     echo "Luna2: ============================================================"
     echo "Luna2: INSTALL FAILED (exit ${rc}) -- NOT retrying."
@@ -537,17 +605,27 @@ function fatal_park () {
     # from anything else the install script runs, e.g. an operator script.
     if [ -s "$LUNA_FAILURE_FILE" ]; then
         print_failure_reason
-        echo "Luna2: lpart reported the reason above (a safety refusal or a non-retryable"
-        echo "Luna2: configuration error); it would recur on every attempt."
+        case "$rc" in
+            "$LUNA_SAFETY_RC") kind="a safety refusal" ;;
+            *) kind="a non-retryable configuration error" ;;
+        esac
+        echo "Luna2: lpart reported the reason above: ${kind}, which would recur on"
+        echo "Luna2: every attempt."
     else
-        echo "Luna2: The install script exited ${rc} (operator script or install step);"
-        echo "Luna2: see the log."
+        echo "Luna2: Reason:"
+        echo "Luna2:   install script failed (exit ${rc})"
+        echo "Luna2: lpart left no verdict, so this is not a safety refusal: see the log."
     fi
     echo "Luna2: Exit 2 and 3 are non-retryable, so the node is parked instead of"
     echo "Luna2: reinstalling in a loop."
     echo "Luna2: Logs: /tmp/luna_install.log.prev  Kernel: /tmp/luna_install.dmesg.last"
     echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
     echo "Luna2: ============================================================"
+    if [ -s "$LUNA_FAILURE_FILE" ]; then
+        luna_post_state "$(lpart_park_state "$rc")"
+    else
+        luna_post_state install.fatal
+    fi
     while true; do
         if { exec 9<>"$ctty"; } 2>/dev/null; then
             exec 9<&-
@@ -656,11 +734,13 @@ if [ "x$root" = "xluna" ]; then
             while [ 0 ]; do
                 token=$(fetch_token)
                 luna_curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
+                curl_rc=$?
                 http_code=$(cat /lunatmp/http_code.out)
-                if [ "$http_code" == "200" ]; then
+                # a body cut short still reports 200; only curl's exit status tells
+                if [ "$curl_rc" = "0" ] && [ "$http_code" == "200" ]; then
                     break
                 else
-                    echo "Luna2: Could not get install script [$http_code]. Sleeping 10 sec."
+                    echo "Luna2: Could not get install script [$http_code, curl exit $curl_rc]. Sleeping 10 sec."
                     sleep 10
                 fi
             done
@@ -712,6 +792,8 @@ if [ "x$root" = "xluna" ]; then
     echo 'Exit from Luna2 Installer'
 
     # Post-install boot of the freshly installed disk.
+    # Not reached today: the only entrypoint, luna2-start.sh, sources
+    # dracut-lib.sh first, so the initramfs-tools branch below never runs.
     # dracut (redhat/suse) pivots cleanly to /sysroot once this hook returns, so
     # there is nothing more to do. initramfs-tools (ubuntu/debian) cannot: with
     # root=luna there is no device for mountroot to mount, so it would drop to an

@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/raidlevel"
 )
 
 // Set and volume names are not labels: they become kernel and LVM object
@@ -16,14 +18,12 @@ import (
 //   - volume name: the LV name of an lvm volume and the GPT partition label of
 //     a partition volume.
 //
-// A name the stack cannot carry used to pass validation and fail only after
-// cleanup had wiped the disks (or, for a name like "disk", have cleanup delete
-// /dev/disk itself). These rules refuse such names up front.
+// A name that would make cleanup leave /dev, or that the stack refuses after
+// the disks were wiped, is refused up front; a merely odd name is a warning.
 
-// nameRE is the character set for set and volume names: the intersection of
-// what LVM accepts for VG/LV names and what survives the md-name fold
-// unambiguously.
-var nameRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
+// nameRE is the character set LVM accepts for VG and LV names; md folds
+// anything else to '_'.
+var nameRE = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 
 // reservedSetNames are entries that exist directly under /dev on RHEL (and the
 // other supported installer initramfs). Cleanup runs `rm -rf /dev/<set name>`,
@@ -31,23 +31,23 @@ var nameRE = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 // by-path link the installer resolves devices through, "md" and "mapper" the
 // arrays and LVs being built, "log" the journal socket. LVM would also place
 // the VG directory on top of the entry.
-var reservedSetNames = map[string]struct{}{
+var reservedSetNames = map[string]bool{
 	// directories
-	".": {}, "..": {}, "block": {}, "bsg": {}, "bus": {}, "char": {}, "cpu": {},
-	"disk": {}, "dma_heap": {}, "dri": {}, "fd": {}, "hugepages": {},
-	"infiniband": {}, "input": {}, "lvm": {}, "mapper": {}, "md": {},
-	"mqueue": {}, "net": {}, "pts": {}, "raw": {}, "serial": {}, "shm": {},
-	"snd": {}, "usb": {}, "vfio": {},
+	"block": true, "bsg": true, "bus": true, "char": true, "cpu": true,
+	"disk": true, "dma_heap": true, "dri": true, "fd": true, "hugepages": true,
+	"infiniband": true, "input": true, "lvm": true, "mapper": true, "md": true,
+	"mqueue": true, "net": true, "pts": true, "raw": true, "serial": true, "shm": true,
+	"snd": true, "usb": true, "vfio": true,
 	// device nodes, sockets and links every installer environment carries
-	"autofs": {}, "btrfs-control": {}, "console": {}, "core": {},
-	"cpu_dma_latency": {}, "cuse": {}, "full": {}, "fuse": {}, "hpet": {},
-	"initctl": {}, "kmsg": {}, "kvm": {}, "log": {}, "loop-control": {},
-	"mcelog": {}, "mem": {}, "nvme-fabrics": {}, "nvram": {}, "null": {},
-	"port": {}, "ppp": {}, "ptmx": {}, "random": {}, "rfkill": {}, "rtc": {},
-	"snapshot": {}, "stderr": {}, "stdin": {}, "stdout": {}, "tty": {},
-	"udmabuf": {}, "uhid": {}, "uinput": {}, "urandom": {}, "userfaultfd": {},
-	"vga_arbiter": {}, "vhost-net": {}, "vhost-vsock": {}, "vsock": {},
-	"watchdog": {}, "zero": {},
+	"autofs": true, "btrfs-control": true, "console": true, "core": true,
+	"cpu_dma_latency": true, "cuse": true, "full": true, "fuse": true, "hpet": true,
+	"initctl": true, "kmsg": true, "kvm": true, "log": true, "loop-control": true,
+	"mcelog": true, "mem": true, "nvme-fabrics": true, "nvram": true, "null": true,
+	"port": true, "ppp": true, "ptmx": true, "random": true, "rfkill": true, "rtc": true,
+	"snapshot": true, "stderr": true, "stdin": true, "stdout": true, "tty": true,
+	"udmabuf": true, "uhid": true, "uinput": true, "urandom": true, "userfaultfd": true,
+	"vga_arbiter": true, "vhost-net": true, "vhost-vsock": true, "vsock": true,
+	"watchdog": true, "zero": true,
 }
 
 // kernelDevNameRE matches kernel block/char device node names (with an
@@ -59,24 +59,18 @@ var kernelDevNameRE = regexp.MustCompile(
 		`tty([A-Z]+[0-9]*|[0-9]+)|vcs[au]?[0-9]*|hidraw[0-9]+|rtc[0-9]+|watchdog[0-9]+|tpm(rm)?[0-9]+)` +
 		`(p?[0-9]+)?$`)
 
-// lvmReservedLVPrefixes and lvmReservedLVSubstrings are the LV names lvcreate
-// refuses (lvm2 apply_lvname_restrictions): names starting with "snapshot" or
-// "pvmove", and names containing an internal sub-LV component suffix.
-var (
-	lvmReservedLVPrefixes   = []string{"snapshot", "pvmove"}
-	lvmReservedLVSubstrings = []string{
-		"_cdata", "_cmeta", "_corig", "_cpool", "_cvol", "_imeta", "_iorig",
-		"_mimage", "_mlog", "_pmspare", "_rimage", "_rmeta", "_tdata", "_tmeta",
-		"_vdata", "_vorigin", "_wcorig",
-	}
-)
+// lvmReservedLVRE matches the LV names lvcreate refuses (lvm2
+// apply_lvname_restrictions): a leading '_', "snapshot" or "pvmove", and the
+// component suffix of an internal sub-LV anywhere in the name.
+var lvmReservedLVRE = regexp.MustCompile(
+	`^(_|snapshot|pvmove)|_(cdata|cmeta|corig|cpool|cvol|imeta|iorig|mimage|mlog|pmspare|rimage|rmeta|tdata|tmeta|vdata|vorigin|wcorig)`)
 
-// maxSetNameLen bounds a set name by its longest md array name. mdadm keeps at
-// most 32 characters of array name in a v1 superblock, and the raid builder's
-// --homehost=any prefixes "any:"; a name that does not fit is stored without
-// the prefix (or truncated), so the array assembles as a foreign /dev/md127
-// instead of /dev/md/<name> and the health probe and cleanup look for it in
-// vain. The longest array is "<set>-boot": 4 + 22 + 5 < 32.
+// maxSetNameLen bounds a raid set's name by its longest md array name. mdadm
+// keeps at most 32 characters of array name in a v1 superblock, and the raid
+// builder's --homehost=any prefixes "any:"; a name that does not fit is stored
+// without the prefix (or truncated), so the array assembles as a foreign
+// /dev/md127 instead of /dev/md/<name> and the health probe and cleanup look
+// for it in vain. The longest array is "<set>-boot": 4 + 22 + 5 < 32.
 const maxSetNameLen = 22
 
 // setRef names a set in an operator-facing message: index and name.
@@ -89,79 +83,54 @@ func volRef(setIdx int, setName string, volIdx int, volName string) string {
 	return fmt.Sprintf("sets[%d].volumes[%d] (set %q, volume %q)", setIdx, volIdx, setName, volName)
 }
 
-// validateSetName checks one set name in isolation (the cross-set collisions
+// checkName applies the rules shared by set and volume names; becomes says
+// what the name turns into, for the warning.
+func (c *Config) checkName(ref, name, becomes string) error {
+	switch {
+	case name == "." || name == "..":
+		return fmt.Errorf("config_validation: %s: name must not be %q: cleanup runs rm -rf /dev/<set name>, and LVM refuses it", ref, name)
+	case strings.HasPrefix(name, "-"):
+		return fmt.Errorf("config_validation: %s: name must not start with '-' (LVM reads it as an option and refuses it)", ref)
+	case !nameRE.MatchString(name):
+		c.warnf("%s: name %q has characters other than letters, digits, '_', '.' and '-'; it becomes %s, and LVM refuses most other characters", ref, name, becomes)
+	}
+	return nil
+}
+
+// checkSetName checks one set name in isolation (the cross-set collisions
 // are validateSetNameCollisions).
-func validateSetName(idx int, name string) error {
-	ref := setRef(idx, name)
-	if !nameRE.MatchString(name) {
+func (c *Config) checkSetName(ref string, s *Set, r raidlevel.Raid) error {
+	if strings.Contains(s.Name, "/") {
+		return fmt.Errorf("config_validation: %s: name must not contain '/': cleanup runs rm -rf /dev/<set name>, which must stay inside /dev", ref)
+	}
+	if err := c.checkName(ref, s.Name, "the LVM volume group, the md array name and a path under /dev"); err != nil {
+		return err
+	}
+	switch {
+	case r != raidlevel.RaidNone && len(s.Name) > maxSetNameLen:
 		return fmt.Errorf(
-			"config_validation: %s: name may only contain letters, digits, '_' and '-' (it becomes the LVM volume group, the md array name and a path under /dev)",
-			ref)
-	}
-	if strings.HasPrefix(name, "-") {
-		return fmt.Errorf("config_validation: %s: name must not start with '-' (LVM refuses such a volume group name)", ref)
-	}
-	if len(name) > maxSetNameLen {
-		return fmt.Errorf(
-			"config_validation: %s: name is %d characters, at most %d are allowed: the set's md arrays (/dev/md/<name>, <name>-efi, <name>-boot) must fit mdadm's 32-character array name together with the \"any:\" homehost prefix",
-			ref, len(name), maxSetNameLen)
-	}
-	if (&Set{Name: name}).MDName() == "" {
+			"config_validation: %s: name is %d characters, at most %d are allowed on a raid set: the set's md arrays (/dev/md/<name>, <name>-efi, <name>-boot) must fit mdadm's 32-character array name together with the \"any:\" homehost prefix",
+			ref, len(s.Name), maxSetNameLen)
+	case s.MDName() == "":
 		return fmt.Errorf(
 			"config_validation: %s: name must contain a letter or digit (the md array name /dev/md/<name> is the name with every other character folded to '_' and trailing '_' trimmed, which leaves nothing)",
 			ref)
-	}
-	if _, reserved := reservedSetNames[name]; reserved || kernelDevNameRE.MatchString(name) {
+	case reservedSetNames[s.Name] || kernelDevNameRE.MatchString(s.Name):
 		return fmt.Errorf(
 			"config_validation: %s: name is reserved: /dev/%s exists on the installer, and cleanup removes /dev/<set name> (rm -rf) while LVM puts the volume group there; choose another set name",
-			ref, name)
+			ref, s.Name)
 	}
 	return nil
 }
 
-// validateVolumeName checks one volume name in isolation; lvm reports whether
-// the volume becomes a logical volume (LVM's reserved names apply only then).
-func validateVolumeName(setIdx int, setName string, volIdx int, name string, lvm bool) error {
-	ref := volRef(setIdx, setName, volIdx, name)
-	if !nameRE.MatchString(name) {
-		return fmt.Errorf(
-			"config_validation: %s: name may only contain letters, digits, '_' and '-' (it becomes the LV name or the GPT partition label)",
-			ref)
+// checkVolumeName checks one volume name; LVM's reserved names apply only to
+// a volume that becomes a logical volume.
+func (c *Config) checkVolumeName(ref string, v *Volume) error {
+	if err := c.checkName(ref, v.Name, "the LV name or the GPT partition label"); err != nil {
+		return err
 	}
-	if strings.HasPrefix(name, "-") {
-		return fmt.Errorf("config_validation: %s: name must not start with '-' (lvcreate refuses such a logical volume name)", ref)
-	}
-	if !lvm {
-		return nil
-	}
-	if strings.HasPrefix(name, "_") {
-		return fmt.Errorf("config_validation: %s: an lvm volume name must not start with '_' (LVM reserves it for internal volumes)", ref)
-	}
-	for _, p := range lvmReservedLVPrefixes {
-		if strings.HasPrefix(name, p) {
-			return fmt.Errorf("config_validation: %s: lvm volume names starting with %q are reserved by LVM (lvcreate refuses them)", ref, p)
-		}
-	}
-	for _, sub := range lvmReservedLVSubstrings {
-		if strings.Contains(name, sub) {
-			return fmt.Errorf("config_validation: %s: lvm volume names containing %q are reserved by LVM for internal sub-volumes (lvcreate refuses them)", ref, sub)
-		}
-	}
-	return nil
-}
-
-// validateVolumeNamesUnique refuses two volumes of one set with the same name:
-// lvcreate refuses a second LV of that name in the VG, and the partition-number
-// predictor identifies a volume by its name.
-func (s *Set) validateVolumeNamesUnique(idx int) error {
-	seen := make(map[string]int, len(s.Volumes))
-	for j, v := range s.Volumes {
-		if prev, dup := seen[v.Name]; dup {
-			return fmt.Errorf(
-				"config_validation: %s: volume name %q is used by volumes[%d] and volumes[%d]; volume names must be unique within a set (they are the LV names of the volume group)",
-				setRef(idx, s.Name), v.Name, prev, j)
-		}
-		seen[v.Name] = j
+	if m := lvmReservedLVRE.FindString(v.Name); v.Provider == "lvm" && m != "" {
+		return fmt.Errorf("config_validation: %s: lvm volume name %q matches %q, which LVM reserves for its internal volumes (lvcreate refuses it)", ref, v.Name, m)
 	}
 	return nil
 }
@@ -185,33 +154,24 @@ func (c *Config) validateSetNameCollisions() error {
 				"config_validation: sets[%d] and sets[%d] are both named %q; set names must be unique (each is a volume group, an md array and a cleanup target)",
 				prev, i, s.Name)
 		}
-		byName[s.Name] = i
-		md := s.MDName()
-		if prev, dup := byMD[md]; dup {
+		if prev, dup := byMD[s.MDName()]; dup {
 			return fmt.Errorf(
 				"config_validation: set names %q (sets[%d]) and %q (sets[%d]) both map to the md array /dev/md/%s (non-alphanumerics fold to '_'); rename one of them",
-				c.Sets[prev].Name, prev, s.Name, i, md)
+				c.Sets[prev].Name, prev, s.Name, i, s.MDName())
 		}
-		byMD[md] = i
+		byName[s.Name], byMD[s.MDName()] = i, i
 	}
 	for i := range c.Sets {
-		a := &c.Sets[i]
-		prefix := a.Name + "-"
+		prefix := c.Sets[i].Name + "-"
 		for j := range c.Sets {
-			if i == j {
-				continue
-			}
 			b := &c.Sets[j]
 			for _, v := range b.Volumes {
-				if v.Provider != "lvm" {
+				if i == j || v.Provider != "lvm" || !strings.HasPrefix(dmMapperName(b.Name, v.Name), prefix) {
 					continue
 				}
-				mapper := dmMapperName(b.Name, v.Name)
-				if strings.HasPrefix(mapper, prefix) {
-					return fmt.Errorf(
-						"config_validation: set names %q (sets[%d]) and %q (sets[%d]) clash: cleanup of set %q removes every /dev/mapper/%s* entry, which includes /dev/mapper/%s (volume %q of set %q); rename one of the sets",
-						a.Name, i, b.Name, j, a.Name, prefix, mapper, v.Name, b.Name)
-				}
+				return fmt.Errorf(
+					"config_validation: set names %q (sets[%d]) and %q (sets[%d]) clash: cleanup of set %q removes every /dev/mapper/%s* entry, which includes /dev/mapper/%s (volume %q of set %q); rename one of the sets",
+					c.Sets[i].Name, i, b.Name, j, c.Sets[i].Name, prefix, dmMapperName(b.Name, v.Name), v.Name, b.Name)
 			}
 		}
 	}

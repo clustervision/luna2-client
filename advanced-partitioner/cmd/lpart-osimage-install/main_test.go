@@ -406,3 +406,65 @@ func TestResolveStreamPolicy(t *testing.T) {
 		})
 	}
 }
+
+// The sync sweep converges only the os set's volumes: the set with role "os",
+// or the one holding "/" when no role is written.
+func TestStorageResultOSMountpoints(t *testing.T) {
+	sr := filepath.Join(t.TempDir(), "storage-result.json")
+	body := `{"version":2,"sets":[
+        {"name":"os","role":"os","filesystems":[{"mount":"/"},{"mount":"/boot"},{"mount":"/boot/efi"},{"mount":"swap"}]},
+        {"name":"scratch","filesystems":[{"mount":"/scratch"}]},
+        {"name":"data","role":"data","persistent":true,"filesystems":[{"mount":"/data"}]}
+    ]}`
+	if err := os.WriteFile(sr, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := readStorageResultSummary(sr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(relMounts(s.OSMountpoints), ","); got != "boot,boot/efi" {
+		t.Fatalf("os mountpoints = %q, want boot,boot/efi", got)
+	}
+	if err := os.WriteFile(sr, []byte(`{"version":2,"filesystems":[{"mount":"/"},{"mount":"/var"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = readStorageResultSummary(sr); err != nil || strings.Join(relMounts(s.OSMountpoints), ",") != "var" {
+		t.Fatalf("single set holding /: os mountpoints %v, err %v", s.OSMountpoints, err)
+	}
+}
+
+// Persistent sets are never written: an image_wins entry that reaches one is a
+// configuration error, refused before anything is extracted.
+func TestImageWinsIntoPersistentRefused(t *testing.T) {
+	tmp := t.TempDir()
+	pm := filepath.Join(tmp, "mounts")
+	cfg := filepath.Join(tmp, "filter.json")
+	sr := filepath.Join(tmp, "storage-result.json")
+	for p, body := range map[string]string{
+		pm:  "tmpfs /sysroot tmpfs rw 0 0\n",
+		cfg: `{"image_wins": ["home/alice/.bashrc"]}`,
+		sr: `{"version":2,"sets":[{"name":"os","role":"os","filesystems":[{"mount":"/"}]},
+			{"name":"home","role":"data","persistent":true,"filesystems":[{"mount":"/home"}]}]}`,
+	} {
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stderr, rc := runEnv(t, "--proc-mounts", pm, "--sysroot", "/sysroot", "--config", cfg, "--storage-result", sr,
+		"--luna-token", "x", "--osimage-file", "img.tar.bz2", "--luna-install-script", "/nonexistent-for-test", "--skip-download")
+	if rc != 3 || !strings.Contains(stderr, "persistent mountpoint /home") {
+		t.Fatalf("want exit 3 naming the persistent mountpoint; rc=%d stderr=%s", rc, stderr)
+	}
+}
+
+// A bad command line is the same on every attempt: exit 3 parks with a
+// fatal_config line, as in every lpart tool; exit 2 is reserved for safety
+// refusals.
+func TestBadFlagIsFatalConfig(t *testing.T) {
+	var out, errb bytes.Buffer
+	rc := run([]string{toolName, "--no-such-flag"}, &out, &errb)
+	if rc != 3 || !strings.Contains(errb.String(), "fatal_config=usage") {
+		t.Fatalf("rc=%d (want 3), stderr=%s", rc, errb.String())
+	}
+}

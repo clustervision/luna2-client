@@ -4,7 +4,7 @@
 //
 // Transport is curl, not net/http, on purpose: curl already ships in the
 // install initramfs and is the carrier every other Luna request uses
-// (luna2-start.sh, lpartinputs), and avoiding net/http keeps the Go HTTP/TLS
+// (luna-installer.sh, lpartinputs), and avoiding net/http keeps the Go HTTP/TLS
 // stack — and its size and CVE surface — out of the on-node binary. This
 // mirrors internal/lpartinputs exactly, in the opposite direction (POST vs GET).
 //

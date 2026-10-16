@@ -5,10 +5,10 @@ import (
 	"fmt"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/jsonstrict"
-
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/raidlevel"
 )
 
@@ -17,6 +17,11 @@ import (
 // pattern-match the class of failure. Unlike the v2-era validator this no
 // longer mirrors the NEWTREE Bash json_v2.sh byte-for-byte (see
 // decisions/0003); the grammar it validates did not exist in the Bash tree.
+//
+// A rule refuses a layout only when the builders cannot lay it down or
+// cleanup would damage the node. A layout that installs but looks like a
+// mistake is accepted as written, with a line in Config.Warnings for the
+// operator.
 //
 // Mode-specific rules (e.g. "a diskful mode needs exactly one os set") are
 // NOT enforced here — the config is validated independently of install_mode.
@@ -37,21 +42,25 @@ func (c *Config) ValidateRaw(raw []byte) error {
 	return c.validateRaw(raw)
 }
 
+// warnf records one warning for the operator; the layout stays accepted.
+func (c *Config) warnf(format string, args ...any) {
+	c.Warnings = append(c.Warnings, fmt.Sprintf(format, args...))
+}
+
 func (c *Config) validateRaw(raw []byte) error {
-	// encoding/json merges repeated (and case-variant) keys into one struct,
-	// so an earlier occurrence could set a field every key check below misses.
+	c.Warnings = nil
+	// encoding/json keeps the last of repeated (or case-variant) keys and
+	// merges repeated slices, so an earlier value can survive unseen.
 	if err := jsonstrict.Check(raw); err != nil {
-		return fmt.Errorf("config_validation: %w", err)
+		c.warnf("%v", err)
 	}
 	var top map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &top); err != nil {
 		return fmt.Errorf("config_validation: top-level: %w", err)
 	}
-	if v, ok := top["comment"]; ok {
-		var str string
-		if err := json.Unmarshal(v, &str); err != nil {
-			return fmt.Errorf("config_validation: top-level: comment must be a string")
-		}
+	var comment string
+	if v, ok := top["comment"]; ok && json.Unmarshal(v, &comment) != nil {
+		c.warnf("top-level: comment is not a string and is ignored")
 	}
 
 	if err := unknownKey(top, allowedTopLevel, "top-level"); err != nil {
@@ -96,14 +105,14 @@ func (c *Config) validateRaw(raw []byte) error {
 		if i < len(setsArr) {
 			setRaw = setsArr[i]
 		}
-		if err := c.Sets[i].validate(i, setRaw); err != nil {
+		if err := c.validateSet(i, setRaw); err != nil {
 			return err
 		}
 	}
 	if err := c.validateSetNameCollisions(); err != nil {
 		return err
 	}
-	if err := c.validateUniqueMountpoints(); err != nil {
+	if err := c.validateMountpoints(); err != nil {
 		return err
 	}
 
@@ -158,8 +167,10 @@ func looksLikeJSONArray(raw json.RawMessage) bool {
 }
 
 //nolint:gocyclo,revive // a flat schema validator reads better than a fragmented one
-func (s *Set) validate(idx int, raw json.RawMessage) error {
+func (c *Config) validateSet(idx int, raw json.RawMessage) error {
+	s := &c.Sets[idx]
 	pfx := fmt.Sprintf("sets[%d]", idx)
+	ref := setRef(idx, s.Name)
 
 	if len(raw) == 0 {
 		var err error
@@ -197,9 +208,6 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 	if s.Name == "" {
 		return fmt.Errorf("config_validation: %s.name is required", pfx)
 	}
-	if err := validateSetName(idx, s.Name); err != nil {
-		return err
-	}
 
 	switch s.Role {
 	case "os", "data":
@@ -217,8 +225,8 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 		return fmt.Errorf("config_validation: %s.selection unsupported: '%s' (allowed: discover, manual)", pfx, s.Selection)
 	}
 
-	if err := s.validateMatch(idx); err != nil {
-		return err
+	if s.Match != nil {
+		c.checkMatch(ref, s.Match)
 	}
 
 	// save pins a discovered layout back to the node (decisions/0008); it is
@@ -226,14 +234,14 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 	if s.Save && s.Selection != "discover" {
 		return fmt.Errorf("config_validation: %s.save is only valid on a selection=discover set", pfx)
 	}
+	if s.IncludeSAN && s.Selection != "discover" {
+		return fmt.Errorf("config_validation: %s.include_san is only valid on a selection=discover set", pfx)
+	}
 
-	// persistent is a data-set guarantee. The osimage install wipes and
-	// rewrites the os root on every install while excluding /boot, so a
-	// "persistent" os set was neither protected nor rebuilt consistently.
+	// The osimage install rewrites the os root on every install (excluding
+	// /boot), so a "persistent" os set is neither protected nor consistent.
 	if s.Persistent && s.Role != "data" {
-		return fmt.Errorf(
-			"config_validation: %s: persistent=true is only valid on a role=data set (the os set's root is rewritten by every osimage install, so it cannot be hands-off)",
-			setRef(idx, s.Name))
+		c.warnf("%s: persistent=true protects nothing on the os set: every osimage install rewrites its root; only a role=data set can be hands-off", ref)
 	}
 
 	// A persistent set must be pinned to explicit devices: "hands-off" is a
@@ -268,37 +276,39 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 	if err != nil {
 		return fmt.Errorf("config_validation: %s.raid %v", pfx, err)
 	}
+	if _, ok := setRaw["allow_degraded"]; ok && (r == raidlevel.RaidNone || r == raidlevel.Raid0) {
+		return fmt.Errorf("config_validation: %s.allow_degraded is valid on a redundant raid set only (raid 1, 5, 6 or 10)", pfx)
+	}
+
+	if err := c.checkSetName(ref, s, r); err != nil {
+		return err
+	}
 
 	if s.Spares < 0 {
 		return fmt.Errorf("config_validation: %s.spares must be >= 0, got: %d", pfx, s.Spares)
 	}
-	// A hot spare only ever replaces a failed member of a redundant array.
-	// raid none has no array and raid0 cannot rebuild a member, so a spare
-	// there is a disk taken from the pool for nothing (and mdadm has no
-	// array to hand it to).
+	// A hot spare only ever replaces a failed member of a redundant array;
+	// raid none has no array and raid0 cannot rebuild a member.
 	if s.Spares > 0 && (r == raidlevel.RaidNone || r == raidlevel.Raid0) {
-		return fmt.Errorf(
-			"config_validation: %s: raid=%s takes no spares, got spares=%d (a hot spare only replaces a failed member of a redundant array: raid 1, 5, 6 or 10)",
-			setRef(idx, s.Name), s.Raid, s.Spares)
+		c.warnf("%s: raid=%s takes no spares, so spares=%d is ignored (a hot spare only replaces a failed member of a redundant array: raid 1, 5, 6 or 10)", ref, s.Raid, s.Spares)
+		s.Spares = 0
+	}
+	if s.Count < 0 {
+		c.warnf("%s: count=%d must not be negative", ref, s.Count)
 	}
 
 	// Active members = members - spares. A manual set lists every member in
 	// devices[], spares included; a discover set resolves count active members
-	// (0 = the level's minimum) plus spares on top.
-	active := 0
-	if s.Count < 0 {
-		return fmt.Errorf("config_validation: %s: count=%d must not be negative", setRef(idx, s.Name), s.Count)
-	}
-	switch s.Selection {
-	case "manual":
-		active = len(s.Devices) - s.Spares
-		if len(s.Devices) > 0 && active < 1 {
-			return fmt.Errorf(
-				"config_validation: %s: spares=%d leaves %d active device(s) of the %d in devices[] (devices[] lists every member, spares included)",
-				setRef(idx, s.Name), s.Spares, active, len(s.Devices))
+	// (0 = the level's minimum) plus spares on top. A manual layout written
+	// when the installer ignored spares lists only the members: its spares
+	// are dropped, and it installs as it always did.
+	active := s.Count
+	if s.Selection == "manual" {
+		if n := len(s.Devices); s.Spares > 0 && !r.AllowsCount(n-s.Spares) && r.AllowsCount(n) {
+			c.warnf("%s: spares=%d is ignored: devices[] lists only the members; add the spare disk(s) to devices[]", ref, s.Spares)
+			s.Spares = 0
 		}
-	case "discover":
-		active = s.Count
+		active = len(s.Devices) - s.Spares
 	}
 
 	// OS-set RAID policy (operator decision 2026-07-16): the OS lives on
@@ -316,16 +326,9 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 				pfx, s.Raid, s.Raid)
 		}
 		switch active {
-		case 0, 1, 2, 4: // 0 = discover count unset (defaults per raid mode), or no devices yet
+		case 0, 1, 2, 4: // 0 = discover count unset (defaults per raid mode)
 		default:
-			if s.Spares > 0 {
-				return fmt.Errorf(
-					"config_validation: %s: the OS set uses exactly 1, 2 or 4 drives (raid none/1/0/10), got %d active (%d devices minus spares=%d)",
-					setRef(idx, s.Name), active, active+s.Spares, s.Spares)
-			}
-			return fmt.Errorf(
-				"config_validation: %s: the OS set uses exactly 1, 2 or 4 drives (raid none/1/0/10), got %d",
-				pfx, active)
+			return fmt.Errorf("config_validation: %s: the OS set uses exactly 1, 2 or 4 drives (raid none/1/0/10), got %s", ref, activeSpec(s, active))
 		}
 	}
 
@@ -336,14 +339,7 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 			return fmt.Errorf("config_validation: %s.devices[] is required for selection=manual", pfx)
 		}
 		if !r.AllowsCount(active) {
-			if s.Spares > 0 {
-				return fmt.Errorf(
-					"config_validation: %s: raid=%s needs %s active, but devices[] lists %d with spares=%d (%d active)",
-					setRef(idx, s.Name), s.Raid, countSpec(r), len(s.Devices), s.Spares, active)
-			}
-			return fmt.Errorf(
-				"config_validation: %s: raid=%s needs %s, but devices[] lists %d",
-				pfx, s.Raid, countSpec(r), len(s.Devices))
+			return fmt.Errorf("config_validation: %s: raid=%s needs %s, but devices[] lists %s", ref, s.Raid, countSpec(r), activeSpec(s, active))
 		}
 	case "discover":
 		if s.Count != 0 && !r.AllowsCount(s.Count) {
@@ -364,51 +360,35 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 			return fmt.Errorf("config_validation: %s.volumes: %w", pfx, err)
 		}
 	}
+	names := make(map[string]int, len(s.Volumes))
 	for j := range s.Volumes {
+		v := &s.Volumes[j]
 		var volRaw json.RawMessage
 		if j < len(volRaws) {
 			volRaw = volRaws[j]
 		}
-		if err := s.Volumes[j].validate(idx, j, volRaw); err != nil {
+		if err := v.validate(idx, j, volRaw); err != nil {
 			return err
 		}
-		v := &s.Volumes[j]
-		if err := validateVolumeName(idx, s.Name, j, v.Name, v.Provider == "lvm"); err != nil {
+		// lvcreate refuses a second LV of the same name, and the partition
+		// number predictor identifies a volume by its name.
+		if prev, dup := names[v.Name]; dup {
+			return fmt.Errorf(
+				"config_validation: %s: volume name %q is used by volumes[%d] and volumes[%d]; volume names must be unique within a set (they are the LV names of the volume group)",
+				ref, v.Name, prev, j)
+		}
+		names[v.Name] = j
+		vref := volRef(idx, s.Name, j, v.Name)
+		if err := c.checkVolumeName(vref, v); err != nil {
 			return err
 		}
-		if err := validateVolumeSize(idx, s.Name, j, v); err != nil {
+		if err := c.checkVolumeSize(vref, v); err != nil {
 			return err
-		}
-	}
-	if err := s.validateVolumeNamesUnique(idx); err != nil {
-		return err
-	}
-	if err := s.validateMountpoints(idx); err != nil {
-		return err
-	}
-
-	// volumes[].raid is not a thing — raid is a set property.
-	for _, vol := range volRaws {
-		var m map[string]json.RawMessage
-		if err := json.Unmarshal(vol, &m); err != nil {
-			continue
-		}
-		if _, ok := m["raid"]; ok {
-			return fmt.Errorf("config_validation: %s: volumes[].raid is not supported; use the set raid field", pfx)
 		}
 	}
 
-	if err := s.validatePartitionOrder(idx, r); err != nil {
+	if err := validateLayout(idx, s, r); err != nil {
 		return err
-	}
-	lvmHundred := 0
-	for _, v := range s.Volumes {
-		if v.Provider == "lvm" && v.Size == sizeRest {
-			lvmHundred++
-		}
-	}
-	if lvmHundred > 1 {
-		return fmt.Errorf("config_validation: %s: at most one lvm volume per set may use size=100%%", pfx)
 	}
 
 	// OS set: exactly one root volume, and a UEFI ESP.
@@ -434,7 +414,7 @@ func (s *Set) validate(idx int, raw json.RawMessage) error {
 		}
 	}
 
-	return s.validateDevicesConsistent(idx)
+	return c.validateDevices(idx, s)
 }
 
 // countSpec renders the member-count requirement for a raid level for use in
@@ -448,6 +428,15 @@ func countSpec(r raidlevel.Raid) string {
 		return fmt.Sprintf("exactly %d device(s)", min)
 	}
 	return fmt.Sprintf("%d-%d device(s)", min, max)
+}
+
+// activeSpec renders a manual set's active member count, naming the spares
+// when they account for the difference with devices[].
+func activeSpec(s *Set, active int) string {
+	if s.Spares == 0 {
+		return strconv.Itoa(active)
+	}
+	return fmt.Sprintf("%d active (%d devices minus spares=%d)", active, len(s.Devices), s.Spares)
 }
 
 func (v *Volume) validate(setIdx, volIdx int, raw json.RawMessage) error {
@@ -505,9 +494,6 @@ func (v *Volume) validate(setIdx, volIdx int, raw json.RawMessage) error {
 	}
 
 	if v.Provider == "partition" {
-		if v.Size == "" {
-			return fmt.Errorf("config_validation: %s.size is required for provider=partition", vpfx)
-		}
 		switch {
 		case v.Mountpoint == "/boot/efi" && v.FS == "vfat":
 		case v.Mountpoint == "swap" && v.FS == "swap":
@@ -535,12 +521,8 @@ func (v *Volume) validate(setIdx, volIdx int, raw json.RawMessage) error {
 	return nil
 }
 
-// validateDevicesConsistent enforces that every device path in a manual set
-// is a supported style and that all paths in a set share one style.
-//
-// Supported styles are the kernel name (/dev/sdX, /dev/vdX, /dev/nvme*) and
-// the whole-disk udev links /dev/disk/by-id and /dev/disk/by-path; every other
-// /dev/disk link is refused (see checkDiskLinkStyle).
+// validateDevices enforces that every device path in a manual set is a
+// supported style and that all paths in a set share one style.
 //
 // Device-mapper / multipath paths (/dev/mapper/*, /dev/dm-*) are REFUSED as
 // set devices: partition naming on dm devices has no reliable convention
@@ -550,23 +532,46 @@ func (v *Volume) validate(setIdx, volIdx int, raw json.RawMessage) error {
 // multipath is a designed, tested feature. (FTA v2 BE-N3 / CCF-8, barrier
 // NB-4.) This check also runs for SINGLE-device sets, which previously
 // skipped style classification entirely.
-func (s *Set) validateDevicesConsistent(idx int) error {
+//
+// A by-uuid link of a whole disk names the filesystem ON it: partitioning
+// destroys that filesystem, so the link is gone and every later boot fails
+// "device not found"; it is refused. The other /dev/disk links (by-label,
+// by-partuuid, by-partlabel, by-diskseq) and a path that can name no disk
+// (a blank, an unclean path, a directory) fail the same way on the node and
+// are warned about.
+func (c *Config) validateDevices(idx int, s *Set) error {
+	ref := setRef(idx, s.Name)
 	var styleOf SelectorType
-	for i, d := range s.EffectiveDevices() {
+	for i, d := range s.Devices {
 		if strings.HasPrefix(d, "/dev/mapper/") || strings.HasPrefix(d, "/dev/dm-") {
 			return fmt.Errorf(
 				"config_validation: sets[%d].devices: device-mapper/multipath path %q is not supported as a set device (dm partition naming has no reliable convention); use the underlying disk's by-id, by-path, or kernel name",
 				idx, d)
 		}
-		if err := checkDevicePathForm(idx, s.Name, d); err != nil {
-			return err
-		}
-		if err := checkDiskLinkStyle(idx, s.Name, d); err != nil {
-			return err
-		}
 		st, err := selectorTypeOf(d)
 		if err != nil {
 			return fmt.Errorf("config_validation: %w", err)
+		}
+		if rest, ok := strings.CutPrefix(d, "/dev/disk/"); ok {
+			dir, name, _ := strings.Cut(rest, "/")
+			switch {
+			case dir == "by-uuid":
+				return fmt.Errorf(
+					"config_validation: %s: device %q is a by-uuid link, which names the filesystem on the disk, not the disk: partitioning removes it, so the next boot fails \"device not found\"; use the disk's /dev/disk/by-id or /dev/disk/by-path link or its kernel name",
+					ref, d)
+			case dir != "by-id" && dir != "by-path":
+				c.warnf("%s: device %q is a /dev/disk/%s link, which does not name the whole disk stably across partitioning and reboots; use the disk's /dev/disk/by-id or /dev/disk/by-path link or its kernel name", ref, d, dir)
+			case name == "" || strings.Contains(name, "/"):
+				c.warnf("%s: device %q must be /dev/disk/%s/<link name>", ref, d, dir)
+			}
+		}
+		switch {
+		case strings.ContainsFunc(d, func(r rune) bool { return r <= ' ' || r == 0x7f }):
+			c.warnf("%s: device %q contains a blank or control character", ref, d)
+		case path.Clean(d) != d:
+			c.warnf("%s: device %q is not a clean path (write it as %q)", ref, d, path.Clean(d))
+		case d == "/dev/disk":
+			c.warnf("%s: device %q is a directory, not a disk", ref, d)
 		}
 		if i == 0 {
 			styleOf = st
@@ -579,60 +584,4 @@ func (s *Set) validateDevicesConsistent(idx int) error {
 		}
 	}
 	return nil
-}
-
-// checkDevicePathForm refuses device strings that can name no disk: blanks or
-// control characters ("/dev/sda "), a path that is not in clean form
-// ("/dev/../etc/passwd", "/dev//sda", "/dev/sda/"), the directories /dev and
-// /dev/disk themselves, and a /dev/disk link that is not exactly
-// /dev/disk/<kind>/<name>. They used to pass validation and failed on the
-// node as "device not found" -- after the layout was accepted everywhere.
-func checkDevicePathForm(idx int, setName, dev string) error {
-	bad := func(why string) error {
-		return fmt.Errorf("config_validation: %s: device %q %s", setRef(idx, setName), dev, why)
-	}
-	for _, r := range dev {
-		if r <= ' ' || r == 0x7f {
-			return bad("contains a blank or control character")
-		}
-	}
-	if path.Clean(dev) != dev {
-		return bad(fmt.Sprintf("is not a clean path (write it as %q)", path.Clean(dev)))
-	}
-	if dev == "/dev" || dev == "/dev/disk" {
-		return bad("is a directory, not a disk")
-	}
-	if rest, ok := strings.CutPrefix(dev, "/dev/disk/"); ok {
-		dir, name, found := strings.Cut(rest, "/")
-		if !found || name == "" || strings.Contains(name, "/") {
-			return bad(fmt.Sprintf("must be /dev/disk/%s/<link name>", dir))
-		}
-	}
-	return nil
-}
-
-// checkDiskLinkStyle refuses /dev/disk links that do not name a whole disk
-// stably across the install. A by-uuid (or by-label) link of a whole disk
-// names the filesystem ON it: partitioning destroys that filesystem, so the
-// link is gone and every later boot fails "device not found". by-partuuid and
-// by-partlabel name a partition, which the installer would zap; by-diskseq
-// changes on every boot. Only by-id and by-path name the disk itself.
-func checkDiskLinkStyle(idx int, setName, dev string) error {
-	rest, ok := strings.CutPrefix(dev, "/dev/disk/")
-	if !ok {
-		return nil
-	}
-	dir, _, _ := strings.Cut(rest, "/")
-	switch dir {
-	case "by-id", "by-path":
-		return nil
-	case "by-uuid":
-		return fmt.Errorf(
-			"config_validation: %s: device %q is a by-uuid link, which names the filesystem on the disk, not the disk: partitioning removes it, so the next boot fails \"device not found\"; use the disk's /dev/disk/by-id or /dev/disk/by-path link or its kernel name",
-			setRef(idx, setName), dev)
-	default:
-		return fmt.Errorf(
-			"config_validation: %s: device %q is a /dev/disk/%s link, which does not name the whole disk stably across partitioning and reboots; use the disk's /dev/disk/by-id or /dev/disk/by-path link or its kernel name",
-			setRef(idx, setName), dev, dir)
-	}
 }

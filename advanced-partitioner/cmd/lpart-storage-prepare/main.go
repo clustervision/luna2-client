@@ -31,7 +31,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cleanup"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
@@ -49,6 +51,7 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/partition"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/raid"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sanitize"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/storagehealth"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sysenv"
 )
@@ -56,6 +59,7 @@ import (
 const toolName = "lpart-storage-prepare"
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, toolName)
 	cli.EnsureInstallerPath()
 	os.Exit(run(os.Args, os.Stdout, os.Stderr))
 }
@@ -92,9 +96,7 @@ const (
 	defaultResolved   = defaultRuntimeDir + "/storage-resolved.json"
 )
 
-// matches bin/lpart-storage-prepare for easy diffing.
-//
-//nolint:gocyclo // command-flow function intentionally linear; structure
+//nolint:gocyclo // command-flow function intentionally linear; structure matches bin/lpart-storage-prepare for easy diffing.
 func run(argv []string, stdout, stderr io.Writer) int {
 	if len(argv) == 0 {
 		argv = []string{toolName}
@@ -105,7 +107,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	f.Bind(fs)
 	fs.StringVar(&f.ConfigPath, "config", "", "Path to v2 storage JSON")
 	fs.BoolVar(&f.Wipe, "wipe", false, "Required to actually touch disks; --dry-run is the alternative")
-	fs.StringVar(&f.ExpectHost, "expect-host", "", "Refuse to run unless `hostname -s` matches this value")
+	fs.StringVar(&f.ExpectHost, "expect-host", "", "Refuse to run unless the hostname matches this value (in full when both carry a domain, else the short names)")
 	fs.StringVar(&f.ResultOut, "result-out", defaultResultOut, "Where to write storage-result.json")
 	fs.StringVar(&f.ResolvedOut, "resolved-out", defaultResolved, "Where to write storage-resolved.json")
 	fs.BoolVar(&f.Details, "details", true, "Verbose: extended device inventory at startup + the final blkid/pvs/vgs/lvs/mdadm evidence (default on; --details=false to quieten)")
@@ -146,13 +148,14 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	// Installer-env guard.
 	logger.SetStage("installer_check")
-	// Outside the Luna installer this tool must never touch a disk; the
-	// condition does not change on retry, so it is a refusal (exit 2).
+	// Outside the Luna installer this tool must never touch a disk. Exit 1, as
+	// in every lpart tool: the installer's cmdline always passes the guard.
 	if err := sysenv.RequireInstallerEnv(sysenv.Options{
 		CmdlinePath:       f.CmdlinePath,
 		AllowNonInstaller: f.AllowNonInstaller,
 	}); err != nil {
-		return cli.ExitSafetyRefusal(stderr, toolName, "not-installer-env", "%v", err)
+		errln(stderr, "%v", err)
+		return 1
 	}
 
 	// Command preflight (the FAT tool names come out of this). A tool missing
@@ -188,6 +191,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			// An invalid disklayout fails identically on every retry: park for
 			// an operator (exit 3) instead of retrying every 30 s for ever.
 			return cli.ExitFatalConfig(stderr, toolName, "config-validation", "%v", verr)
+		}
+		for _, w := range loaded.Warnings {
+			logger.Warn(w)
 		}
 		cfg = loaded
 	}
@@ -300,6 +306,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	sp := &setProcessor{
 		runner:   runner,
 		logger:   logger,
+		lateWait: selector.LateDeviceWait,
 		selector: selector.New(selector.Options{Runner: runner, Logger: logger, CandidatesOut: stderr}),
 		cleaner:  cleanup.New(cleanup.Options{Runner: runner, Logger: logger}),
 		part:     partition.New(partition.Options{Runner: runner, Logger: logger, DryRun: f.DryRun}),
@@ -308,6 +315,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		fs:       fsmod.New(fsmod.Options{Runner: runner, Logger: logger, MkfsFatName: tools.MkfsFat}),
 		mount:    mounter,
 		checker:  fscheck.New(fscheck.Options{Runner: runner, Logger: logger, FsckVfatCmd: tools.FsckVfat}),
+
+		sanitizeProgress: filepath.Join(filepath.Dir(f.ResultOut), sanitize.ProgressFile),
 	}
 
 	// Discover the disk pool once: selection=discover resolution and sanitize
@@ -448,6 +457,8 @@ type setProcessor struct {
 	pool     []discover.Device // discovered disks for selection=discover + sanitize
 	// sanitizeReadBack overrides the sanitize read-back verification (tests).
 	sanitizeReadBack func(disk string) (bool, error)
+	// sanitizeProgress records the disks a sanitize erased, for a retry.
+	sanitizeProgress string
 	// protected holds the canonical kernel paths of every PERSISTENT set's
 	// disks (filled by reserveManualSets). It is handed to cleanup as an
 	// independent barrier: no destructive cleanup step may touch these
@@ -460,6 +471,9 @@ type setProcessor struct {
 	// set's PRESENT devices, and the configured devices absent from the node.
 	manualDisks map[string][]selector.Resolved
 	missing     map[string][]string
+	// lateWait bounds the wait for a manual set's device that is not there
+	// yet (selector.LateDeviceWait; zero in tests).
+	lateWait time.Duration
 	// classifyFn overrides the storagehealth.Classify health probe (tests).
 	classifyFn func(ctx context.Context, set *v2.Set, disks []selector.Resolved) storagehealth.Verdict
 	// poolErr is the device-discovery failure, when listing the pool failed.
@@ -689,10 +703,6 @@ func (sp *setProcessor) process(ctx context.Context, p plannedSet, detectedFirmw
 	return res, resolvedRecord, nil
 }
 
-// existingBootPartitions returns the ESP and BIOS boot partition NUMBERS of an
-// existing os-set layout, as the partition builder numbered them: the BIOS
-// boot partition (EF02) is partition 1 when the disk has one, and the ESP
-// follows it (Set.PartitionNumber). 0 = none.
 // mountExistingAdvice is the operator hint of a mount-existing refusal. A
 // persistent set is never repartitioned or formatted, in any mode: pointing
 // at install_mode full (which the node may already run) sent the operator in
@@ -704,6 +714,10 @@ func mountExistingAdvice(set *v2.Set) string {
 	return "it is not repartitioned in this mode -- operator review required (install_mode full rebuilds the set)"
 }
 
+// existingBootPartitions returns the ESP and BIOS boot partition NUMBERS of an
+// existing os-set layout, as the partition builder numbered them: the BIOS
+// boot partition (EF02) is partition 1 when the disk has one, and the ESP
+// follows it (Set.PartitionNumber). 0 = none.
 func existingBootPartitions(set *v2.Set, biosBoot bool) (esp, bios int) {
 	if set.Role != "os" {
 		return 0, 0
@@ -799,7 +813,7 @@ func (sp *setProcessor) activateExisting(ctx context.Context, set *v2.Set, rmode
 	// Assemble with EXPLICIT members (md auto-assembly is disabled for the
 	// whole install), then vgchange; shared with the health probe so both see
 	// the same devices. See storagehealth.ActivateExisting.
-	storagehealth.ActivateExisting(ctx, sp.runner, set, paths, sp.logger)
+	storagehealth.ActivateExisting(ctx, sp.runner, set, paths, sp.logger, false)
 }
 
 // protectedPaths renders the protected-disk set as a path slice for

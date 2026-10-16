@@ -115,7 +115,7 @@ func assertNeverRepairsDestructively(t *testing.T, calls []executor.CommandSpec)
 // replay, which preserves committed data), never by xfs_repair -L.
 func TestCheckXFSDirtyLogReplaysJournalSafely(t *testing.T) {
 	s := &seqRunner{responses: map[string][]executor.FakeResponse{
-		"xfs_repair -n": {stubExit(0)}, // clean once mount+umount replayed the log
+		"xfs_repair -n": {stubExit(1), stubExit(0)}, // dirty, then clean once mount+umount replayed the log
 		"mount -t":      {stubExit(0)},
 		"umount":        {stubExit(0)},
 	}}
@@ -140,7 +140,7 @@ func TestCheckXFSDirtyLogReplaysJournalSafely(t *testing.T) {
 
 func TestCheckXFSUncleanAfterReplayIsUnhealthy(t *testing.T) {
 	s := &seqRunner{responses: map[string][]executor.FakeResponse{
-		"xfs_repair -n": {stubExit(2)}, // still unclean after the replay
+		"xfs_repair -n": {stubExit(2), stubExit(2)}, // still unclean after the replay
 		"mount -t":      {stubExit(0)},
 		"umount":        {stubExit(0)},
 	}}

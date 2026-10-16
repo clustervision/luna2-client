@@ -40,6 +40,21 @@ func TestParseClearableBootNumsKeepsLunaToo(t *testing.T) {
 	}
 }
 
+// Network boot entries are kept whatever their case or protocol; only an
+// entry that is clearly not one (a disk, a shell) is deleted.
+func TestParseClearableBootNumsKeepsEveryNetworkEntry(t *testing.T) {
+	body := "Boot0001* UEFI HTTPv4 (MAC:001122334455)\n" +
+		"Boot0002* UEFI: IPv6 Intel(R) Ethernet\n" +
+		"Boot0003* Onboard NIC (IPV4)\n" +
+		"Boot0004* pxe boot\n" +
+		"Boot0005* NETWORK\n" +
+		"Boot0006* UEFI OS\n" +
+		"Boot0007* EFI Internal Shell\n"
+	if got := parseClearableBootNums(body); !equalSlices(got, []string{"0006", "0007"}) {
+		t.Fatalf("got %v, want only 0006 and 0007 deleted", got)
+	}
+}
+
 func TestTrinityNumsFromOutput(t *testing.T) {
 	got := trinityNumsFromOutput(sampleEFIOutput)
 	want := []string{"0001", "0002"}

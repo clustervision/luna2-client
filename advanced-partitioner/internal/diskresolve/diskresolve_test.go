@@ -69,9 +69,15 @@ func TestParseSize(t *testing.T) {
 		{"2048B", 2048, true},
 		{"2048", 2048, true},
 		{"8TB", 8 * tib, true}, // legacy two-letter form
+		{"8TiB", 8 * tib, true},
+		{"20gib", 20 * gib, true},
+		{"1.5T", 3 * tib / 2, true},
+		{"0.5g", gib / 2, true},
 		{"  16G ", 16 * gib, true},
 		{"", 0, false},
 		{"big", 0, false},
+		{"1.T", 0, false},
+		{"99999999999999999999G", 0, false},
 	}
 	for _, c := range cases {
 		got, err := ParseSize(c.in)
@@ -123,7 +129,7 @@ func TestResolveSmallestFirstWithinTolerance(t *testing.T) {
 		dev("/dev/sda", 500, "ssd"),
 		dev("/dev/sdb", 500, "ssd"),
 	}
-	got, err := Resolve(pool, Match{Tags: []string{"ssd"}}, 2, 0, 0)
+	got, err := Resolve(pool, Match{Tags: []string{"ssd"}}, 2, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -138,7 +144,7 @@ func TestResolveCountPlusSpares(t *testing.T) {
 		dev("/dev/sdb", 500, "ssd"),
 		dev("/dev/sdc", 500, "ssd"),
 	}
-	got, err := Resolve(pool, Match{}, 2, 1, 0)
+	got, err := Resolve(pool, Match{}, 2, 1, 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -149,7 +155,7 @@ func TestResolveCountPlusSpares(t *testing.T) {
 
 func TestResolveNotEnough(t *testing.T) {
 	pool := []discover.Device{dev("/dev/sda", 500, "ssd")}
-	if _, err := Resolve(pool, Match{Tags: []string{"ssd"}}, 2, 0, 0); err == nil {
+	if _, err := Resolve(pool, Match{Tags: []string{"ssd"}}, 2, 0, 0, nil); err == nil {
 		t.Fatal("expected not-enough-disks error")
 	}
 }
@@ -159,7 +165,7 @@ func TestResolveToleranceViolation(t *testing.T) {
 		dev("/dev/sda", 500, "ssd"),
 		dev("/dev/sdb", 2000, "ssd"), // 4x larger -> exceeds 5%
 	}
-	if _, err := Resolve(pool, Match{}, 2, 0, 5); err == nil {
+	if _, err := Resolve(pool, Match{}, 2, 0, 5, nil); err == nil {
 		t.Fatal("expected tolerance violation error")
 	}
 }
@@ -169,7 +175,7 @@ func TestResolveTagFilterExcludes(t *testing.T) {
 		dev("/dev/sda", 8000, "rotary"),
 		dev("/dev/nvme0n1", 2000, "ssd", "nvme"),
 	}
-	got, err := Resolve(pool, Match{Tags: []string{"nvme"}}, 1, 0, 0)
+	got, err := Resolve(pool, Match{Tags: []string{"nvme"}}, 1, 0, 0, nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -194,7 +200,7 @@ func TestResolveOrdersEqualDisksByIdentityNotKernelName(t *testing.T) {
 		{Name: "sdb", Path: "/dev/sdb", Size: size, WWN: "0x5000000000000002"},
 	}
 	for i, pool := range [][]discover.Device{bootA, bootB} {
-		got, err := Resolve(pool, Match{}, 1, 0, 0)
+		got, err := Resolve(pool, Match{}, 1, 0, 0, nil)
 		if err != nil {
 			t.Fatalf("boot %d: %v", i, err)
 		}
@@ -204,7 +210,24 @@ func TestResolveOrdersEqualDisksByIdentityNotKernelName(t *testing.T) {
 	}
 	// Size still comes first.
 	small := append([]discover.Device{{Name: "sdz", Path: "/dev/sdz", Size: size / 2, WWN: "0x5000000000000009"}}, bootA...)
-	if got, _ := Resolve(small, Match{}, 1, 0, 0); got[0].Name != "sdz" {
+	if got, _ := Resolve(small, Match{}, 1, 0, 0, nil); got[0].Name != "sdz" {
 		t.Fatalf("smallest disk first, got %s", got[0].Name)
+	}
+}
+
+// The set's own disks go first: equal disks are otherwise ordered by identity,
+// and a changed order must not move a set to other disks.
+func TestResolvePrefersTheSetsOwnDisks(t *testing.T) {
+	pool := []discover.Device{
+		{Name: "sda", Path: "/dev/sda", Size: 100, WWN: "0xa"},
+		{Name: "sdb", Path: "/dev/sdb", Size: 100, WWN: "0xb"},
+		{Name: "sdc", Path: "/dev/sdc", Size: 100, WWN: "0xc"},
+	}
+	got, err := Resolve(pool, Match{}, 2, 0, 0, map[string]bool{"/dev/sdc": true})
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	if got[0].Path != "/dev/sdc" || got[1].Path != "/dev/sda" {
+		t.Fatalf("want the own disk first, then identity order: got %s %s", got[0].Path, got[1].Path)
 	}
 }

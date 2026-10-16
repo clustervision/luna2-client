@@ -127,3 +127,20 @@ func TestGlobMatchCollapsesStars(t *testing.T) {
 		}
 	}
 }
+
+// An image_wins entry reaches a persistent mountpoint when it names it, lies
+// below it, or is a glob whose literal part sits above it.
+func TestPatternReaches(t *testing.T) {
+	for raw, want := range map[string]bool{
+		"home": true, "home/alice/.bashrc": true, "home/*": true, "var/*": true,
+		"etc/ssh/sshd_config": false, "homes/x": false, "etc/*": false,
+	} {
+		dir := "home"
+		if raw == "var/*" {
+			dir = "var/lib/data"
+		}
+		if got := ParsePattern(raw).Reaches(dir); got != want {
+			t.Errorf("%q reaches %q = %v, want %v", raw, dir, got, want)
+		}
+	}
+}

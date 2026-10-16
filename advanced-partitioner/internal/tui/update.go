@@ -225,7 +225,7 @@ func (m *Model) applyEvent(ev engine.InstallerEvent) {
 // FailureExitCode maps the failure class carried on EvInstallerFailed.Data
 // (any type exposing Fatal() bool — pipeline.FailureClass does) to the
 // process exit code: fatal/safety-refusal failures exit 3 — the code
-// luna2-start.sh PARKS on — everything else exits 1 (retry). FTA Cluster B
+// luna-installer.sh PARKS on — everything else exits 1 (retry). FTA Cluster B
 // (B1): the class used to be flattened to a hardcoded 1 here.
 func FailureExitCode(data any) int {
 	type classed interface{ Fatal() bool }

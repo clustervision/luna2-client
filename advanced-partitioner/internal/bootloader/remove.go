@@ -167,32 +167,41 @@ const mbrBootCodeLen = 440
 const biosBootWipeMax = 8 << 20
 
 // RemoveBIOSBootloader takes the local boot path away from a BIOS node whose
-// OS set does not ask for "first" -- the only value that installs GRUB for
-// BIOS. An earlier "first" install left GRUB's boot.img in the MBR of every
-// boot disk and its core.img in the BIOS boot (EF02) partition; with those in
-// place, a BIOS that tries the disk before (or after a failed) PXE boots the
-// stale install instead of asking the controller. So: zero the MBR boot code
-// (the first 440 bytes; the partition table is never touched) and the EF02
-// partition contents. Idempotent (already-zero areas are not rewritten),
-// dry-run aware, and it refuses anything that is not a whole disk.
+// OS set asks for bootloader "none". An earlier "first" install left GRUB's
+// boot.img in the MBR of every boot disk and its core.img in the BIOS boot
+// (EF02) partition; with those in place, a BIOS that tries the disk before (or
+// after a failed) PXE boots the stale install instead of asking the
+// controller. So: zero the MBR boot code (the first 440 bytes; the partition
+// table is never touched) and the EF02 partition contents -- only when both are
+// GRUB's; any other boot code is warned about and left. Idempotent (already-zero
+// areas are not rewritten), dry-run aware, and it refuses anything that is not
+// a whole disk.
 func RemoveBIOSBootloader(ctx context.Context, opts RemoveBIOSBootloaderOptions) error {
 	cleared, wiped := 0, 0
 	for _, disk := range opts.BootDevices {
+		parts, err := biosBootPartitions(ctx, opts.Runner, disk)
+		if err != nil {
+			if opts.Logger != nil {
+				opts.Logger.Warn(fmt.Sprintf("cannot list partitions of %s (%v): its boot code is left as it is", disk, err))
+			}
+			continue
+		}
+		why, err := notGRUBInstall(disk, parts)
+		if err != nil {
+			return err
+		}
+		if why != "" {
+			if opts.Logger != nil {
+				opts.Logger.Warn(fmt.Sprintf("%s: %s; its boot code is left as it is", disk, why))
+			}
+			continue
+		}
 		did, err := clearMBRBootCode(opts, disk)
 		if err != nil {
 			return err
 		}
 		if did {
 			cleared++
-		}
-		parts, err := biosBootPartitions(ctx, opts.Runner, disk)
-		if err != nil {
-			// The MBR code is what BIOS runs; without it core.img is
-			// unreachable, so a failed listing only costs the belt.
-			if opts.Logger != nil {
-				opts.Logger.Warn(fmt.Sprintf("cannot list partitions of %s (%v): BIOS boot partition not wiped", disk, err))
-			}
-			continue
 		}
 		for _, p := range parts {
 			did, err := wipeBIOSBootPartition(opts, p.Name)
@@ -330,6 +339,58 @@ func wipeBIOSBootPartition(opts RemoveBIOSBootloaderOptions, part string) (bool,
 		opts.Logger.UserInfo("wiped the BIOS boot partition %s (GRUB core image)", part)
 	}
 	return true, nil
+}
+
+// GRUB's i386-pc boot.img (the MBR) and diskboot.img (the first sector of
+// core.img) carry these strings; their offsets differ between GRUB builds.
+const (
+	grubBootImgMark = "GRUB \x00Geom"
+	grubCoreImgMark = "loading\x00"
+)
+
+// notGRUBInstall says why the boot code on disk is not a GRUB install to remove,
+// or "" when it is: boot.img in the MBR and core.img at the start of every BIOS
+// boot partition. A blank MBR or partition is what an interrupted removal
+// leaves, so it counts as GRUB's; anything else is not ours.
+func notGRUBInstall(disk string, parts []blockDev) (string, error) {
+	mbr, err := readFirstSector(disk, true)
+	if err != nil {
+		return "", err
+	}
+	blank := mbr == nil || mbr[510] != 0x55 || mbr[511] != 0xAA || allZero(mbr[:mbrBootCodeLen])
+	if !blank && !strings.Contains(string(mbr[:mbrBootCodeLen]), grubBootImgMark) {
+		return "the MBR boot code is not GRUB's", nil
+	}
+	if !blank && len(parts) == 0 {
+		return "GRUB is in the MBR but there is no BIOS boot partition with its core image", nil
+	}
+	for _, p := range parts {
+		s, err := readFirstSector(p.Name, false)
+		if err != nil {
+			return "", err
+		}
+		if s == nil || (!strings.Contains(string(s), grubCoreImgMark) && !allZero(s)) {
+			return fmt.Sprintf("the BIOS boot partition %s does not start with GRUB's core image", p.Name), nil
+		}
+	}
+	return "", nil
+}
+
+// readFirstSector returns the first 512 bytes of path, or nil when it is shorter.
+func readFirstSector(path string, wholeDisk bool) ([]byte, error) {
+	f, err := openRawTarget(path, wholeDisk, false)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+	sector := make([]byte, 512)
+	if n, err := f.ReadAt(sector, 0); n < len(sector) {
+		if err == nil || err == io.EOF {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read the first sector of %s: %w", path, err)
+	}
+	return sector, nil
 }
 
 func allZero(b []byte) bool {

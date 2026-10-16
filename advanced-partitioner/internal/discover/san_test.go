@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -29,10 +30,10 @@ func writeSys(t *testing.T, root, rel, body string) {
 	}
 }
 
-// The discover pool (and so sanitize's scope) holds LOCAL disks only: FC and
-// iSCSI LUNs and the paths of a multipath map are shared SAN storage. A disk
+// FC and iSCSI LUNs are listed and marked SAN (only a set that opts in uses
+// them, sanitize never); the paths of a multipath map are never listed. A disk
 // held by an LVM mapping (dm uuid LVM-...) is still a local disk.
-func TestListDevicesExcludesSANAndMultipathPaths(t *testing.T) {
+func TestListDevicesMarksSANAndExcludesMultipathPaths(t *testing.T) {
 	sys := t.TempDir()
 	for _, d := range []string{"sdd", "sde"} {
 		if err := os.MkdirAll(filepath.Join(sys, d, "holders", "dm-3"), 0o755); err != nil {
@@ -55,14 +56,19 @@ func TestListDevicesExcludesSANAndMultipathPaths(t *testing.T) {
 	for _, d := range devs {
 		names = append(names, d.Name)
 	}
-	if len(devs) != 2 || devs[0].Name != "sda" || devs[1].Name != "sdf" {
-		t.Fatalf("pool = %v, want [sda sdf] (fc, iscsi and multipath paths excluded)", names)
+	if strings.Join(names, " ") != "sda sdb sdc sdf" {
+		t.Fatalf("pool = %v, want [sda sdb sdc sdf] (multipath paths excluded)", names)
+	}
+	for _, d := range devs {
+		if want := d.Name == "sdb" || d.Name == "sdc"; d.SAN() != want {
+			t.Fatalf("%s: SAN() = %v, want %v", d.Name, d.SAN(), want)
+		}
 	}
 	if devs[0].Serial != "S4EVNX0" || devs[0].WWN != "0x5002538e00000001" {
 		t.Fatalf("identity not captured: %+v", devs[0])
 	}
-	if devs[0].IdentityKey() != "wwn:0x5002538e00000001" || devs[1].IdentityKey() != "serial:LV1" {
-		t.Fatalf("identity keys: %q %q", devs[0].IdentityKey(), devs[1].IdentityKey())
+	if devs[0].IdentityKey() != "wwn:0x5002538e00000001" || devs[3].IdentityKey() != "serial:LV1" {
+		t.Fatalf("identity keys: %q %q", devs[0].IdentityKey(), devs[3].IdentityKey())
 	}
 }
 

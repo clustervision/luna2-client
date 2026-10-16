@@ -46,6 +46,7 @@ import (
 const toolName = "lpart-bootloader-finalise"
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, toolName)
 	cli.EnsureInstallerPath()
 	os.Exit(run(os.Args, os.Stdout, os.Stderr))
 }
@@ -90,7 +91,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&f.ArchOverride, "arch", "", "(test) override detected architecture")
 
 	if err := fs.Parse(argv[1:]); err != nil {
-		return 2
+		// A bad command line is identical on every retry: park (exit 3).
+		return cli.ExitFatalConfig(stderr, toolName, "usage", "%v", err)
 	}
 	if f.ShowVersion {
 		_, _ = fmt.Fprintln(stdout, cli.Version())
@@ -148,6 +150,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	if err != nil {
 		return fail(stderr, "", err)
 	}
+	bctx.ReusesRoot = ic.InstallMode.IsLocal()
+	if bctx.LunaKernelOptions, err = bootloader.LunaKernelOptions(f.CmdlinePath); err != nil {
+		errln(stderr, "%v", err)
+		return 1
+	}
 	if err := writeBootContext(f.BootContextOut, bctx); err != nil {
 		errln(stderr, "write boot-context: %v", err)
 		return 1
@@ -161,13 +168,12 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.UserInfo("Sysroot: %s", bctx.Sysroot)
 
 	nativeFS := fsops.FS{DryRun: f.DryRun, Logger: logger}
+	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
 
 	logger.SetStage("write_fstab")
-	if err := bootloader.WriteFstab(nativeFS, bctx.Sysroot, bctx.StorageResult); err != nil {
+	if err := bootloader.WriteFstab(nativeFS, runner, bctx.Sysroot, bctx.StorageResult); err != nil {
 		return fail(stderr, "write fstab", err)
 	}
-
-	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
 
 	cleanup := func() {
 		bootloader.CleanupBindMounts(context.Background(), runner, bctx.Sysroot, nil)
@@ -203,12 +209,12 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		switch {
 		case bctx.StorageResult.StorageType == "memory":
 			logger.UserInfo("No bootloader installed (memory root): fstab written; the node PXE-boots every time")
+		case bctx.FirmwareMode != "uefi" && bctx.BootOrder != "none":
+			logger.UserInfo(`No bootloader installed (firmware is %q and the OS set's bootloader is "last": only "first" installs GRUB for BIOS): fstab written; a GRUB an earlier install left on the disk stays as the fallback behind PXE`, bctx.FirmwareMode)
 		case bctx.FirmwareMode != "uefi":
-			// Only "first" installs GRUB for BIOS. An earlier "first" left
-			// boot.img in each boot disk's MBR and core.img in the BIOS boot
-			// partition; a BIOS that tries the disk would boot that stale
-			// install, so take it away.
-			logger.UserInfo(`No bootloader installed (firmware is %q and the OS set's bootloader is not "first", the only value that installs GRUB for BIOS): fstab written; the node PXE-boots every time`, bctx.FirmwareMode)
+			// An earlier "first" left boot.img in each boot disk's MBR and
+			// core.img in the BIOS boot partition; "none" takes them away.
+			logger.UserInfo(`No bootloader installed (firmware is %q and the OS set asks for bootloader "none"): fstab written; the node PXE-boots every time`, bctx.FirmwareMode)
 			logger.SetStage("remove_bootloader")
 			if err := bootloader.RemoveBIOSBootloader(context.Background(), bootloader.RemoveBIOSBootloaderOptions{
 				Runner: runner, Logger: logger, FS: nativeFS,
@@ -247,10 +253,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 		// GRUB for BIOS keeps its core image in a BIOS boot partition and
 		// refuses to install without one. Only a layout rebuild creates it, so
-		// say which install mode does that rather than failing mid-install. A
-		// result that did not record the number (mount-existing) is checked
-		// against the disks themselves.
-		if bctx.StorageResult.BIOSBootPartition == 0 && !allHaveBIOSBootPartition(runner, bctx.StorageResult.BootDevices) {
+		// say which install mode does that rather than failing mid-install.
+		if bctx.StorageResult.BIOSBootPartition == 0 {
 			return cli.ExitSafetyRefusal(stderr, toolName, "missing-bios-boot-partition",
 				"GRUB for BIOS needs a BIOS boot partition for its core image and this node's layout has none; reinstall the node with install_mode full so the partition is created -- not running dracut/GRUB")
 		}
@@ -362,20 +366,6 @@ func fatalConfig(reason, format string, args ...any) error {
 	return &bootloader.FatalError{Kind: "config", Reason: reason, Err: fmt.Errorf(format, args...)}
 }
 
-// allHaveBIOSBootPartition reports whether every boot disk carries a BIOS boot
-// (EF02) partition; grub2-install needs one on each disk it installs to.
-func allHaveBIOSBootPartition(runner executor.Runner, disks []string) bool {
-	if len(disks) == 0 {
-		return false
-	}
-	for _, d := range disks {
-		if !bootloader.HasBIOSBootPartition(context.Background(), runner, d) {
-			return false
-		}
-	}
-	return true
-}
-
 // loadStorageResult decodes a storage-result.json file. The bash
 // predecessor handles two shapes:
 //
@@ -403,6 +393,9 @@ func loadStorageResult(path string) (result.StorageResult, error) {
 		for i := range multi.Sets {
 			s := &multi.Sets[i]
 			if s.Role == "os" {
+				if osSet != nil {
+					return result.StorageResult{}, fatalConfig("storage-result-invalid", "more than one os set in storage-result sets[] (%q and %q)", osSet.Name, s.Name)
+				}
 				osSet = s
 				continue
 			}

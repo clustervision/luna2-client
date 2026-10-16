@@ -3,8 +3,8 @@ package pipeline
 // Barrier-pinning tests for the exit-code integrity chain (FTA Cluster B).
 // The invariants pinned here:
 //   - a sub-tool's numeric exit survives as a typed stepError (B1);
-//   - exit 2 (safety refusal) and exit 3 (fatal config) classify FATAL,
-//     everything else retryable (B1);
+//   - exit 2 classifies as a safety refusal and exit 3 as fatal config, both
+//     non-retryable; everything else retryable (B1);
 //   - the terminal outcome is recorded on the Pipeline itself before the
 //     event channel closes, so consumers never depend on the lossy display
 //     bus (B2).
@@ -40,12 +40,12 @@ func TestClassifyFatalCodes(t *testing.T) {
 		err  error
 		want FailureClass
 	}{
-		{&stepError{Code: 2}, FailFatal},     // safety refusal (data fence)
+		{&stepError{Code: 2}, FailSafety},    // safety refusal (data fence)
 		{&stepError{Code: 3}, FailFatal},     // fatal config
 		{&stepError{Code: 1}, FailRetryable}, // generic failure
 		{&stepError{Code: 5}, FailRetryable},
 		{errors.New("plain"), FailRetryable},
-		{fmt.Errorf("wrap: %w", &stepError{Code: 2}), FailFatal},
+		{fmt.Errorf("wrap: %w", &stepError{Code: 2}), FailSafety},
 	}
 	for _, c := range cases {
 		if got := classify(c.err); got != c.want {
@@ -55,7 +55,7 @@ func TestClassifyFatalCodes(t *testing.T) {
 }
 
 func TestFailureClassFatal(t *testing.T) {
-	if !FailFatal.Fatal() || FailRetryable.Fatal() {
+	if !FailFatal.Fatal() || !FailSafety.Fatal() || FailRetryable.Fatal() {
 		t.Fatal("Fatal() mapping wrong")
 	}
 }
@@ -119,8 +119,8 @@ func TestRunStepArgvPreservesExitCode(t *testing.T) {
 			t.Fatalf("exit %d: stepError.Code = %d", code, se.Code)
 		}
 		if code == 2 || code == 3 {
-			if classify(err) != FailFatal {
-				t.Fatalf("exit %d must classify FailFatal (park), got retryable", code)
+			if !classify(err).Fatal() {
+				t.Fatalf("exit %d must park, got retryable", code)
 			}
 		} else if classify(err) != FailRetryable {
 			t.Fatalf("exit %d must classify FailRetryable", code)
@@ -176,5 +176,47 @@ func TestPostPhaseSkipsBootloaderForSanitize(t *testing.T) {
 	}
 	if err := p.runPost(); err == nil {
 		t.Fatal("auto post phase without storage-result.json must fail")
+	}
+}
+
+// An install-context the post phase cannot read parks (fatal) instead of
+// being taken for install_mode=auto.
+func TestPostPhaseRefusesAnUnreadableInstallContext(t *testing.T) {
+	for name, body := range map[string]string{"corrupt": "{not json", "unknown mode": `{"install_mode":"bogus"}`} {
+		t.Run(name, func(t *testing.T) {
+			rt := t.TempDir()
+			if err := os.WriteFile(rt+"/install-context.json", []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			p := New(context.Background(), Options{Phase: PhasePost, RuntimeDir: rt, LogDir: rt, StepTimeout: 10 * time.Second})
+			go func() {
+				for range p.Events() {
+				}
+			}()
+			if err := p.runPost(); classify(err) != FailFatal {
+				t.Fatalf("got %v (class %v), want a fatal failure", err, classify(err))
+			}
+		})
+	}
+}
+
+// A step that refused a degraded set leaves the marker the install template
+// reads to report install.degraded; any other refusal leaves none.
+func TestMarkDegradedFromStepStderr(t *testing.T) {
+	for _, c := range []struct {
+		line string
+		want bool
+	}{
+		{"lpart-storage-prepare: safety_refusal=degraded set \"os\" is degraded", true},
+		{"lpart-storage-prepare: safety_refusal=data-fence set \"os\" is broken", false},
+	} {
+		dir := t.TempDir()
+		p := New(context.Background(), Options{Phase: PhasePart, RuntimeDir: dir, LogDir: dir})
+		p.stepStderr = []string{c.line}
+		p.markDegraded()
+		_, err := os.Stat(p.rt(DegradedMarker))
+		if (err == nil) != c.want {
+			t.Fatalf("%q: marker present = %v, want %v", c.line, err == nil, c.want)
+		}
 	}
 }

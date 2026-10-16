@@ -3,26 +3,20 @@ package bootloader
 import (
 	"context"
 	"fmt"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
-	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
 )
 
-// Partition type identifiers as lsblk PARTTYPE / blkid PART_ENTRY_TYPE print
-// them (lowercase GUID for GPT, 0x.. for an MBR label).
-const (
-	gptTypeESP      = "c12a7328-f81f-11d2-ba4b-00a0c93ec93b" // EF00
-	gptTypeBIOSBoot = "21686148-6449-6e6f-744e-656564454649" // EF02
-	mbrTypeESP      = "0xef"
-)
+// gptTypeBIOSBoot is the BIOS boot partition type (EF02) as lsblk PARTTYPE /
+// blkid PART_ENTRY_TYPE print it.
+const gptTypeBIOSBoot = "21686148-6449-6e6f-744e-656564454649"
 
-// blockDev is one line of `lsblk -nPp -o NAME,TYPE,PARTTYPE,PKNAME,MOUNTPOINT`.
+// blockDev is one line of `lsblk -nPp -o NAME,TYPE,PARTTYPE`.
 type blockDev struct {
-	Name, Type, PartType, PKName, MountPoint string
+	Name, Type, PartType string
 }
 
 var lsblkPairRE = regexp.MustCompile(`([A-Z:_-]+)="((?:[^"\\]|\\.)*)"`)
@@ -33,7 +27,7 @@ var lsblkPairRE = regexp.MustCompile(`([A-Z:_-]+)="((?:[^"\\]|\\.)*)"`)
 func listBlockDevs(ctx context.Context, runner executor.Runner, disk string) ([]blockDev, error) {
 	res, err := runner.Run(ctx, executor.CommandSpec{
 		Path:          "lsblk",
-		Args:          []string{"-nPp", "-o", "NAME,TYPE,PARTTYPE,PKNAME,MOUNTPOINT", disk},
+		Args:          []string{"-nPp", "-o", "NAME,TYPE,PARTTYPE", disk},
 		CaptureStdout: true, CaptureStderr: true, Quiet: true,
 	})
 	if err != nil {
@@ -48,10 +42,7 @@ func listBlockDevs(ctx context.Context, runner executor.Runner, disk string) ([]
 		if kv["NAME"] == "" {
 			continue
 		}
-		out = append(out, blockDev{
-			Name: kv["NAME"], Type: kv["TYPE"], PartType: strings.ToLower(kv["PARTTYPE"]),
-			PKName: kv["PKNAME"], MountPoint: kv["MOUNTPOINT"],
-		})
+		out = append(out, blockDev{Name: kv["NAME"], Type: kv["TYPE"], PartType: strings.ToLower(kv["PARTTYPE"])})
 	}
 	// Without a udev database lsblk can leave PARTTYPE empty; probe those
 	// partitions directly.
@@ -88,20 +79,6 @@ func unescapeLsblk(s string) string {
 	return b.String()
 }
 
-// partNumber is the partition number at the end of a partition device name
-// (/dev/sda1 -> 1, /dev/nvme0n1p3 -> 3), or 0.
-func partNumber(name string) int {
-	i := len(name)
-	for i > 0 && name[i-1] >= '0' && name[i-1] <= '9' {
-		i--
-	}
-	n, err := strconv.Atoi(name[i:])
-	if err != nil {
-		return 0
-	}
-	return n
-}
-
 // biosBootPartitions returns the BIOS boot (EF02) partitions on disk.
 func biosBootPartitions(ctx context.Context, runner executor.Runner, disk string) ([]blockDev, error) {
 	devs, err := listBlockDevs(ctx, runner, disk)
@@ -115,86 +92,4 @@ func biosBootPartitions(ctx context.Context, runner executor.Runner, disk string
 		}
 	}
 	return out, nil
-}
-
-// HasBIOSBootPartition reports whether disk carries a BIOS boot (EF02)
-// partition, for a storage result that recorded none (bios_boot_partition 0,
-// e.g. a mount-existing layout).
-func HasBIOSBootPartition(ctx context.Context, runner executor.Runner, disk string) bool {
-	parts, err := biosBootPartitions(ctx, runner, disk)
-	return err == nil && len(parts) > 0
-}
-
-// espDeviceOf returns the device of the /boot/efi filesystem in the storage
-// result ("" when there is none): a partition, or the md mirror of them.
-func espDeviceOf(sr result.StorageResult) string {
-	for _, fs := range sr.Filesystems {
-		if fs.Mount == "/boot/efi" {
-			return fs.Device
-		}
-	}
-	return ""
-}
-
-// detectESPPartition finds the ESP's partition number on disk, for a storage
-// result that recorded none (esp_partition 0). In order: the one partition of
-// GPT type EF00 (or MBR 0xef); among several, or when the type is not set, the
-// partition that is -- or carries the md mirror that is -- the /boot/efi
-// device or is mounted at .../boot/efi. 0 when nothing qualifies.
-func detectESPPartition(ctx context.Context, runner executor.Runner, disk, espDevice string) int {
-	devs, err := listBlockDevs(ctx, runner, disk)
-	if err != nil {
-		return 0
-	}
-	isESPMount := func(d blockDev) bool {
-		return strings.HasSuffix(d.MountPoint, "/boot/efi") || (espDevice != "" && sameDevice(d.Name, espDevice))
-	}
-	holdsESP := func(p blockDev) bool {
-		if isESPMount(p) {
-			return true
-		}
-		for _, c := range devs {
-			if c.PKName == p.Name && isESPMount(c) {
-				return true
-			}
-		}
-		return false
-	}
-	var byType, byMount []blockDev
-	for _, d := range devs {
-		if d.Type != "part" {
-			continue
-		}
-		if d.PartType == gptTypeESP || d.PartType == mbrTypeESP {
-			byType = append(byType, d)
-		}
-		if holdsESP(d) {
-			byMount = append(byMount, d)
-		}
-	}
-	switch {
-	case len(byType) == 1:
-		return partNumber(byType[0].Name)
-	case len(byType) > 1:
-		for _, d := range byType {
-			if holdsESP(d) {
-				return partNumber(d.Name)
-			}
-		}
-		return partNumber(byType[0].Name)
-	case len(byMount) > 0:
-		return partNumber(byMount[0].Name)
-	}
-	return 0
-}
-
-// sameDevice compares two device paths after resolving symlinks
-// (/dev/md/esp -> /dev/md127).
-func sameDevice(a, b string) bool {
-	if a == b {
-		return true
-	}
-	ra, errA := filepath.EvalSymlinks(a)
-	rb, errB := filepath.EvalSymlinks(b)
-	return errA == nil && errB == nil && ra == rb
 }

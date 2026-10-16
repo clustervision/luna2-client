@@ -54,6 +54,7 @@ import (
 const toolName = "lpart-storage-check"
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, toolName)
 	cli.EnsureInstallerPath()
 	os.Exit(run(os.Args, os.Stdout, os.Stderr))
 }
@@ -88,9 +89,7 @@ const (
 	defaultResultOut  = defaultRuntimeDir + "/storage-check-result.json"
 )
 
-// bash predecessor section by section.
-//
-//nolint:gocyclo // command flow is intentionally linear; matches the
+//nolint:gocyclo // command flow is intentionally linear; matches the bash predecessor section by section.
 func run(argv []string, stdout, stderr io.Writer) int {
 	if len(argv) == 0 {
 		argv = []string{toolName}
@@ -119,8 +118,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintln(stdout, cli.Version())
 		return 0
 	}
-	// storage-check's probes are already read-only (BR-7: fsck -n variants,
-	// lsblk/blkid reads) -- there is nothing for --dry-run to protect. What
+	// --dry-run cannot make storage-check read-only: the probes assemble
+	// arrays, replay an XFS log by mounting and run e2fsck -p. What
 	// --dry-run WOULD do is stub every probe to rc 0, making Classify
 	// fabricate a verdict from evidence it never gathered: a false health
 	// report an operator may act on (FTA v2 BE-F7, TE-D). Fail closed: refuse
@@ -128,8 +127,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// --dry-run to this tool.
 	if f.DryRun {
 		return cli.ExitFatalConfig(stderr, toolName, "dry-run",
-			"--dry-run is not supported: storage-check probes are already read-only, "+
-				"and stubbing them would fabricate health verdicts; run without --dry-run")
+			"--dry-run is not supported: stubbing the storage-check probes "+
+				"would fabricate health verdicts; run without --dry-run")
 	}
 
 	logger, err := f.NewLogger(toolName)
@@ -156,7 +155,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		CmdlinePath:       f.CmdlinePath,
 		AllowNonInstaller: f.AllowNonInstaller,
 	}); err != nil {
-		return cli.ExitFatalConfig(stderr, toolName, "installer-env", "%v", err)
+		errln(stderr, "%v", err) // exit 1, as in every lpart tool
+		return 1
 	}
 
 	logger.SetStage("command_checks")
@@ -189,6 +189,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	}
 	if err := cfg.ValidateRaw(raw); err != nil {
 		return cli.ExitFatalConfig(stderr, toolName, "config-validation", "%v", err)
+	}
+	for _, w := range cfg.Warnings {
+		logger.Warn(w)
 	}
 	// A selection=discover set names no devices in the config: storage-prepare
 	// picks them from the disk pool and records them in storage-resolved.json
@@ -225,6 +228,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// First PRESENT device per set: the BIOS boot partition probe below must
 	// not look at a configured member that is missing (degraded raid).
 	presentFirst := map[string]string{}
+	resolvedBySet := map[string][]selector.Resolved{}
 	for i := range cfg.Sets {
 		set := &cfg.Sets[i]
 		storageType := set.StorageType()
@@ -234,7 +238,25 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			continue
 		}
 
-		resolved, missing, err := resolvePresent(context.Background(), resolver, set.EffectiveDevices())
+		var resolved []selector.Resolved
+		var missing []string
+		var err error
+		if werr := selector.WaitWhileMissing(context.Background(), runner, selector.LateDeviceWait, func() (int, error) {
+			resolved, missing, err = resolvePresent(context.Background(), resolver, set.EffectiveDevices())
+			if err != nil && len(missing) == 0 {
+				return 0, err // not a missing device: no point waiting
+			}
+			return len(missing), nil
+		}); werr != nil {
+			err = werr
+		}
+		if resolveRetryable(err) {
+			errln(stderr, "set %q: %v", set.Name, err)
+			return 1
+		}
+		if msg := degradedRefusal(set, len(resolved), missing); err == nil && msg != "" {
+			return cli.ExitSafetyRefusal(stderr, toolName, "degraded", "%s", msg)
+		}
 		if err == nil && len(missing) > 0 && !set.RunsDegradedWith(len(resolved)) {
 			err = fmt.Errorf("device(s) %s not present on this node, and raid %s cannot run without them (%d of %d device(s) present)",
 				strings.Join(missing, ", "), set.Raid, len(resolved), len(set.EffectiveDevices()))
@@ -255,6 +277,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		presentFirst[set.Name] = resolved[0].ResolvedPath
 		verdict, fs := storagehealth.Classify(context.Background(), runner, checker, set, resolved, logger)
 		logger.KV("verdict", set.Name+"="+string(verdict))
+		if verdict == storagehealth.VerdictDegraded {
+			return cli.ExitSafetyRefusal(stderr, toolName, "degraded", "%s", storagehealth.DegradedRefusal(set))
+		}
+		resolvedBySet[set.Name] = resolved
 		failures = append(failures, fs...)
 	}
 
@@ -300,6 +326,17 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	logger.SetStage("mount")
 	logger.UserInfo("All sets healthy — mounting storage tree")
+	// the probe released what it activated: bring the sets up read-write
+	for i := range cfg.Sets {
+		set := &cfg.Sets[i]
+		paths := make([]string, 0, len(resolvedBySet[set.Name]))
+		for _, r := range resolvedBySet[set.Name] {
+			paths = append(paths, r.ResolvedPath)
+		}
+		if len(paths) > 0 {
+			storagehealth.ActivateExisting(context.Background(), runner, set, paths, logger, false)
+		}
+	}
 	predicted := fsmod.PredictFilesystemsFromConfig(cfg, func(set *v2.Set) bool {
 		disk, ok := presentFirst[set.Name]
 		if set.Role != "os" || !ok {
@@ -417,4 +454,23 @@ func resolvePresent(ctx context.Context, resolver *selector.Resolver, devices []
 		return nil, missing, fmt.Errorf("none of the set's devices (%s) is present on this node", strings.Join(missing, ", "))
 	}
 	return present, missing, nil
+}
+
+// resolveRetryable reports a device-resolution failure that may clear on
+// retry (a failed lsblk probe): exit 1, as in lpart-storage-prepare, not a
+// park for an operator.
+func resolveRetryable(err error) bool {
+	var re *selector.ResolveError
+	return errors.As(err, &re) && re.Kind == selector.KindProbe
+}
+
+// degradedRefusal is the reason to park when a redundant raid set could run
+// without its missing members but the layout does not allow it; "" otherwise.
+// Same rule and wording as lpart-storage-prepare.
+func degradedRefusal(set *v2.Set, present int, missing []string) string {
+	if len(missing) == 0 || set.AllowDegraded || !set.RunsDegradedWith(present) {
+		return ""
+	}
+	return fmt.Sprintf("set %q is degraded: device(s) %s not present on this node (%d of %d present); replace the disk and reinstall with install_mode full, or set allow_degraded on the set to install on it degraded",
+		set.Name, strings.Join(missing, ", "), present, len(set.EffectiveDevices()))
 }

@@ -110,7 +110,7 @@ func TestSUSERegenerateInitramfsUsesDracut(t *testing.T) {
 	}
 	var saw bool
 	for _, c := range f.Calls() {
-		if c.Chroot == sysroot && strings.Contains(strings.Join(c.Args, " "), "dracut -f --omit luna --kver 6.4.0-150600.1-default") {
+		if c.Chroot == sysroot && strings.Join(c.Args, " ") == strings.Join(dracutArgs("6.4.0-150600.1-default"), " ") {
 			saw = true
 		}
 	}

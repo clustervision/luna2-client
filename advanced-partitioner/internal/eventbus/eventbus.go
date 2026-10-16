@@ -30,7 +30,7 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/engine"
 )
 
-// DefaultPath is the on-node bus FIFO. luna2-start.sh creates it and launches
+// DefaultPath is the on-node bus FIFO. luna-installer.sh creates it and launches
 // lpart-tui to read it before running install.sh; every step emits to it.
 const DefaultPath = "/run/lpart/events"
 
@@ -97,7 +97,7 @@ type Writer struct {
 func NewWriter(w io.Writer) *Writer { return &Writer{w: w} }
 
 // Open opens the bus at path for writing. The path is normally a FIFO created by
-// luna2-start.sh; it is opened non-blocking so that a not-yet-attached (or
+// luna-installer.sh; it is opened non-blocking so that a not-yet-attached (or
 // absent) reader does not block the producer. A regular file or a FIFO with a
 // reader both work. When the path cannot be opened at all, Open returns a Writer
 // that silently drops events, plus the error — callers that want best-effort can
@@ -112,7 +112,7 @@ func Open(path string) (*Writer, error) {
 
 // EnsureFIFO creates path as a FIFO if it does not already exist. A pre-existing
 // FIFO (or any existing node) is left as-is. The renderer calls this before
-// OpenReader so the bus exists even if luna2-start.sh has not made it.
+// OpenReader so the bus exists even if luna-installer.sh has not made it.
 func EnsureFIFO(path string) error {
 	if _, err := os.Stat(path); err == nil {
 		return nil

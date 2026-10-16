@@ -1,5 +1,5 @@
 Package: luna2-client
-Version: 2.2-4
+Version: 2.2-6
 Maintainer: ClusterVision
 Architecture: arm64
 Depends: initramfs-tools | dracut, dracut-network | initramfs-tools, shim-signed, grub-efi-arm64-signed, grub-efi-arm64-bin, mdadm, lvm2, gdisk, fdisk, lsscsi, jq, parted, dosfstools, lbzip2, aria2, efibootmgr, grepcidr, curl, openssh-server, dropbear-bin, tpm2-tools

@@ -25,4 +25,8 @@ done
 # rpmbuild's generated .build-id links and disable their creation to avoid
 # stale "installed but unpackaged" debuginfo links failing check-files.
 rm -rf "$HERE/src/usr/lib/.build-id"
-rpmbuild --define "_build_id_links none" --buildroot "$HERE/src" -ba luna2-client.spec
+# The version comes from VERSION at the repository root, as in the pipeline.
+VERSION=$(tr -d '[:space:]' < "$REPO_ROOT/VERSION")
+rpmbuild --define "_build_id_links none" \
+    --define "luna_version ${VERSION%-*}" --define "luna_release ${VERSION#*-}" \
+    --buildroot "$HERE/src" -ba luna2-client.spec

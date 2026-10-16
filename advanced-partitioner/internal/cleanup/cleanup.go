@@ -17,8 +17,7 @@ import (
 // builds one of these per selected set from the typed v2 config + the
 // disk/selector.Resolved records.
 type Set struct {
-	// Name is the set name; also the LVM VG name (unless provider.vg_name
-	// overrides it, in which case the override goes here too).
+	// Name is the set name; also the LVM VG name (v2.Set.VGName).
 	Name string
 	// SelectedDisks is the list of resolved whole-disk paths, e.g.
 	// "/dev/sda", "/dev/disk/by-path/pci-0000:00:1f.2-ata-1.0" (the
@@ -188,6 +187,9 @@ func (c *Cleaner) CleanupSelectedSet(ctx context.Context, set Set) (Result, erro
 		}
 	}
 
+	if err := c.refuseOutsideSpans(ctx, selected); err != nil {
+		return Result{}, err
+	}
 	c.unmountUnderSysroot(ctx, set.Name, set.OwnsSysroot, selected)
 	if err := c.teardownVG(ctx, set.Name, selected, set.Protected); err != nil {
 		return Result{}, err

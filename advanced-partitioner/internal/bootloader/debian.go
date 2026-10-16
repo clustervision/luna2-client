@@ -18,7 +18,7 @@ import (
 //	            grub-install only when BIOS (UEFI uses the signed
 //	            shim+grub from /EFI/<distro>/ instead).
 //	Initramfs:  update-initramfs -u -k all
-//	Install:    write /etc/default/grub (Debian-flavoured keys);
+//	Install:    write /etc/default/grub (GRUB_DEFAULT=0);
 //	            BIOS path runs grub-install --target=i386-pc per disk
 //	            then update-grub; UEFI path calls StageSignedShim
 //	            (with GrubDirName="grub"), then RegisterUEFIEntries,
@@ -80,7 +80,7 @@ func (a *debianAdapter) updateInitramfsIsDracut() bool {
 
 // RegenerateInitramfs regenerates the INSTALLED system's initramfs with the
 // generator the image uses: `update-initramfs -u -k all` for initramfs-tools
-// (or an image without dracut), else `dracut -f --omit luna --kver <kver>` for
+// (or an image without dracut), else dracut (dracutArgs) for
 // every bootable kernel — identical to the RHEL/SUSE path. Omit the luna
 // module: it is only for the netboot install initramfs, never the installed
 // system's. On Ubuntu 26.04 update-initramfs is dracut's wrapper, which builds
@@ -146,12 +146,10 @@ func (a *debianAdapter) installBIOS(ctx context.Context) error {
 	return a.generateGrubConfig(ctx)
 }
 
-// writeGrubDefault merges lpart's keys and root-storage kernel arguments into
-// the image's /etc/default/grub (see grubdefault.go). The Debian keys differ
-// from RHEL's: GRUB_DEFAULT=0 (numeric, not "saved"), no GRUB_DISABLE_SUBMENU.
+// writeGrubDefault writes /etc/default/grub (see grubdefault.go) with
+// GRUB_DEFAULT=0: update-grub's first entry is the newest kernel.
 func (a *debianAdapter) writeGrubDefault() error {
-	return writeMergedGrubDefault(a.deps.FS, a.deps.BootContext.Sysroot,
-		debianGrubDefaultKeys, a.deps.BootContext.KernelArgs)
+	return writeGrubDefault(a.deps.FS, a.deps.BootContext, "0")
 }
 
 func (a *debianAdapter) installUEFI(ctx context.Context) error {
@@ -181,7 +179,6 @@ func (a *debianAdapter) installUEFI(ctx context.Context) error {
 		BootDevices:   a.deps.BootContext.StorageResult.BootDevices,
 		RegisterNVRAM: a.deps.BootContext.RegisterNVRAM,
 		ESPPartition:  a.deps.BootContext.StorageResult.ESPPartition,
-		ESPDevice:     espDeviceOf(a.deps.BootContext.StorageResult),
 		SnapshotDir:   a.deps.SnapshotDir,
 		BootOrder:     a.deps.BootContext.BootOrder,
 	}); err != nil {
@@ -203,25 +200,26 @@ func (a *debianAdapter) generateGrubConfig(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("update-grub: %w", err)
 	}
-	a.normalizeGrubCfgForSeparateBoot()
+	if err := a.normalizeGrubCfgForSeparateBoot(); err != nil {
+		return err
+	}
 	// Same degraded-safe rewrite as RHEL (BE-W5): on a mirrored boot chain
 	// the update-grub output locates /boot and root by md-array UUID, which
 	// GRUB resolves non-deterministically when a mirror leg is missing —
 	// dropping the mduuid set/hints forces the fs-uuid scan that finds a raw
 	// metadata-1.0 member. No-op on non-RAID layouts (no mduuid references).
-	makeGrubCfgDegradedSafeAt(a.deps.FS,
+	return grubCfgDegradedSafeAt(a.deps.FS,
 		filepath.Join(sysroot, "boot", "grub", "grub.cfg"),
 		filepath.Join(sysroot, "boot", "grub2", "grub.cfg"),
 	)
-	return nil
 }
 
 // normalizeGrubCfgForSeparateBoot rewrites /boot-prefixed kernel /
 // initrd lines in grub.cfg when /boot is a separate filesystem.
 // Mirrors bootloader_debian_normalize_grub_for_separate_boot.
-func (a *debianAdapter) normalizeGrubCfgForSeparateBoot() {
+func (a *debianAdapter) normalizeGrubCfgForSeparateBoot() error {
 	if !a.hasBootMount() {
-		return
+		return nil
 	}
 	sysroot := a.deps.BootContext.Sysroot
 	for _, cfg := range []string{
@@ -243,8 +241,12 @@ func (a *debianAdapter) normalizeGrubCfgForSeparateBoot() {
 				out = append(out, line)
 			}
 		}
-		_ = a.deps.FS.WriteFile(cfg, []byte(strings.Join(out, "\n")), 0o644)
+		// the unrepaired /boot/vmlinuz paths are not found on a separate /boot
+		if err := a.deps.FS.WriteFile(cfg, []byte(strings.Join(out, "\n")), 0o644); err != nil {
+			return fmt.Errorf("repair grub.cfg for a separate /boot: %w", err)
+		}
 	}
+	return nil
 }
 
 func (a *debianAdapter) hasBootMount() bool {

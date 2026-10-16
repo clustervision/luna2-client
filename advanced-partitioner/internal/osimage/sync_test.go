@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"errors"
 	"io"
 	"os"
@@ -13,6 +14,16 @@ import (
 	"testing"
 	"time"
 )
+
+// requireGNUTar skips the test unless tar is GNU tar: the sync depends on its
+// --exclude semantics and exit statuses, which a fake cannot vouch for.
+func requireGNUTar(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command("tar", "--version").Output()
+	if err != nil || !strings.Contains(string(out), "GNU tar") {
+		t.Skip("GNU tar not available")
+	}
+}
 
 func protectionFor(preserve, empty, nonew, keep []string, skip []string) (Protection, []string) {
 	pp, pe, pn, pk := ParsePatterns(preserve), ParsePatterns(empty), ParsePatterns(nonew), ParsePatterns(keep)
@@ -130,9 +141,7 @@ func syncOpts(root string, img []byte, prot Protection, ex []string, wins []stri
 }
 
 func TestSyncExtractConverges(t *testing.T) {
-	if _, err := exec.LookPath("tar"); err != nil {
-		t.Skip("GNU tar not available")
-	}
+	requireGNUTar(t)
 	root := t.TempDir()
 	d, f, l := byte(tar.TypeDir), byte(tar.TypeReg), byte(tar.TypeSymlink)
 	img := buildTar(t, []ent{
@@ -228,9 +237,7 @@ func mustNorm(t *testing.T, raw ...string) []string {
 // A protected directory where the image has a file must never be removed to
 // make room: the sync refuses for an operator instead.
 func TestSyncRefusesTypeChangeOnProtectedDir(t *testing.T) {
-	if _, err := exec.LookPath("tar"); err != nil {
-		t.Skip("GNU tar not available")
-	}
+	requireGNUTar(t)
 	root := t.TempDir()
 	write(t, root, "var/lib/app/state", "precious\n")
 	img := buildTar(t, []ent{{"./", "", "", tar.TypeDir, 0o755}, {"./var/", "", "", tar.TypeDir, 0o755}, {"./var/lib/", "", "", tar.TypeDir, 0o755}, {"./var/lib/app", "file now\n", "", tar.TypeReg, 0o644}})
@@ -265,9 +272,7 @@ func TestLoadFilterConfigRejectsUnknownKeys(t *testing.T) {
 // A hard link in the image whose target is preserved (excluded from tar)
 // must not fail the sync: it is linked to the preserved file on disk.
 func TestSyncHardlinkIntoPreserved(t *testing.T) {
-	if _, err := exec.LookPath("tar"); err != nil {
-		t.Skip("GNU tar not available")
-	}
+	requireGNUTar(t)
 	root := t.TempDir()
 	write(t, root, "opt/keep/bin/tool", "local tool\n")
 	d, f := byte(tar.TypeDir), byte(tar.TypeReg)
@@ -294,5 +299,275 @@ func TestSyncHardlinkIntoPreserved(t *testing.T) {
 	}
 	if _, err := os.Lstat(filepath.Join(root, "usr/bin/gone")); err == nil {
 		t.Fatal("usr/bin/gone links to a preserved file that is absent: it must not be created")
+	}
+}
+
+// A mount below the sysroot that is not one of the os set's volumes (a data
+// set without a role, anything mounted there) is never entered by the sweep,
+// even where the image has a directory of the same name; os volumes converge.
+func TestSyncSweepSkipsMountsOutsideTheOSSet(t *testing.T) {
+	requireGNUTar(t)
+	root := t.TempDir()
+	mounts := filepath.Join(t.TempDir(), "mounts")
+	body := "/dev/os " + root + " xfs rw 0 0\n/dev/boot " + root + "/boot xfs rw 0 0\n/dev/sdb1 " + root + "/srv/data xfs rw 0 0\n"
+	if err := os.WriteFile(mounts, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := procSelfMounts
+	procSelfMounts = mounts
+	t.Cleanup(func() { procSelfMounts = orig })
+
+	d, f := byte(tar.TypeDir), byte(tar.TypeReg)
+	img := buildTar(t, []ent{
+		{"./", "", "", d, 0o755}, {"./srv/", "", "", d, 0o755}, {"./srv/data/", "", "", d, 0o755},
+		{"./boot/", "", "", d, 0o755}, {"./boot/vmlinuz-new", "kernel\n", "", f, 0o644},
+	})
+	write(t, root, "srv/data/precious", "data set\n")
+	write(t, root, "srv/data/sub/deep", "data set\n")
+	write(t, root, "boot/vmlinuz-old", "old kernel\n")
+	so := syncOpts(root, img, Protection{}, nil, nil, "")
+	so.OSMounts = []string{"boot"}
+	if _, err := SyncExtract(context.Background(), so); err != nil {
+		t.Fatalf("SyncExtract: %v", err)
+	}
+	for _, rel := range []string{"srv/data/precious", "srv/data/sub/deep"} {
+		if _, ok := read(root, rel); !ok {
+			t.Errorf("%s is on a mount outside the os set and must not be swept", rel)
+		}
+	}
+	if _, ok := read(root, "boot/vmlinuz-old"); ok {
+		t.Error("boot is an os volume and must converge")
+	}
+}
+
+// Verification is off unless asked for, and a mismatch it finds is a warning:
+// the sync still succeeds.
+func TestSyncVerifyOffByDefaultAndOnlyWarns(t *testing.T) {
+	requireGNUTar(t)
+	if os.Geteuid() == 0 {
+		t.Skip("root tar restores the image owner, so no mismatch can be staged")
+	}
+	var buf bytes.Buffer
+	tw := tar.NewWriter(&buf)
+	for _, h := range []*tar.Header{
+		{Name: "./", Typeflag: tar.TypeDir, Mode: 0o755, Uid: os.Getuid(), Gid: os.Getgid()},
+		// a non-root tar cannot give the file this owner: verify must see it
+		{Name: "./f", Typeflag: tar.TypeReg, Mode: 0o644, Uid: os.Getuid() + 1, Gid: os.Getgid(), Size: 1, ModTime: time.Unix(1e9, 0)},
+	} {
+		if err := tw.WriteHeader(h); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := tw.Write([]byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := SyncExtract(context.Background(), syncOpts(t.TempDir(), buf.Bytes(), Protection{}, nil, nil, ""))
+	if err != nil || res.Verified != 0 {
+		t.Fatalf("default: want no verification, got %+v err=%v", res, err)
+	}
+	res, err = SyncExtract(context.Background(), syncOpts(t.TempDir(), buf.Bytes(), Protection{}, nil, nil, "metadata"))
+	if err != nil {
+		t.Fatalf("a verify mismatch must not fail the sync: %v", err)
+	}
+	if len(res.Mismatches) == 0 {
+		t.Fatalf("the owner mismatch was not reported: %+v", res)
+	}
+}
+
+// The hard-link tolerance holds only for tar's own exit status 2. A tar that
+// did not exit (killed, as by the OOM killer) failed, whatever its stderr says.
+func TestSyncHardlinkToleranceNeedsExitStatus2(t *testing.T) {
+	requireGNUTar(t)
+	root := t.TempDir()
+	d, f := byte(tar.TypeDir), byte(tar.TypeReg)
+	img := buildTar(t, []ent{
+		{"./", "", "", d, 0o755}, {"./opt/", "", "", d, 0o755}, {"./opt/keep/", "", "", d, 0o755},
+		{"./opt/keep/gone", "image\n", "", f, 0o644},
+		{"./usr/", "", "", d, 0o755}, {"./usr/gone", "", "./opt/keep/gone", byte(tar.TypeLink), 0o644},
+	})
+	prot, ex := protectionFor([]string{"opt/keep"}, nil, nil, nil, nil)
+	so := syncOpts(root, img, prot, ex, nil, "")
+	// the real tar runs to the end, then the process dies by a signal
+	so.tarCmd = func(ctx context.Context, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", append([]string{"-c", `tar "$@"; kill -9 $$`, "sh"}, args...)...) //nolint:gosec // test-built args
+	}
+	_, err := SyncExtract(context.Background(), so)
+	if err == nil || !strings.Contains(err.Error(), "signal: killed") || !strings.Contains(err.Error(), "Cannot hard link") {
+		t.Fatalf("a killed tar must fail the sync, got %v", err)
+	}
+}
+
+// A sync that stops mid-stream (here the refusal on a protected directory, at
+// the first member) returns at once with the real decompressor: lbzip2 is still
+// writing the rest of the image into a pipe nobody reads any more.
+func TestSyncFailingMidStreamReturns(t *testing.T) {
+	requireGNUTar(t)
+	if _, err := exec.LookPath("lbzip2"); err != nil {
+		t.Skip("lbzip2 not available")
+	}
+	root := t.TempDir()
+	write(t, root, "var/lib/app/state", "precious\n")
+	noise := make([]byte, 8<<20)
+	if _, err := rand.Read(noise); err != nil {
+		t.Fatal(err)
+	}
+	img := buildTar(t, []ent{
+		{"./", "", "", tar.TypeDir, 0o755}, {"./var/", "", "", tar.TypeDir, 0o755}, {"./var/lib/", "", "", tar.TypeDir, 0o755},
+		{"./var/lib/app", "file now\n", "", tar.TypeReg, 0o644}, {"./big", string(noise), "", tar.TypeReg, 0o644},
+	})
+	p := filepath.Join(t.TempDir(), "image.tar")
+	if err := os.WriteFile(p, img, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("lbzip2", p).CombinedOutput(); err != nil { //nolint:gosec // test-built path
+		t.Fatalf("lbzip2: %v: %s", err, out)
+	}
+	prot, ex := protectionFor([]string{"var/lib/app/state"}, nil, nil, nil, nil)
+	so := syncOpts(root, nil, prot, ex, nil, "")
+	so.TarballPath, so.decompress = p+".bz2", nil
+	done := make(chan error, 1)
+	go func() { _, err := SyncExtract(context.Background(), so); done <- err }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "operator review required") {
+			t.Fatalf("want the refusal, got %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("the sync did not return: the decompressor is waited for while it blocks on its pipe")
+	}
+}
+
+// A directory reached through a symlinked parent (opt -> data/opt, into a data
+// set) is never removed to make room for an image file: the removal would leave
+// the os tree.
+func TestSyncTypeChangeNeverFollowsASymlinkedParent(t *testing.T) {
+	requireGNUTar(t)
+	root := t.TempDir()
+	write(t, root, "data/opt/foo/precious/file", "data set\n")
+	if err := os.Symlink("data/opt", filepath.Join(root, "opt")); err != nil {
+		t.Fatal(err)
+	}
+	img := buildTar(t, []ent{{"./", "", "", tar.TypeDir, 0o755}, {"./opt/foo", "image\n", "", tar.TypeReg, 0o644}})
+	_, _ = SyncExtract(context.Background(), syncOpts(root, img, Protection{}, nil, nil, ""))
+	if got, ok := read(root, "data/opt/foo/precious/file"); !ok || got != "data set\n" {
+		t.Fatal("a directory behind a symlinked parent was removed")
+	}
+}
+
+// An image_wins entry the image does not carry is only reported; any other
+// failure of the image_wins tar fails the sync, or the old file stays in place
+// while the install reports success.
+func TestSyncImageWinsFailureFailsTheSync(t *testing.T) {
+	requireGNUTar(t)
+	d, f := byte(tar.TypeDir), byte(tar.TypeReg)
+	img := buildTar(t, []ent{
+		{"./", "", "", d, 0o755}, {"./etc/", "", "", d, 0o755}, {"./etc/ssh/", "", "", d, 0o755},
+		{"./etc/ssh/sshd_config", "image-sshd\n", "", f, 0o644},
+	})
+	prot, ex := protectionFor([]string{"etc/ssh"}, nil, nil, nil, nil)
+
+	t.Run("entry not in the image", func(t *testing.T) {
+		so := syncOpts(t.TempDir(), img, prot, ex, []string{"etc/ssh/sshd_config", "etc/not-in-image"}, "")
+		if _, err := SyncExtract(context.Background(), so); err != nil {
+			t.Fatalf("a missing image_wins entry must not fail the sync: %v", err)
+		}
+	})
+	for name, script := range map[string]string{
+		"exit 2, write error": `tar "$@"; echo "tar: ./etc/ssh/sshd_config: Cannot write: No space left on device" >&2; exit 2`,
+		"killed":              `tar "$@"; kill -9 $$`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			so := syncOpts(t.TempDir(), img, prot, ex, []string{"etc/ssh/sshd_config"}, "")
+			so.tarCmd = func(ctx context.Context, args ...string) *exec.Cmd {
+				if args[len(args)-1] != "./etc/ssh/sshd_config" {
+					return exec.CommandContext(ctx, "tar", args...) //nolint:gosec // test-built args
+				}
+				return exec.CommandContext(ctx, "sh", append([]string{"-c", script, "sh"}, args...)...) //nolint:gosec // test-built args
+			}
+			_, err := SyncExtract(context.Background(), so)
+			if err == nil || !strings.Contains(err.Error(), "image_wins") {
+				t.Fatalf("a failed image_wins tar must fail the sync, got %v", err)
+			}
+		})
+	}
+}
+
+// A tar that dies early (a full os filesystem) surfaces as a broken pipe on
+// the image stream; its own message must stay in the error, which is what
+// the caller classifies (ENOSPC parks).
+func TestSyncKeepsTheStderrOfATarThatDiedEarly(t *testing.T) {
+	requireGNUTar(t)
+	img := buildTar(t, []ent{
+		{"./", "", "", tar.TypeDir, 0o755},
+		{"./big", strings.Repeat("x", 4<<20), "", tar.TypeReg, 0o644},
+	})
+	so := syncOpts(t.TempDir(), img, Protection{}, nil, nil, "")
+	so.tarCmd = func(ctx context.Context, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, "sh", "-c", `echo "tar: ./big: Cannot write: No space left on device" >&2; exit 2`)
+	}
+	_, err := SyncExtract(context.Background(), so)
+	if err == nil || !strings.Contains(err.Error(), "No space left on device") {
+		t.Fatalf("the sync error lost tar's stderr: %v", err)
+	}
+}
+
+// A directory on an os volume (/boot, /boot/efi, a separate /var) converges
+// like one on the root; a directory on any other filesystem, listed as a mount
+// or not, is never entered.
+func TestSyncSweepConvergesOSVolumesOnly(t *testing.T) {
+	requireGNUTar(t)
+	root := t.TempDir()
+	mounts := filepath.Join(t.TempDir(), "mounts")
+	body := "/dev/os " + root + " xfs rw 0 0\n/dev/boot " + root + "/boot xfs rw 0 0\n" +
+		"/dev/esp " + root + "/boot/efi vfat rw 0 0\n/dev/sdb1 " + root + "/srv/data xfs rw 0 0\n"
+	if err := os.WriteFile(mounts, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	origMounts, origDev := procSelfMounts, devOf
+	procSelfMounts = mounts
+	// One device per volume: boot, boot/efi and srv/data are their own
+	// filesystems, and mnt/foreign is one the mount table does not list.
+	devOf = func(path string) uint64 {
+		rel := strings.TrimPrefix(path, root+"/")
+		for dev, vol := range []string{"boot/efi", "boot", "srv/data", "mnt/foreign"} {
+			if within(rel, vol) {
+				return uint64(dev + 2)
+			}
+		}
+		return 1
+	}
+	t.Cleanup(func() { procSelfMounts, devOf = origMounts, origDev })
+
+	d, f := byte(tar.TypeDir), byte(tar.TypeReg)
+	img := buildTar(t, []ent{
+		{"./", "", "", d, 0o755}, {"./boot/", "", "", d, 0o755}, {"./boot/efi/", "", "", d, 0o755},
+		{"./boot/efi/EFI/", "", "", d, 0o755}, {"./boot/vmlinuz-new", "kernel\n", "", f, 0o644},
+		{"./srv/", "", "", d, 0o755}, {"./mnt/", "", "", d, 0o755},
+	})
+	write(t, root, "boot/old-kernel-dir/vmlinuz-old", "old kernel\n")
+	write(t, root, "boot/efi/EFI/oldvendor/grubx64.efi", "old loader\n")
+	write(t, root, "srv/data/sub/deep", "data set\n")
+	write(t, root, "mnt/foreign/sub/deep", "foreign\n")
+	so := syncOpts(root, img, Protection{}, nil, nil, "")
+	so.OSMounts = []string{"boot", "boot/efi"}
+	if _, err := SyncExtract(context.Background(), so); err != nil {
+		t.Fatalf("SyncExtract: %v", err)
+	}
+	for _, rel := range []string{"boot/old-kernel-dir", "boot/efi/EFI/oldvendor"} {
+		if _, err := os.Lstat(filepath.Join(root, rel)); err == nil {
+			t.Errorf("%s is on an os volume and not in the image: it must be swept", rel)
+		}
+	}
+	for _, rel := range []string{"srv/data/sub/deep", "mnt/foreign/sub/deep"} {
+		if _, ok := read(root, rel); !ok {
+			t.Errorf("%s is not on an os volume and must not be swept", rel)
+		}
+	}
+	if _, ok := read(root, "boot/vmlinuz-new"); !ok {
+		t.Error("the image's own boot file is missing")
 	}
 }

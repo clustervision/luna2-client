@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
+	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/disk/selector"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 )
@@ -36,5 +39,42 @@ func TestResolvePresentSeparatesMissingMembers(t *testing.T) {
 
 	if _, _, err := resolvePresent(context.Background(), r, []string{absent}); err == nil {
 		t.Fatal("a set with none of its devices present must fail")
+	}
+}
+
+// install_mode=local parks on a degraded set unless the set allows it.
+func TestDegradedRefusalFollowsAllowDegraded(t *testing.T) {
+	set := &v2.Set{Name: "os", Raid: "1", Devices: []string{"/dev/vda", "/dev/vdb"}}
+	if msg := degradedRefusal(set, 1, []string{"/dev/vdb"}); !strings.Contains(msg, "is degraded") {
+		t.Fatalf("missing member without allow_degraded must refuse, got %q", msg)
+	}
+	set.AllowDegraded = true
+	if msg := degradedRefusal(set, 1, []string{"/dev/vdb"}); msg != "" {
+		t.Fatalf("allow_degraded must let the set run degraded, got %q", msg)
+	}
+	set.AllowDegraded = false
+	if msg := degradedRefusal(set, 0, []string{"/dev/vda", "/dev/vdb"}); msg != "" {
+		t.Fatalf("a set that cannot run at all is not a degraded refusal, got %q", msg)
+	}
+}
+
+// A failed lsblk probe is retried like in lpart-storage-prepare; a missing or
+// unusable device is not.
+func TestResolveRetryableOnlyForProbeFailures(t *testing.T) {
+	const dev = "/dev/null"
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-dn", "-o", "TYPE", dev},
+		Response: executor.FakeResponse{Err: errors.New("exit status 32")}})
+	r := selector.New(selector.Options{Runner: f, IsBlockDevice: func(string) bool { return true }})
+	_, _, err := resolvePresent(context.Background(), r, []string{dev})
+	if err == nil || !resolveRetryable(err) {
+		t.Fatalf("a failed lsblk probe must be retryable, got %v", err)
+	}
+	_, _, err = resolvePresent(context.Background(), r, []string{"/dev/lpart-test-absent"})
+	if err == nil || resolveRetryable(err) {
+		t.Fatalf("a missing device must not be retryable, got %v", err)
+	}
+	if resolveRetryable(nil) {
+		t.Fatal("no error is not a retryable failure")
 	}
 }

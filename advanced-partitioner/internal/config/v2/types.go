@@ -34,6 +34,9 @@ type Config struct {
 	// (round-trips through parse/marshal) and ignored by all validation and
 	// decision logic. Allowed at the layout, set, and volume levels.
 	Comment string `json:"comment,omitempty"`
+	// Warnings is what Validate found wrong but installable: the layout is
+	// accepted as written, and the installer logs each line for the operator.
+	Warnings []string `json:"-"`
 }
 
 // Set is one storage set: a group of disks (chosen automatically by match or
@@ -66,14 +69,21 @@ type Set struct {
 	// the next boot (see decisions/0008). Valid only on discover sets; the
 	// validator rejects it on a manual set. Default false.
 	Save bool `json:"save,omitempty"`
+	// IncludeSAN, on a selection=discover set, lets it pick FC and iSCSI LUNs.
+	// They are shared storage, so discover leaves them out by default; sanitize
+	// never erases them. The paths of a multipath LUN are never picked.
+	IncludeSAN bool `json:"include_san,omitempty"`
 	// Persistent, when true, is a hands-off guarantee: the set is never
 	// partitioned, formatted, or written, only mounted. It survives auto,
-	// sync, and full; only sanitize erases it. Operator-set only.
+	// sync, and full; sanitize refuses a layout that has one. Operator-set only.
 	Persistent bool `json:"persistent,omitempty"`
 	// Bootloader, on the os set, places the node's own disk in the UEFI boot
 	// order or takes the bootloader away altogether. Absent means "last" —
 	// today's behaviour, the network entry ahead of the disk.
 	Bootloader Bootloader `json:"bootloader,omitempty"`
+	// AllowDegraded lets an install use this redundant raid set with members
+	// missing. Without it a degraded set parks the node for an operator.
+	AllowDegraded bool `json:"allow_degraded,omitempty"`
 	// Origin is provenance written by the installer when it pins a discovered
 	// layout (Save). It is not operator input; it round-trips when the pinned
 	// layout is read back on a later boot. nil on operator-authored configs.
@@ -196,7 +206,7 @@ var (
 	allowedTopLevel = []string{"version", "sets", "comment"}
 	allowedSet      = []string{
 		"name", "role", "selection", "raid", "count", "spares",
-		"match", "devices", "save", "persistent", "bootloader", "origin", "volumes", "comment",
+		"match", "devices", "save", "include_san", "persistent", "bootloader", "allow_degraded", "origin", "volumes", "comment",
 	}
 	allowedMatch  = []string{"tags", "min_size", "max_size", "model"}
 	allowedOrigin = []string{"from", "at", "by", "host"}

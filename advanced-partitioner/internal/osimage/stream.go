@@ -81,11 +81,11 @@ func StreamHTTPExtract(ctx context.Context, dopts DownloadOptions, eopts Extract
 	pipe := "set -o pipefail; curl " + shJoin(curlArgs) + " | tar " + shJoin(tarArgs)
 
 	dopts.info("streaming osimage extract (curl | tar): " + imageURL + " -> " + eopts.Sysroot)
-	if _, err := dopts.Runner.Run(ctx, executor.CommandSpec{
+	if res, err := dopts.Runner.Run(ctx, executor.CommandSpec{
 		Path: "sh", Args: []string{"-c", pipe},
 		CaptureStdout: true, CaptureStderr: true,
 	}); err != nil {
-		return fmt.Errorf("streamed curl|tar extract: %w", err)
+		return fmt.Errorf("streamed curl|tar extract: %w", withStderr(err, res.Stderr))
 	}
 
 	osRelease := filepath.Join(eopts.Sysroot, "etc", "os-release")

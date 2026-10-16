@@ -165,6 +165,36 @@ func TestBIOSDiskOSProceedsWithWarning(t *testing.T) {
 	}
 }
 
+// A layout the validator accepts with a warning installs, and the warning
+// reaches the tool log at WARN level so the operator sees what was read.
+func TestConfigWarningsAreLogged(t *testing.T) {
+	tmp := t.TempDir()
+	cmdline := filepath.Join(tmp, "cmdline")
+	if err := os.WriteFile(cmdline, []byte("root=luna rw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logDir := filepath.Join(tmp, "logs")
+	cfg := writeConfig(t, strings.Replace(validConfig, `"raid": "none",`, `"raid": "none", "spares": 1,`, 1))
+	var outBuf, errBuf bytes.Buffer
+	rc := run([]string{
+		"lpart-storage-prepare",
+		"--log-dir", logDir,
+		"--cmdline-path", cmdline,
+		"--skip-command-check",
+		"--skip-final-inventory",
+		"--config", cfg, "--dry-run",
+	}, &outBuf, &errBuf)
+	if strings.Contains(errBuf.String(), "fatal_config=config-validation") {
+		t.Fatalf("a warning must not refuse the layout; rc=%d stderr=%s", rc, errBuf.String())
+	}
+	logText := readToolLog(t, logDir)
+	for _, want := range []string{"level=WARN", `raid=none takes no spares, so spares=1 is ignored`} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("expected the validation warning to be logged with %q; log=%s", want, logText)
+		}
+	}
+}
+
 // A disk OS gets no bootloader on BIOS, so the post-install handoff must be a
 // pivot to /sysroot. An install ramdisk that reboots instead would land on a
 // disk with nothing to boot and loop back into PXE forever: refuse up front,
@@ -331,8 +361,8 @@ func TestRefusesWithoutLunaMarker(t *testing.T) {
 		"--skip-final-inventory",
 		"--config", cfg, "--dry-run",
 	}, &outBuf, &errBuf)
-	if rc == 0 {
-		t.Fatalf("expected refusal; stderr=%s", errBuf.String())
+	if rc != 1 { // the same exit as every lpart tool's installer-env guard
+		t.Fatalf("expected refusal with exit 1, got %d; stderr=%s", rc, errBuf.String())
 	}
 	if !strings.Contains(errBuf.String(), "root=luna") {
 		t.Fatalf("wording wrong: %s", errBuf.String())
@@ -443,5 +473,16 @@ func TestInvalidConfigIsFatalNotRetryable(t *testing.T) {
 	_, stderr, rc := runWithBootEnv(t, "uefi", true, "--install-context", ic, "--config", cfg, "--dry-run")
 	if rc != 3 || !strings.Contains(stderr, "fatal_config=config-validation") {
 		t.Fatalf("invalid config: want rc=3 with fatal_config marker, got rc=%d stderr=%s", rc, stderr)
+	}
+}
+
+// A bad command line is the same on every attempt: exit 3 parks with a
+// fatal_config line, as in every lpart tool; exit 2 is reserved for safety
+// refusals.
+func TestBadFlagIsFatalConfig(t *testing.T) {
+	var out, errb bytes.Buffer
+	rc := run([]string{toolName, "--no-such-flag"}, &out, &errb)
+	if rc != 3 || !strings.Contains(errb.String(), "fatal_config=usage") {
+		t.Fatalf("rc=%d (want 3), stderr=%s", rc, errb.String())
 	}
 }

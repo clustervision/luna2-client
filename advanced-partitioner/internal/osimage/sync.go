@@ -1,41 +1,14 @@
 package osimage
 
-// sync.go -- the converge-to-image refresh for sync/auto on a healthy disk.
+// The converge-to-image refresh for sync/auto on a healthy disk: one
+// decompression feeds GNU tar and an in-process header reader, then a sweep
+// deletes what is neither an image member nor protected. Extracting first means
+// an interruption leaves too many files, never too few.
 //
-// One decompression of the image tarball feeds, at the same time,
-//
-//   - GNU tar, which extracts the image over the existing tree with the same
-//     --exclude list as a full extract (preserve, no_new_files,
-//     preserve_empty contents, persistent mountpoints), and
-//   - an in-process tar header reader, which records every member path and
-//     its metadata without parsing tar's text output.
-//
-// Then a sweep deletes every path on the os set's filesystems that is neither
-// an image member (or a parent of one) nor protected by the filter. The
-// protection the sweep honours is built from the SAME parsed patterns as the
-// tar excludes (Protection), so nothing tar leaves alone is ever deleted:
-// TestSweepNeverDeletesTarExcluded pins that.
-//
-// Compared with the former PrepareSysroot-then-extract refresh:
-//   - extract first, sweep second: a failure or power loss mid-way leaves too
-//     many files, never too few;
-//   - keep_extra: image files under a path are refreshed, files the image does
-//     not have are kept (logs, local state);
-//   - image_wins: selected paths inside a preserved tree still come from the
-//     image;
-//   - /boot and /boot/efi are converged too (the old prepare skipped any
-//     top-level directory with a mount below it, so old kernels and stale ESP
-//     files stayed for ever);
-//   - verify: every extracted member is compared with its tar header after the
-//     sweep (type, permissions, owner, size, mtime, link target; "content" also
-//     compares sha256), so "the disk matches the image" is checked, not assumed.
-//
-// Type conflicts (the image has a file where the disk has a directory, or the
-// other way round) are resolved by the header reader BEFORE tar sees the member:
-// the bytes of a member are only passed on to tar after the conflicting path
-// has been removed, and only when that path is not protected. GNU tar's own
-// --recursive-unlink is never used: it removes existing directory trees
-// wholesale, protected content included.
+// The sweep's protection is built from the same patterns as the tar excludes,
+// so nothing tar leaves alone is deleted (TestSweepNeverDeletesTarExcluded).
+// Type conflicts are resolved before tar sees the member: tar's own
+// --recursive-unlink would remove protected trees wholesale.
 
 import (
 	"archive/tar"
@@ -45,82 +18,53 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
 )
 
-// Protection decides what the sync sweep must never delete. It is built from
-// the same patterns as BuildTarExcludes plus the persistent mountpoints, so
-// the sweep and tar agree on what is protected.
+// Protection decides what the sync sweep must never delete.
 type Protection struct {
 	Preserve      []Pattern // excluded from tar, kept on disk as is
 	PreserveEmpty []Pattern // directory kept, its contents removed (tar excludes base/*)
 	NoNewFiles    []Pattern // excluded from tar, kept on disk as is
 	KeepExtra     []Pattern // NOT excluded from tar; files the image lacks are kept
-	// Mountpoints the sweep must not enter (persistent sets, non-os sets) --
-	// sysroot-relative, without leading "/".
+	// SkipMounts are sysroot-relative mountpoints the sweep never enters.
 	SkipMounts []string
 }
 
-// protectedSubtree reports whether rel lies in (or is) a kept subtree: the
-// sweep leaves rel and everything below it alone.
+// protectedSubtree reports whether the sweep leaves rel and everything below it alone.
 func (p Protection) protectedSubtree(rel string) bool {
-	for _, set := range [][]Pattern{p.Preserve, p.NoNewFiles, p.KeepExtra} {
-		for _, pt := range set {
-			if pt.Match(rel) {
-				return true
-			}
-		}
+	if matchAny(p.Preserve, rel) || matchAny(p.NoNewFiles, rel) || matchAny(p.KeepExtra, rel) {
+		return true
 	}
-	for _, m := range p.SkipMounts {
-		if rel == m || strings.HasPrefix(rel, m+"/") {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(p.SkipMounts, func(m string) bool { return within(rel, m) })
 }
 
-// mayContainProtected reports whether a directory rel could hold a protected
-// path below it, so the sweep must descend into it instead of removing it
-// whole. A pattern with a wildcard protects anything under its literal prefix
-// (conservative: the sweep then decides child by child).
+// mayContainProtected reports whether directory rel could hold a protected
+// path, so the sweep decides child by child instead of removing it whole. A
+// wildcard pattern counts for anything under its literal prefix.
 func (p Protection) mayContainProtected(rel string) bool {
-	under := func(base string) bool { return base != "" && strings.HasPrefix(base, rel+"/") }
+	below := rel + "/"
 	for _, set := range [][]Pattern{p.Preserve, p.NoNewFiles, p.KeepExtra, p.PreserveEmpty} {
 		for _, pt := range set {
 			lit := literalPrefix(pt.Raw)
-			if under(pt.Base) || under(lit) || (lit != "" && strings.HasPrefix(rel+"/", lit)) && strings.ContainsAny(pt.Raw, "*?") {
+			if strings.HasPrefix(pt.Base, below) || (lit != "" && (strings.HasPrefix(lit, below) || strings.HasPrefix(below, lit))) {
 				return true
 			}
 		}
 	}
-	for _, m := range p.SkipMounts {
-		if strings.HasPrefix(m, rel+"/") {
-			return true
-		}
-	}
-	return false
-}
-
-// emptiedDir reports whether rel is a preserve_empty base: the directory itself
-// is kept, its children are swept (tar does not refill them).
-func (p Protection) emptiedDir(rel string) bool {
-	for _, pt := range p.PreserveEmpty {
-		if rel == pt.Base {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(p.SkipMounts, func(m string) bool { return strings.HasPrefix(m, below) })
 }
 
 // literalPrefix returns the part of a pattern before its first wildcard,
@@ -137,26 +81,17 @@ func literalPrefix(raw string) string {
 	return ""
 }
 
-// ExcludedByTar reports whether a member path is excluded from the tar
-// extract by the given exclude flags (as built by BuildTarExcludes and the
-// persistent-mountpoint excludes): "--exclude=./X" excludes X and everything
-// below it, "--exclude=./X/*" everything below X. Patterns follow tar's
-// wildcard rules as used here (no wildcards in our bases except in preserve
-// globs, where * may match /).
+// ExcludedByTar reports whether the --exclude flags (as BuildTarExcludes
+// builds them) skip member rel: "./X" excludes X and everything below it,
+// "./X/*" only what is below X.
 func ExcludedByTar(rel string, excludes []string) bool {
 	for _, ex := range excludes {
 		pat := strings.TrimPrefix(strings.TrimPrefix(ex, "--exclude="), "./")
-		if pat == "" {
-			continue
-		}
-		if strings.HasSuffix(pat, "/*") {
-			base := strings.TrimSuffix(pat, "/*")
+		if base, ok := strings.CutSuffix(pat, "/*"); ok {
 			if strings.HasPrefix(rel, base+"/") {
 				return true
 			}
-			continue
-		}
-		if globMatch(pat, rel) || rel == pat || strings.HasPrefix(rel, pat+"/") {
+		} else if pat != "" && (globMatch(pat, rel) || within(rel, pat)) {
 			return true
 		}
 	}
@@ -169,13 +104,16 @@ type SyncOptions struct {
 	Sysroot     string
 	TarballPath string
 	ACLs        bool
-	// TarExcludes is the full --exclude list (filter + persistent mountpoints).
-	TarExcludes []string
+	TarExcludes []string // the full --exclude list (filter + persistent mountpoints)
 	Protect     Protection
-	// ImageWins are member patterns extracted from the image even inside a
-	// preserved tree (a second tar on the same stream).
+	// OSMounts are the os set's own mountpoints, sysroot-relative ("boot",
+	// "boot/efi"). The sweep never enters any other mount below the sysroot.
+	OSMounts []string
+	// ImageWins are extracted even inside a preserved tree (a second tar on
+	// the same stream).
 	ImageWins []Pattern
-	// Verify: "metadata" (default), "content" (also sha256), or "none".
+	// Verify: "none" (default), "metadata", or "content" (also sha256).
+	// Mismatches are warnings only.
 	Verify      string
 	DryRun      bool
 	Details     bool
@@ -183,9 +121,10 @@ type SyncOptions struct {
 	// test seams
 	decompress func(ctx context.Context, path string) (io.ReadCloser, func() error, error)
 	tarCmd     func(ctx context.Context, args ...string) *exec.Cmd
-	// conflictDelay slows the type-conflict check down (test only): without the
+	// conflictDelay slows the type-conflict check (test only): without the
 	// hold, tar would then reach the member first and fail.
 	conflictDelay time.Duration
+	mounts        []string // sysroot-relative mountpoints below the sysroot
 }
 
 // SyncResult reports what the sync did.
@@ -215,7 +154,7 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 	}
 	o.Sysroot = filepath.Clean(o.Sysroot)
 	if o.Verify == "" {
-		o.Verify = "metadata"
+		o.Verify = "none"
 	}
 	if o.decompress == nil {
 		o.decompress = lbzip2Decompress
@@ -228,46 +167,45 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 		return res, nil
 	}
 
+	var err error
+	if o.mounts, err = mountsBelow(o.Sysroot); err != nil {
+		return res, err
+	}
+	o.Protect.SkipMounts = slices.Clone(o.Protect.SkipMounts)
+	for _, m := range o.mounts {
+		if !slices.Contains(o.OSMounts, m) {
+			o.Protect.SkipMounts = append(o.Protect.SkipMounts, m)
+		}
+	}
+
 	src, waitSrc, err := o.decompress(ctx, o.TarballPath)
 	if err != nil {
 		return res, fmt.Errorf("sync: decompress %s: %w", o.TarballPath, err)
 	}
 	defer func() { _ = src.Close() }()
 
-	base := append([]string{"--numeric-owner"}, CapabilityXattrArgs...)
+	acl := "--no-acls"
 	if o.ACLs {
-		base = append([]string{"--acls"}, base...)
-	} else {
-		base = append([]string{"--no-acls"}, base...)
+		acl = "--acls"
 	}
-	tar1 := o.tarCmd(ctx, append(append(append([]string{}, base...), o.TarExcludes...), "-xf", "-", "-C", o.Sysroot)...)
-	var tar1Err strings.Builder
-	tar1.Stderr = &limitedWriter{b: &tar1Err, max: 64 << 10}
-	in1, err := tar1.StdinPipe()
+	base := append([]string{acl, "--numeric-owner"}, CapabilityXattrArgs...)
+	var tar1Err, tar2Err strings.Builder
+	tar1, in1, err := o.startTar(ctx, append(append(slices.Clone(base), o.TarExcludes...), "-xf", "-", "-C", o.Sysroot), &tar1Err, "sync: start tar")
 	if err != nil {
 		return res, err
-	}
-	if err := tar1.Start(); err != nil {
-		return res, fmt.Errorf("sync: start tar: %w", err)
 	}
 	sinks := []io.Writer{in1}
 	closers := []io.Closer{in1}
 
 	var tar2 *exec.Cmd
-	var tar2Err strings.Builder
 	if len(o.ImageWins) > 0 {
-		args := append(append([]string{}, base...), "--wildcards", "-xf", "-", "-C", o.Sysroot)
+		args := append(slices.Clone(base), "--wildcards", "-xf", "-", "-C", o.Sysroot)
 		for _, w := range o.ImageWins {
 			args = append(args, "./"+w.Raw)
 		}
-		tar2 = o.tarCmd(ctx, args...)
-		tar2.Stderr = &limitedWriter{b: &tar2Err, max: 64 << 10}
-		in2, err := tar2.StdinPipe()
-		if err != nil {
+		var in2 io.WriteCloser
+		if tar2, in2, err = o.startTar(ctx, args, &tar2Err, "sync: start tar (image_wins)"); err != nil {
 			return res, err
-		}
-		if err := tar2.Start(); err != nil {
-			return res, fmt.Errorf("sync: start tar (image_wins): %w", err)
 		}
 		sinks = append(sinks, in2)
 		closers = append(closers, in2)
@@ -277,9 +215,8 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 	br := bufio.NewReaderSize(src, 1<<20)
 	tr := tar.NewReader(io.TeeReader(br, fw))
 	members := map[string]memberInfo{}
-	// hard links whose target tar excluded: tar cannot create them ("Cannot
-	// hard link to ...: No such file or directory", exit 2); they are linked
-	// to the preserved on-disk file after the extract
+	// hard links to a member tar excluded: tar cannot create them, so they are
+	// linked to the preserved on-disk file after the extract
 	type pendingLink struct{ link, target string }
 	var pending []pendingLink
 	var streamErr error
@@ -293,49 +230,48 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 			streamErr = fmt.Errorf("sync: read image tar: %w", err)
 			break
 		}
-		rel := strings.TrimSuffix(strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+hdr.Name)), "/"), "/")
+		rel := memberPath(hdr.Name)
 		if rel != "" {
-			mi := memberInfo{typ: hdr.Typeflag, mode: hdr.Mode, uid: hdr.Uid, gid: hdr.Gid, size: hdr.Size, mtime: hdr.ModTime, link: hdr.Linkname}
-			excluded := ExcludedByTar(rel, o.TarExcludes)
-			if !excluded || winsMatch(o.ImageWins, rel) {
-				if fixed, ferr := o.resolveTypeConflict(rel, hdr); ferr != nil {
+			if o.extracted(rel) {
+				fixed, ferr := o.resolveTypeConflict(rel, hdr)
+				if ferr != nil {
 					streamErr = ferr
 					break
-				} else if fixed {
+				}
+				if fixed {
 					res.TypeChanges++
 				}
-			}
-			if hdr.Typeflag == tar.TypeLink && (!excluded || winsMatch(o.ImageWins, rel)) {
-				tgt := strings.TrimSuffix(strings.TrimPrefix(filepath.ToSlash(filepath.Clean("/"+hdr.Linkname)), "/"), "/")
-				if ExcludedByTar(tgt, o.TarExcludes) && !winsMatch(o.ImageWins, tgt) {
-					pending = append(pending, pendingLink{rel, tgt})
+				if hdr.Typeflag == tar.TypeLink {
+					if tgt := memberPath(hdr.Linkname); !o.extracted(tgt) {
+						pending = append(pending, pendingLink{rel, tgt})
+					}
 				}
-			}
-			if !excluded || winsMatch(o.ImageWins, rel) {
-				members[rel] = mi
+				members[rel] = memberInfo{typ: hdr.Typeflag, mode: hdr.Mode, uid: hdr.Uid, gid: hdr.Gid, size: hdr.Size, mtime: hdr.ModTime, link: hdr.Linkname}
 			} else {
 				members[rel] = memberInfo{typ: 'x'} // excluded: kept by the sweep, not verified
 			}
 		}
 		fw.release()
+		var h hash.Hash
+		sink := io.Discard
 		if o.Verify == "content" && hdr.Typeflag == tar.TypeReg && members[rel].typ != 'x' {
-			h := sha256.New()
-			if _, err := io.Copy(h, tr); err != nil {
-				streamErr = fmt.Errorf("sync: read %s: %w", rel, err)
-				break
-			}
+			h = sha256.New()
+			sink = h
+		}
+		if _, err := io.Copy(sink, tr); err != nil {
+			streamErr = fmt.Errorf("sync: read %s: %w", rel, err)
+			break
+		}
+		if h != nil {
 			mi := members[rel]
 			mi.sum = hex.EncodeToString(h.Sum(nil))
 			members[rel] = mi
-		} else if _, err := io.Copy(io.Discard, tr); err != nil {
-			streamErr = fmt.Errorf("sync: read %s: %w", rel, err)
-			break
 		}
 	}
 	fw.release()
 	if streamErr == nil {
-		// end-of-archive blocks and record padding after the last header,
-		// read from the buffered reader so no buffered byte is lost
+		// end-of-archive blocks and record padding, from the buffered reader so
+		// no buffered byte is lost
 		if _, err := io.Copy(fw, br); err != nil {
 			streamErr = err
 		}
@@ -348,14 +284,23 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 	if tar2 != nil {
 		werr2 = tar2.Wait()
 	}
+	if streamErr != nil {
+		_ = src.Close() // the decompressor blocks on a full pipe until its reader goes
+	}
 	srcErr := waitSrc()
+	if errors.Is(streamErr, syscall.EPIPE) && werr1 != nil {
+		// a tar that died early shows here as a broken pipe; the cause is its stderr
+		return res, fmt.Errorf("%w (tar extract: %v: %s)", streamErr, werr1, strings.TrimSpace(tar1Err.String()))
+	}
 	if streamErr != nil {
 		return res, streamErr
 	}
 	if srcErr != nil {
 		return res, fmt.Errorf("sync: decompress: %w", srcErr)
 	}
-	if werr1 != nil && len(pending) > 0 && onlyHardlinkErrors(tar1Err.String(), len(pending)) {
+	// GNU tar exits 2 both for a hard link it cannot create and for a fatal
+	// error; only its stderr tells them apart.
+	if werr1 != nil && len(pending) > 0 && exitStatus(werr1) == 2 && onlyHardlinkErrors(tar1Err.String(), len(pending)) {
 		werr1 = nil // the pending links are created below
 	}
 	if werr1 != nil {
@@ -377,12 +322,15 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 	if werr2 != nil {
 		// tar exits 2 when a requested member is not in the archive: an
 		// image_wins entry the image does not carry. Report, do not fail.
+		// It exits 2 for a fatal error too; only its stderr tells them apart.
+		if exitStatus(werr2) != 2 || !onlyNotFoundErrors(tar2Err.String()) {
+			return res, fmt.Errorf("sync: tar extract (image_wins): %v: %s", werr2, strings.TrimSpace(tar2Err.String()))
+		}
 		o.warn("image_wins: %v: %s", werr2, strings.TrimSpace(tar2Err.String()))
 	}
 	res.Members = len(members)
 	o.info("sync: image extracted over %s (%d members, %d type changes)", o.Sysroot, res.Members, res.TypeChanges)
 
-	// Sweep.
 	keepDirs := map[string]bool{}
 	for rel := range members {
 		for d := filepath.Dir(rel); d != "." && d != "/" && !keepDirs[d]; d = filepath.Dir(d) {
@@ -398,17 +346,18 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 
 	if o.Verify != "none" {
 		res.Verified, res.Mismatches = o.verify(members)
-		if len(res.Mismatches) > 0 {
-			for i, m := range res.Mismatches {
-				if i >= 20 {
-					o.warn("... %d more mismatches", len(res.Mismatches)-20)
-					break
-				}
-				o.warn("verify: %s", m)
+		for i, m := range res.Mismatches {
+			if i >= 20 {
+				o.warn("... %d more mismatches", len(res.Mismatches)-20)
+				break
 			}
-			return res, &SyncVerifyError{Count: len(res.Mismatches)}
+			o.warn("verify: %s", m)
 		}
-		o.info("sync: verified %d member(s) against the image (%s): disk matches the image", res.Verified, o.Verify)
+		if len(res.Mismatches) > 0 {
+			o.warn("sync: %d member(s) on disk do not match the image after the sync", len(res.Mismatches))
+		} else {
+			o.info("sync: verified %d member(s) against the image (%s): disk matches the image", res.Verified, o.Verify)
+		}
 	}
 
 	if o.RemoveAfter {
@@ -419,24 +368,65 @@ func SyncExtract(ctx context.Context, o SyncOptions) (SyncResult, error) {
 	return res, nil
 }
 
-// SyncVerifyError means the disk does not match the image after the sync.
-type SyncVerifyError struct{ Count int }
-
-func (e *SyncVerifyError) Error() string {
-	return fmt.Sprintf("sync: %d member(s) on disk do not match the image after the sync", e.Count)
-}
-
-func winsMatch(wins []Pattern, rel string) bool {
-	for _, w := range wins {
-		if w.Match(rel) {
-			return true
-		}
+// startTar starts a tar reading the image from its stdin.
+func (o SyncOptions) startTar(ctx context.Context, args []string, stderr *strings.Builder, what string) (*exec.Cmd, io.WriteCloser, error) {
+	cmd := o.tarCmd(ctx, args...)
+	cmd.Env = append(os.Environ(), "LC_ALL=C") // the hard-link tolerance reads tar's English messages
+	cmd.Stderr = &limitedWriter{b: stderr, max: 64 << 10}
+	in, err := cmd.StdinPipe()
+	if err != nil {
+		return nil, nil, err
 	}
-	return false
+	if err := cmd.Start(); err != nil {
+		return nil, nil, fmt.Errorf("%s: %w", what, err)
+	}
+	return cmd, in, nil
 }
 
-// resolveTypeConflict removes an unprotected on-disk path whose type differs
-// from the member's (so tar can create the member), before tar sees it.
+// extracted reports whether tar writes member rel: not excluded, or image_wins.
+func (o SyncOptions) extracted(rel string) bool {
+	return !ExcludedByTar(rel, o.TarExcludes) || matchAny(o.ImageWins, rel)
+}
+
+// parentIsReal reports whether rel's parent directory below the sysroot resolves
+// to itself, i.e. no component of it is a symlink.
+func (o SyncOptions) parentIsReal(rel string) bool {
+	root, err := filepath.EvalSymlinks(o.Sysroot)
+	if err != nil {
+		return false
+	}
+	dir, err := filepath.EvalSymlinks(filepath.Join(o.Sysroot, filepath.Dir(rel)))
+	return err == nil && dir == filepath.Join(root, filepath.Dir(rel))
+}
+
+// memberPath turns a member name into a sysroot-relative path ("./etc/" -> "etc").
+func memberPath(name string) string {
+	return strings.TrimPrefix(filepath.Clean("/"+name), "/")
+}
+
+func matchAny(pats []Pattern, rel string) bool {
+	return slices.ContainsFunc(pats, func(p Pattern) bool { return p.Match(rel) })
+}
+
+// within reports whether rel is base or lies below it.
+func within(rel, base string) bool {
+	return rel == base || strings.HasPrefix(rel, base+"/")
+}
+
+// exitStatus is a command's exit status, or -1 when it did not exit normally.
+func exitStatus(err error) int {
+	var ee *exec.ExitError
+	if errors.As(err, &ee) {
+		return ee.ExitCode()
+	}
+	return -1
+}
+
+var conflictKinds = map[byte]string{tar.TypeReg: "file", tar.TypeSymlink: "symlink", tar.TypeLink: "hardlink"}
+
+// resolveTypeConflict removes an unprotected on-disk directory where the image
+// has a file, symlink or hard link, before tar sees the member. tar replaces a
+// non-directory itself; devices and fifos are left to tar.
 func (o SyncOptions) resolveTypeConflict(rel string, hdr *tar.Header) (bool, error) {
 	abs := filepath.Join(o.Sysroot, rel)
 	fi, err := os.Lstat(abs)
@@ -446,24 +436,18 @@ func (o SyncOptions) resolveTypeConflict(rel string, hdr *tar.Header) (bool, err
 	if o.conflictDelay > 0 {
 		time.Sleep(o.conflictDelay)
 	}
-	wantDir := hdr.Typeflag == tar.TypeDir
-	isDir := fi.IsDir()
-	if wantDir == isDir {
+	kind, ok := conflictKinds[hdr.Typeflag]
+	if !ok || !fi.IsDir() {
 		return false, nil
 	}
-	if !wantDir && hdr.Typeflag != tar.TypeReg && hdr.Typeflag != tar.TypeSymlink && hdr.Typeflag != tar.TypeLink {
-		return false, nil // devices/fifos: let tar decide
-	}
-	if !isDir {
-		// disk has a file/symlink where the image has a directory: tar replaces
-		// a non-directory itself; a symlink to a directory is replaced too.
+	if !o.parentIsReal(rel) {
+		// a symlinked parent (opt -> data/opt) would take the removal out of the os tree
 		return false, nil
 	}
-	// disk has a directory where the image has a file/symlink/hardlink.
-	if o.Protect.protectedSubtree(rel) || o.Protect.mayContainProtected(rel) || isMountOrHasMount(abs) {
+	if o.Protect.protectedSubtree(rel) || o.Protect.mayContainProtected(rel) || o.hasMount(rel) {
 		return false, fmt.Errorf("sync: the image has a non-directory at %s, but the disk has a directory there that holds protected content or a mount; not removing it -- operator review required", rel)
 	}
-	o.info("sync: type change at %s (directory on disk, %s in the image): removing the directory", rel, typeName(hdr.Typeflag))
+	o.info("sync: type change at %s (directory on disk, %s in the image): removing the directory", rel, kind)
 	return true, os.RemoveAll(abs)
 }
 
@@ -477,33 +461,25 @@ const (
 
 // underEmptied reports whether rel lies strictly below a preserve_empty base.
 func (p Protection) underEmptied(rel string) bool {
-	for _, pt := range p.PreserveEmpty {
-		if pt.Base != "" && strings.HasPrefix(rel, pt.Base+"/") {
-			return true
-		}
-	}
-	return false
+	return slices.ContainsFunc(p.PreserveEmpty, func(pt Pattern) bool { return pt.Base != "" && strings.HasPrefix(rel, pt.Base+"/") })
 }
 
-// sweepAction is the sweep's decision for one on-disk path, independent of
-// the filesystem walk so it can be tested exhaustively. inImage: rel is an
-// image member; excluded: tar excluded that member; keepDir: rel is a parent
-// directory of a member.
+// sweepAction is the sweep's decision for one on-disk path, apart from the walk
+// so it can be tested exhaustively. inImage: rel is a member; excluded: tar
+// excluded that member; keepDir: rel is a parent directory of a member.
 func (p Protection) sweepAction(rel string, isDir, inImage, excluded, keepDir bool) int {
 	switch {
 	case p.protectedSubtree(rel):
-		// preserve / no_new_files / keep_extra / persistent or non-os mount
 		return actKeepTree
-	case p.emptiedDir(rel):
+	case slices.ContainsFunc(p.PreserveEmpty, func(pt Pattern) bool { return pt.Base == rel }):
 		return actKeep // the preserve_empty directory itself stays; its children are emptied
 	case p.underEmptied(rel):
 		if isDir && p.mayContainProtected(rel) {
 			return actDescend
 		}
-		return actRemove // preserve_empty: "keep the directory, wipe its contents"
+		return actRemove
 	case inImage && excluded:
-		// tar left it alone for a reason this Protection does not name: keep it
-		// exactly as it is (never delete what tar excluded)
+		// tar left it alone for a reason this Protection does not name
 		return actKeepTree
 	case inImage || keepDir:
 		return actKeep
@@ -516,7 +492,13 @@ func (p Protection) sweepAction(rel string, isDir, inImage, excluded, keepDir bo
 func (o SyncOptions) sweep(members map[string]memberInfo, keepDirs map[string]bool) (int, error) {
 	removed := 0
 	root := o.Sysroot
-	rootDev := devOf(root)
+	// The root and the os set's own volumes converge alike.
+	ownDevs := map[uint64]bool{devOf(root): true}
+	for _, m := range o.OSMounts {
+		if slices.Contains(o.mounts, m) {
+			ownDevs[devOf(filepath.Join(root, m))] = true
+		}
+	}
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, werr error) error {
 		if werr != nil {
 			if errors.Is(werr, fs.ErrNotExist) {
@@ -527,10 +509,9 @@ func (o SyncOptions) sweep(members map[string]memberInfo, keepDirs map[string]bo
 		if path == root {
 			return nil
 		}
-		rel := filepath.ToSlash(strings.TrimPrefix(path, root+"/"))
+		rel := strings.TrimPrefix(path, root+"/")
 		m, inImage := members[rel]
-		act := o.Protect.sweepAction(rel, d.IsDir(), inImage, m.typ == 'x', keepDirs[rel])
-		switch act {
+		switch o.Protect.sweepAction(rel, d.IsDir(), inImage, m.typ == 'x', keepDirs[rel]) {
 		case actKeepTree:
 			if d.IsDir() {
 				return filepath.SkipDir
@@ -539,8 +520,9 @@ func (o SyncOptions) sweep(members map[string]memberInfo, keepDirs map[string]bo
 		case actKeep, actDescend:
 			return nil
 		}
-		if d.IsDir() && (devOf(path) != rootDev || isMountOrHasMount(path)) {
-			// another filesystem that the image does not own: never delete into it
+		if d.IsDir() && (!ownDevs[devOf(path)] || o.hasMount(rel)) {
+			// a mountpoint, a parent of one, or a filesystem that is not the os
+			// set's: never delete into it
 			o.detail("  sync: keeping mountpoint %s (not part of the image)", rel)
 			return filepath.SkipDir
 		}
@@ -577,17 +559,13 @@ func posixMetaFS(dev uint64, path string, cache map[uint64]bool) bool {
 	if v, ok := cache[dev]; ok {
 		return v
 	}
-	v := true
-	if t, err := statfsType(path); err == nil && fsMagicNoPOSIX[t] {
-		v = false
-	}
-	cache[dev] = v
-	return v
+	t, err := statfsType(path)
+	cache[dev] = err != nil || !fsMagicNoPOSIX[t]
+	return cache[dev]
 }
 
-// mtimeMatches compares a file's mtime with the image's: to the second on a
-// POSIX filesystem, within 2 seconds on vfat (FAT rounds write times down to
-// an even second).
+// mtimeMatches compares mtimes to the second on a POSIX filesystem, within
+// 2 seconds on vfat (FAT rounds write times down to an even second).
 func mtimeMatches(disk, image time.Time, posix bool) bool {
 	if posix {
 		return disk.Truncate(time.Second).Equal(image.Truncate(time.Second))
@@ -603,12 +581,7 @@ func (o SyncOptions) verify(members map[string]memberInfo) (int, []string) {
 	fsKind := map[uint64]bool{}
 	var bad []string
 	n := 0
-	keys := make([]string, 0, len(members))
-	for k := range members {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for _, rel := range keys {
+	for _, rel := range slices.Sorted(maps.Keys(members)) {
 		m := members[rel]
 		if m.typ == 'x' {
 			continue
@@ -621,13 +594,8 @@ func (o SyncOptions) verify(members map[string]memberInfo) (int, []string) {
 		}
 		st, _ := fi.Sys().(*syscall.Stat_t)
 		n++
-		// The ESP is vfat: it stores no owner or mode bits (the mount options
-		// decide them) and keeps mtimes in 2-second steps. Compare type, size,
-		// content and mtime (2 s tolerance) there; owner and mode cannot match.
-		posix := true
-		if st != nil {
-			posix = posixMetaFS(uint64(st.Dev), abs, fsKind) //nolint:unconvert // Dev is uint64 on amd64, uint32 elsewhere
-		}
+		// vfat (the ESP) stores no owner or mode, so only POSIX filesystems compare them
+		posix := st == nil || posixMetaFS(uint64(st.Dev), abs, fsKind) //nolint:unconvert // Dev is uint64 on amd64, uint32 elsewhere
 		switch m.typ {
 		case tar.TypeDir:
 			if !fi.IsDir() {
@@ -686,7 +654,8 @@ func fileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func devOf(path string) uint64 {
+// devOf is a test seam: the device a path is on.
+var devOf = func(path string) uint64 {
 	fi, err := os.Lstat(path)
 	if err != nil {
 		return 0
@@ -697,84 +666,64 @@ func devOf(path string) uint64 {
 	return 0
 }
 
-// isMountOrHasMount reports whether path is a mountpoint or has a mount below
-// it, from /proc/self/mounts.
-func isMountOrHasMount(path string) bool {
-	body, err := os.ReadFile("/proc/self/mounts")
+// procSelfMounts is a test seam.
+var procSelfMounts = "/proc/self/mounts"
+
+var mountUnescaper = strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+
+// mountsBelow lists the mountpoints strictly below root, relative to it. An
+// unreadable mount table is an error: the sweep must know what not to enter.
+func mountsBelow(root string) ([]string, error) {
+	body, err := os.ReadFile(procSelfMounts)
 	if err != nil {
-		return true // fail closed: do not delete what we cannot prove is not a mount
+		return nil, fmt.Errorf("sync: cannot list the mounts below %s, refusing to sweep: %w", root, err)
 	}
+	var out []string
 	for _, line := range strings.Split(string(body), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 2 {
-			continue
-		}
-		mp := strings.ReplaceAll(f[1], `\040`, " ")
-		if mp == path || strings.HasPrefix(mp, path+"/") {
-			return true
+		if f := strings.Fields(line); len(f) >= 2 {
+			if rel, ok := strings.CutPrefix(mountUnescaper.Replace(f[1]), root+"/"); ok && rel != "" {
+				out = append(out, rel)
+			}
 		}
 	}
-	return false
+	return out, nil
 }
 
-func typeName(t byte) string {
-	switch t {
-	case tar.TypeReg:
-		return "file"
-	case tar.TypeSymlink:
-		return "symlink"
-	case tar.TypeLink:
-		return "hardlink"
-	case tar.TypeDir:
-		return "directory"
-	}
-	return fmt.Sprintf("type %q", t)
+// hasMount reports whether rel is a mountpoint or has one below it.
+func (o SyncOptions) hasMount(rel string) bool {
+	return slices.ContainsFunc(o.mounts, func(m string) bool { return within(m, rel) })
 }
 
-// holdWriter buffers while hold is set and passes bytes straight on otherwise,
-// so a member's header reaches tar only after the type-conflict check.
+// holdWriter buffers while hold is set, so a member's header reaches tar only
+// after the type-conflict check.
 type holdWriter struct {
 	w    io.Writer
 	hold bool
 	buf  []byte
-	mu   sync.Mutex
 	err  error
 }
 
 func (h *holdWriter) Write(p []byte) (int, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	if h.err != nil {
-		return 0, h.err
-	}
-	if h.hold {
+	if h.hold && h.err == nil {
 		h.buf = append(h.buf, p...)
 		return len(p), nil
 	}
-	if len(h.buf) > 0 {
-		if _, err := h.w.Write(h.buf); err != nil {
-			h.err = err
-			return 0, err
-		}
-		h.buf = h.buf[:0]
+	h.release()
+	if h.err == nil {
+		_, h.err = h.w.Write(p)
 	}
-	if _, err := h.w.Write(p); err != nil {
-		h.err = err
-		return 0, err
+	if h.err != nil {
+		return 0, h.err
 	}
 	return len(p), nil
 }
 
 func (h *holdWriter) release() {
-	h.mu.Lock()
 	h.hold = false
 	if len(h.buf) > 0 && h.err == nil {
-		if _, err := h.w.Write(h.buf); err != nil {
-			h.err = err
-		}
+		_, h.err = h.w.Write(h.buf)
 		h.buf = h.buf[:0]
 	}
-	h.mu.Unlock()
 }
 
 type limitedWriter struct {
@@ -783,13 +732,8 @@ type limitedWriter struct {
 }
 
 func (l *limitedWriter) Write(p []byte) (int, error) {
-	if l.b.Len() < l.max {
-		rest := l.max - l.b.Len()
-		if len(p) > rest {
-			l.b.Write(p[:rest])
-		} else {
-			l.b.Write(p)
-		}
+	if rest := l.max - l.b.Len(); rest > 0 {
+		l.b.Write(p[:min(len(p), rest)])
 	}
 	return len(p), nil
 }
@@ -829,6 +773,24 @@ func (o SyncOptions) detail(format string, args ...any) {
 	if o.Logger != nil && o.Details {
 		o.Logger.UserInfo(format, args...)
 	}
+}
+
+// onlyNotFoundErrors reports whether tar's stderr holds nothing but "Not found
+// in archive" errors and the closing exit summary.
+func onlyNotFoundErrors(stderr string) bool {
+	n := 0
+	for _, line := range strings.Split(strings.TrimSpace(stderr), "\n") {
+		line = strings.TrimSpace(line)
+		switch {
+		case line == "":
+		case strings.HasSuffix(line, ": Not found in archive"):
+			n++
+		case strings.Contains(line, "Exiting with failure status due to previous errors"):
+		default:
+			return false
+		}
+	}
+	return n > 0
 }
 
 // onlyHardlinkErrors reports whether tar's stderr holds nothing but "Cannot

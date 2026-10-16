@@ -2,6 +2,7 @@ package storagehealth
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -135,5 +136,18 @@ func TestVolumeDevice(t *testing.T) {
 	raid0 := &v2.Set{Name: "os", Role: "os", Selection: "manual", Raid: "0"}
 	if got := volumeDevice(raid0, esp, "/dev/sda", 1); got != "/dev/sda1" {
 		t.Errorf("raid0 ESP must be raw: got %q want /dev/sda1", got)
+	}
+}
+
+// allow_degraded is advised only to a set that does not already have it.
+func TestDegradedRefusalAdvisesOnlyWhatIsMissing(t *testing.T) {
+	for _, allow := range []bool{false, true} {
+		msg := DegradedRefusal(&v2.Set{Name: "os", AllowDegraded: allow})
+		if advised := strings.Contains(msg, "set allow_degraded"); advised == allow {
+			t.Errorf("allow_degraded=%v: advice to set it = %v: %q", allow, advised, msg)
+		}
+		if !strings.Contains(msg, "replace the disk") {
+			t.Errorf("allow_degraded=%v: the replace advice is gone: %q", allow, msg)
+		}
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -46,9 +47,15 @@ func HasBIOSBootPartition(ctx context.Context, runner executor.Runner, disk stri
 // fine, and the probe or mount that follows stays the hard gate. Shared by the
 // health probe (sync/auto/local verdicts) and the mount-existing path, so both
 // see the same devices.
-func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, disks []string, logger *txlog.Logger) {
+//
+// readOnly assembles the arrays read-only (the health probe on a data set). A
+// degraded array is started (--run) only when the set allows it
+// (allow_degraded); otherwise it stays inactive and its name is returned in
+// Degraded. Assembled names the arrays this call assembled, for Release.
+func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, disks []string, logger *txlog.Logger, readOnly bool) Activation {
+	var act Activation
 	if runner == nil || set == nil {
-		return
+		return act
 	}
 	run := func(path string, args ...string) {
 		if _, err := runner.Run(ctx, executor.CommandSpec{
@@ -66,11 +73,29 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 			names = append(names, mdName+"-efi", mdName+"-boot")
 		}
 		for _, n := range names {
-			assembleExplicit(ctx, runner, n, disks, run, logger)
+			assembled, degraded := assembleExplicit(ctx, runner, n, disks, run, logger, readOnly, set.AllowDegraded)
+			if assembled {
+				act.Assembled = append(act.Assembled, n)
+			}
+			if degraded {
+				act.Degraded = append(act.Degraded, n)
+			}
 		}
 		run("udevadm", "settle")
 		for _, n := range names {
-			warnIfDegraded(ctx, runner, set.Name, n, logger)
+			active, total, state, degraded := runningDegraded(ctx, runner, n)
+			switch {
+			case !degraded:
+			case set.AllowDegraded:
+				if logger != nil {
+					logger.Warn(fmt.Sprintf("set %s: array %s runs DEGRADED (%s of %s members active, state %q); allow_degraded is set, so the set is used as it is -- re-add or replace the failed member (mdadm --detail /dev/md/%s), or reinstall with install_mode full to rebuild it", set.Name, n, active, total, state, n))
+				}
+			case !slices.Contains(act.Degraded, n):
+				// Already running on fewer members (started before lpart):
+				// without allow_degraded that is the same refusal as a
+				// member that is missing.
+				act.Degraded = append(act.Degraded, n)
+			}
 		}
 	}
 	if set.StorageType() == v2.StorageLVM {
@@ -81,10 +106,37 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 			if logger != nil {
 				logger.Info("activate (best-effort) VG " + set.VGName() + ": " + problem)
 			}
-			return
+			return act
 		}
 		run("vgchange", "-ay", "--select", vg.Select())
 		run("udevadm", "settle")
+	}
+	return act
+}
+
+// Activation is what ActivateExisting brought up.
+type Activation struct {
+	Assembled []string // arrays this call assembled (not ones already running)
+	Degraded  []string // arrays left inactive because a member is missing
+}
+
+// Release stops what a health probe brought up -- the volume group (when
+// vgSelect is set) and the arrays it assembled -- so the decision that follows
+// starts from the disks as they were, and the probe's read-only arrays never
+// reach a mount.
+func Release(ctx context.Context, runner executor.Runner, act Activation, vgSelect string, logger *txlog.Logger) {
+	run := func(path string, args ...string) {
+		if _, err := runner.Run(ctx, executor.CommandSpec{
+			Path: path, Args: args, CaptureStdout: true, CaptureStderr: true,
+		}); err != nil && logger != nil {
+			logger.Info("release (best-effort) " + path + " " + strings.Join(args, " ") + ": " + err.Error())
+		}
+	}
+	if vgSelect != "" {
+		run("vgchange", "-an", "--select", vgSelect)
+	}
+	for _, n := range act.Assembled {
+		run("mdadm", "--stop", "/dev/md/"+n)
 	}
 }
 
@@ -92,12 +144,10 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 // finds on the given disks (mdadm --examine, superblock Name match). No
 // members found is a no-op: the array may already be running.
 //
-// --run starts the array even when a member is missing (degraded): without it
-// mdadm assembles but leaves a degraded array inactive, so a node with one
-// dead mirror disk could never mount its OS again (sync parked, auto recreated
-// on the surviving disk, a persistent raid set parked). mdadm still refuses
-// when too few members remain for the level to run at all.
-func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string, disks []string, run func(string, ...string), logger *txlog.Logger) {
+// Without --run mdadm leaves an array that misses a member inactive; start
+// adds --run, so it runs degraded. assembled reports that this call assembled
+// the array, degraded that it is left inactive.
+func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string, disks []string, run func(string, ...string), logger *txlog.Logger, readOnly, start bool) (assembled, degraded bool) {
 	var members []string
 	for _, d := range disks {
 		for _, p := range partitionsOn(ctx, runner, d) {
@@ -110,15 +160,35 @@ func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string
 		if logger != nil {
 			logger.Info(fmt.Sprintf("activate: no member partitions with superblock name %q on the set's disks (array already running, or not raid)", mdName))
 		}
-		return
+		return false, false
 	}
 	for _, m := range members {
 		if md := mdHolder(ctx, runner, m); md != "" {
-			adoptAssembledArray(ctx, runner, mdName, md, run, logger)
-			return
+			return false, adoptAssembledArray(ctx, runner, mdName, md, members, run, logger, start)
 		}
 	}
-	run("mdadm", append([]string{"--assemble", "--run", "/dev/md/" + mdName}, members...)...)
+	args := []string{"--assemble"}
+	if readOnly {
+		args = append(args, "--readonly")
+	}
+	if start {
+		args = append(args, "--run")
+	}
+	run("mdadm", append(append(args, "/dev/md/"+mdName), members...)...)
+	md := mdHolder(ctx, runner, members[0])
+	return true, md != "" && arrayState(ctx, runner, md) == "inactive"
+}
+
+// arrayState is the md array's sysfs state ("clean", "inactive", ...), or "".
+func arrayState(ctx context.Context, runner executor.Runner, md string) string {
+	res, err := runner.Run(ctx, executor.CommandSpec{
+		Path: "cat", Args: []string{"/sys/block/" + md + "/md/array_state"},
+		CaptureStdout: true, CaptureStderr: true,
+	})
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(res.Stdout))
 }
 
 // mdHolder returns the kernel name of the md array that already holds
@@ -147,25 +217,32 @@ func mdHolder(ctx context.Context, runner executor.Runner, dev string) string {
 // so `mdadm --assemble` on its members failed "is busy - skipping" and the
 // health probe judged the set broken ("block device not found:
 // /dev/md/os-efi") -- a degraded mirror could never be synced or booted
-// locally on Ubuntu. Start it (degraded) and give it its name.
-func adoptAssembledArray(ctx context.Context, runner executor.Runner, mdName, md string, run func(string, ...string), logger *txlog.Logger) {
-	state := ""
-	if res, err := runner.Run(ctx, executor.CommandSpec{
-		Path: "cat", Args: []string{"/sys/block/" + md + "/md/array_state"},
-		CaptureStdout: true, CaptureStderr: true,
-	}); err == nil {
-		state = strings.TrimSpace(string(res.Stdout))
-	}
+// locally on Ubuntu. Start it (degraded) when start allows it, and give it its
+// name; otherwise report it degraded and leave it as it is.
+func adoptAssembledArray(ctx context.Context, runner executor.Runner, mdName, md string, members []string, run func(string, ...string), logger *txlog.Logger, start bool) (degraded bool) {
+	state := arrayState(ctx, runner, md)
 	if logger != nil {
 		logger.Info(fmt.Sprintf("activate: array %s is already assembled as /dev/%s (state %q); using it", mdName, md, state))
 	}
 	switch state {
 	case "clean", "active", "active-idle", "readonly", "read-auto", "write-pending":
+		// a member that missed writes (a stale disk put back) must not be
+		// taken over with the others; never used, whatever allow_degraded says
+		if events := memberEvents(ctx, runner, members); len(events) > 1 {
+			if logger != nil {
+				logger.Warn(fmt.Sprintf("activate: array %s (/dev/%s) members disagree on their event count (%s); not taken over", mdName, md, strings.Join(events, ", ")))
+			}
+			return true
+		}
 	default: // inactive (degraded, not started) or unknown
+		if !start {
+			return true
+		}
 		run("mdadm", "--run", "/dev/"+md)
 	}
 	run("mkdir", "-p", "/dev/md")
 	run("ln", "-sfn", "../"+md, "/dev/md/"+mdName)
+	return false
 }
 
 // MDNamesOnDisks maps the md array name in every superblock found on the
@@ -232,23 +309,42 @@ func mdSuperblockName(ctx context.Context, runner executor.Runner, part string) 
 	return ""
 }
 
-// warnIfDegraded logs a loud warning when /dev/md/<mdName> runs degraded.
-// A mirror member that lost its md superblock (or failed) is not a missing
-// disk: the array starts on the other member, the set probes healthy and is
-// used -- correctly -- but nothing said so, and the mirror silently stayed
-// single for every later install. Arrays that do not exist are skipped.
-func warnIfDegraded(ctx context.Context, runner executor.Runner, setName, mdName string, logger *txlog.Logger) {
-	if logger == nil {
-		return
+// memberEvents returns the distinct event counts in the members' superblocks
+// (mdadm --examine "Events :"); members it cannot read are skipped.
+func memberEvents(ctx context.Context, runner executor.Runner, members []string) []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, m := range members {
+		res, err := runner.Run(ctx, executor.CommandSpec{
+			Path: "mdadm", Args: []string{"--examine", m},
+			CaptureStdout: true, CaptureStderr: true,
+		})
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(res.Stdout), "\n") {
+			if k, v, ok := strings.Cut(strings.TrimSpace(line), " : "); ok && strings.TrimSpace(k) == "Events" {
+				if v = strings.TrimSpace(v); !seen[v] {
+					seen[v] = true
+					out = append(out, m+"="+v)
+				}
+			}
+		}
 	}
+	return out
+}
+
+// runningDegraded reports whether /dev/md/<mdName> runs degraded, with its
+// active and total member counts and state as mdadm --detail prints them. An
+// array that does not exist is not degraded.
+func runningDegraded(ctx context.Context, runner executor.Runner, mdName string) (active, total, state string, degraded bool) {
 	res, err := runner.Run(ctx, executor.CommandSpec{
 		Path: "mdadm", Args: []string{"--detail", "/dev/md/" + mdName},
 		CaptureStdout: true, CaptureStderr: true,
 	})
 	if err != nil {
-		return
+		return "", "", "", false
 	}
-	var state, active, total string
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
 		k, v, ok := strings.Cut(strings.TrimSpace(line), " : ")
 		if !ok {
@@ -263,8 +359,5 @@ func warnIfDegraded(ctx context.Context, runner executor.Runner, setName, mdName
 			total = strings.TrimSpace(v)
 		}
 	}
-	if !strings.Contains(state, "degraded") {
-		return
-	}
-	logger.Warn(fmt.Sprintf("set %s: array %s runs DEGRADED (%s of %s members active, state %q); the set is used as it is -- re-add or replace the failed member (mdadm --detail /dev/md/%s), or reinstall with install_mode full to rebuild it", setName, mdName, active, total, state, mdName))
+	return active, total, state, strings.Contains(state, "degraded")
 }

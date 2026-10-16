@@ -29,6 +29,9 @@ func TestValidCorpus(t *testing.T) {
 			if err := cfg.ValidateRaw(raw); err != nil {
 				t.Fatalf("ValidateRaw: %v", err)
 			}
+			if len(cfg.Warnings) > 0 {
+				t.Fatalf("a worked example must not warn: %q", cfg.Warnings)
+			}
 			if err := cfg.Validate(); err != nil {
 				t.Fatalf("Validate (round-trip): %v", err)
 			}
@@ -209,6 +212,11 @@ func TestInvalidCases(t *testing.T) {
 			"save-on-manual",
 			`{"version":2,"sets":[{"name":"x","role":"data","selection":"manual","raid":"none","devices":["/dev/sda"],"save":true,"volumes":[` + dataVol() + `]}]}`,
 			"save is only valid on a selection=discover set",
+		},
+		{
+			"include_san-on-manual",
+			`{"version":2,"sets":[{"name":"x","role":"data","selection":"manual","raid":"none","devices":["/dev/sda"],"include_san":true,"volumes":[` + dataVol() + `]}]}`,
+			"include_san is only valid on a selection=discover set",
 		},
 		{
 			"origin-unknown-field",

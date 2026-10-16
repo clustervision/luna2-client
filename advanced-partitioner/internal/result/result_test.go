@@ -296,7 +296,7 @@ func TestAssembleCarriesBootloaderChoice(t *testing.T) {
 		{"", "grub", "last"},
 		{v2.BootloaderLast, "grub", "last"},
 		{v2.BootloaderFirst, "grub", "first"},
-		{v2.BootloaderNone, "none", "last"},
+		{v2.BootloaderNone, "none", "none"}, // finalise on BIOS removes GRUB for none only
 	}
 	for _, c := range cases {
 		t.Run(string(c.bl), func(t *testing.T) {

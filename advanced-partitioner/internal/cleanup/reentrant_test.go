@@ -99,6 +99,9 @@ func TestReentrantCleanupAfterPriorPreparePass(t *testing.T) {
 	}
 
 	f := executor.NewFakeRunner(executor.FakeResponse{})
+	// the array is lpart's own (homehost "any") from the previous install
+	f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine", "/dev/sda3"},
+		Response: executor.FakeResponse{Stdout: []byte("  Name : any:os\n")}})
 	// findmnt -rn -o TARGET,SOURCE: /sysroot is mounted from the prior pass.
 	f.AddMatch(executor.FakeMatch{
 		Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET,SOURCE"},

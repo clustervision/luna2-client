@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cleanup"
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/discover"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/disk/selector"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/diskresolve"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installcontext"
@@ -215,7 +217,7 @@ func (sp *setProcessor) planSet(ctx context.Context, mode installcontext.Mode, c
 	// set.Devices so the record shows the same disks). Failure to meet the
 	// layout is a halt, never a silent fallback.
 	if set.SelectionMode() == "discover" && set.StorageType() != v2.StorageMemory {
-		if err := sp.resolveDiscover(set); err != nil {
+		if err := sp.resolveDiscover(ctx, set); err != nil {
 			return p, err
 		}
 	}
@@ -234,6 +236,9 @@ func (sp *setProcessor) planSet(ctx context.Context, mode installcontext.Mode, c
 		sp.logger.KV("verdict", set.Name+"="+string(verdict))
 	}
 
+	if verdict == storagehealth.VerdictDegraded {
+		return p, safetyRefusalf("degraded", "%s; no disk was touched", storagehealth.DegradedRefusal(set))
+	}
 	act, halt := decideAction(mode, set.Role, false, verdict)
 	// A set with absent members may only be MOUNTED, degraded, and only when
 	// the array actually came up (healthy verdict, or local/full which do
@@ -344,9 +349,11 @@ func classifyResolveErr(setName string, err error) error {
 	return fmt.Errorf("set %q: %w", setName, err)
 }
 
-// missingDeviceError is the fatal config error for a set whose absent
-// devices it cannot run without; nil when nothing is missing or the redundant
-// raid set can still run degraded (planSet then still refuses a create).
+// missingDeviceError is the error for a set with absent devices: a safety
+// refusal (reason degraded) when the redundant raid set could run without them
+// but the layout does not allow it, the fatal config error when it cannot run
+// at all, nil when nothing is missing or allow_degraded is set (planSet then
+// still refuses a create).
 func (sp *setProcessor) missingDeviceError(set *v2.Set) error {
 	missing := sp.missing[set.Name]
 	if len(missing) == 0 {
@@ -354,7 +361,12 @@ func (sp *setProcessor) missingDeviceError(set *v2.Set) error {
 	}
 	present := len(sp.manualDisks[set.Name])
 	if set.RunsDegradedWith(present) {
-		return nil
+		if set.AllowDegraded {
+			return nil
+		}
+		return safetyRefusalf("degraded",
+			"set %q is degraded: device(s) %s not present on this node (%d of %d present); replace the disk and reinstall with install_mode full, or set allow_degraded on the set to install on it degraded; no disk was touched",
+			set.Name, strings.Join(missing, ", "), present, len(set.EffectiveDevices()))
 	}
 	return fatalConfigf("device-missing",
 		"set %q: device(s) %s not present on this node, and raid %s cannot run without them (%d of %d device(s) present) -- replace the disk or correct the disklayout; no disk was touched",
@@ -410,11 +422,7 @@ func (sp *setProcessor) refuseForeignSetSignatures(ctx context.Context, cfg *v2.
 					set.Name, paths, v.Name, other.Name)
 			}
 		}
-		names := []string{other.MDName()}
-		if other.Role == "os" {
-			names = append(names, other.MDName()+"-efi", other.MDName()+"-boot")
-		}
-		for _, n := range names {
+		for _, n := range setMDNames(other) {
 			if dev, ok := mdNames[n]; ok {
 				return safetyRefusalf(reason,
 					"set %q (selection=discover) picked disk(s) %v, and %s carries md array %q of set %q -- discover chose another set's disks; refusing to wipe them -- operator review required (pin the sets with selection=manual)",
@@ -443,8 +451,13 @@ func (sp *setProcessor) checkForeignVGs(ctx context.Context, plans []plannedSet)
 			continue
 		}
 		loc, err := vgselect.Locate(ctx, sp.runner, p.set.VGName(), diskPaths(p.disks))
-		if err != nil || len(loc.Foreign) == 0 {
-			continue // the lvm builder re-checks right before vgcreate
+		if err != nil {
+			// Retry rather than skip: the builder's re-check would only run
+			// after every create set was cleaned.
+			return fmt.Errorf("set %q: look for a foreign volume group %q: %w; no disk was touched", p.set.Name, p.set.VGName(), err)
+		}
+		if len(loc.Foreign) == 0 {
+			continue
 		}
 		wiped, err := vgselect.StackedKernelNames(ctx, sp.runner, createDisks)
 		if err != nil {
@@ -554,16 +567,23 @@ func (sp *setProcessor) reserveManualSets(ctx context.Context, cfg *v2.Config) e
 		}
 		var present []selector.Resolved
 		var missing []string
-		for _, dev := range set.EffectiveDevices() {
-			r, err := sp.resolveForReservation(ctx, []string{dev})
-			if err != nil {
-				if errors.Is(err, selector.ErrNotFound) {
-					missing = append(missing, dev)
-					continue
+		resolve := func() (int, error) {
+			present, missing = nil, nil
+			for _, dev := range set.EffectiveDevices() {
+				r, err := sp.resolveForReservation(ctx, []string{dev})
+				if err != nil {
+					if errors.Is(err, selector.ErrNotFound) {
+						missing = append(missing, dev)
+						continue
+					}
+					return 0, err
 				}
-				return classifyResolveErr(set.Name, fmt.Errorf("resolving devices for reservation: %w", err))
+				present = append(present, r...)
 			}
-			present = append(present, r...)
+			return len(missing), nil
+		}
+		if err := selector.WaitWhileMissing(ctx, sp.runner, sp.lateWait, resolve); err != nil {
+			return classifyResolveErr(set.Name, fmt.Errorf("resolving devices for reservation: %w", err))
 		}
 		if len(missing) > 0 {
 			// Judged by planSet (missingDeviceError): a set this run ignores
@@ -607,13 +627,17 @@ func (sp *setProcessor) reserveManualSets(ctx context.Context, cfg *v2.Config) e
 // raid count, removes them from the pool, and fills set.Devices. A match the
 // pool cannot meet is a fatal config error (exit 3) -- unless the pool itself
 // could not be listed, which may clear on retry (exit 1).
-func (sp *setProcessor) resolveDiscover(set *v2.Set) error {
+func (sp *setProcessor) resolveDiscover(ctx context.Context, set *v2.Set) error {
 	mf := set.MatchFilter()
 	m, err := diskresolve.ParseMatch(mf.Tags, mf.MinSize, mf.MaxSize, mf.Model)
 	if err != nil {
 		return fatalConfigf("match-invalid", "set %q: match: %v", set.Name, err)
 	}
-	selected, err := diskresolve.Resolve(sp.pool, m, set.MemberCount(), set.SpareCount(), 0)
+	pool := sp.pool
+	if !set.IncludeSAN {
+		pool = localDisks(pool)
+	}
+	selected, err := diskresolve.Resolve(pool, m, set.MemberCount(), set.SpareCount(), 0, sp.ownDisks(ctx, set, pool))
 	if err != nil {
 		if sp.poolErr != nil {
 			return fmt.Errorf("set %q: %w (device discovery failed: %v)", set.Name, err, sp.poolErr)
@@ -639,15 +663,71 @@ func (sp *setProcessor) resolveDiscover(set *v2.Set) error {
 	return nil
 }
 
+// ownDisks returns the pool disks (by Path) that already carry the set's own
+// volume group or md array: the disks it was installed on before. A disk that
+// cannot be probed is simply not preferred; the signature refusals still run
+// before anything is created.
+func (sp *setProcessor) ownDisks(ctx context.Context, set *v2.Set, pool []discover.Device) map[string]bool {
+	own := map[string]bool{}
+	for _, d := range pool {
+		disk := []string{d.KernelPath}
+		vgs, _ := vgselect.OnDisks(ctx, sp.runner, disk)
+		for _, v := range vgs {
+			if v.Name == set.VGName() {
+				own[d.Path] = true
+			}
+		}
+		mdNames := storagehealth.MDNamesOnDisks(ctx, sp.runner, disk)
+		for _, n := range setMDNames(set) {
+			if _, ok := mdNames[n]; ok {
+				own[d.Path] = true
+			}
+		}
+	}
+	if len(own) > 0 {
+		paths := make([]string, 0, len(own))
+		for p := range own {
+			paths = append(paths, p)
+		}
+		sort.Strings(paths)
+		sp.logger.UserInfo("set %q: preferring disk(s) %v, which carry its own volume group or md array", set.Name, paths)
+	}
+	return own
+}
+
+// localDisks leaves the SAN LUNs (shared storage) out of a pool.
+func localDisks(pool []discover.Device) []discover.Device {
+	out := make([]discover.Device, 0, len(pool))
+	for _, d := range pool {
+		if !d.SAN() {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// setMDNames are the md array names a set creates: its own, and for the os set
+// the ESP and /boot mirrors.
+func setMDNames(set *v2.Set) []string {
+	names := []string{set.MDName()}
+	if set.Role == "os" {
+		names = append(names, set.MDName()+"-efi", set.MDName()+"-boot")
+	}
+	return names
+}
+
 // runSanitize securely erases every discovered local disk, then stops.
 func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.StorageResult, []result.ResolvedSet, error) {
-	disks := make([]string, 0, len(sp.pool))
-	for _, d := range sp.pool {
+	local := localDisks(sp.pool)
+	disks := make([]string, 0, len(local))
+	erase := make([]sanitize.Disk, 0, len(local))
+	for _, d := range local {
 		disks = append(disks, d.KernelPath)
+		erase = append(erase, sanitize.Disk{Path: d.KernelPath, Size: d.Size})
 	}
 	if len(disks) == 0 {
 		// A diskless node is legitimate (exit 0), but say plainly that
-		// nothing was erased: the node powers off after sanitize.
+		// nothing was erased: the node parks after sanitize.
 		sp.logger.UserInfo("sanitize: no local disks found -- nothing was erased (USB, FC/iSCSI and multipath disks are excluded from sanitize by design)")
 		return nil, nil, nil
 	}
@@ -674,8 +754,8 @@ func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.
 		}
 		return nil, nil, fmt.Errorf("sanitize: pre-erase stack teardown: %w", err)
 	}
-	s := sanitize.New(sanitize.Options{Runner: sp.runner, Logger: sp.logger, DryRun: dryRun, ReadBack: sp.sanitizeReadBack})
-	if _, err := s.EraseAll(ctx, disks); err != nil {
+	s := sanitize.New(sanitize.Options{Runner: sp.runner, Logger: sp.logger, DryRun: dryRun, ReadBack: sp.sanitizeReadBack, Progress: sp.sanitizeProgress})
+	if _, err := s.EraseAll(ctx, erase); err != nil {
 		// Deterministic: the same disk fails the same way on every retry, so
 		// park for an operator (safety refusal, exit 2) instead of looping.
 		return nil, nil, safetyRefusalf("sanitize-incomplete", "%v", err)

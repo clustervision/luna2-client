@@ -408,14 +408,9 @@ type ExtractOptions struct {
 	RemoveAfter bool
 }
 
-// CapabilityXattrArgs restores file capabilities (security.capability) from
-// the image. The daemon packs with --xattrs --selinux --acls, but the extract
-// restored none of them, so every capability was lost and only the install
-// template's fix_capabilities put back a fixed list of nine binaries --
-// newuidmap/newgidmap (rootless podman, apptainer user namespaces), mtr-packet
-// and others stayed broken. Only security.capability: SELinux labels are set
-// by the template's restorecon afterwards, and user.* xattrs are not supported
-// on tmpfs (the memboot RAM root) by the el8 kernel.
+// CapabilityXattrArgs restores file capabilities from the image. Only
+// security.capability: SELinux labels come from the template's restorecon, and
+// the el8 kernel's tmpfs (the memboot root) does not take user.* xattrs.
 var CapabilityXattrArgs = []string{"--xattrs", "--xattrs-include=security.capability"}
 
 // Extract runs tar -I lbzip2 --acls/--no-acls --numeric-owner with the
@@ -447,17 +442,15 @@ func Extract(ctx context.Context, opts ExtractOptions) error {
 	args = append(args, "-xf", opts.TarballPath, "-C", opts.Sysroot)
 
 	opts.info("extracting osimage into " + opts.Sysroot)
-	if _, err := opts.Runner.Run(ctx, executor.CommandSpec{
+	if res, err := opts.Runner.Run(ctx, executor.CommandSpec{
 		Path: "tar", Args: args,
 		CaptureStdout: true, CaptureStderr: true,
 	}); err != nil {
-		return fmt.Errorf("tar extract: %w", err)
+		return fmt.Errorf("tar extract: %w", withStderr(err, res.Stderr))
 	}
 
-	osRelease := filepath.Join(opts.Sysroot, "etc", "os-release")
-	if _, err := os.Stat(osRelease); err != nil {
-		return fmt.Errorf("osimage extract did not produce %s: %w", osRelease, err)
-	}
+	// No os-release check here: VerifyExtract makes it, and refuses (exit 3)
+	// an image without one, which fails the same way on every retry.
 	opts.info("osimage extracted into " + opts.Sysroot + " successfully")
 
 	if opts.RemoveAfter {
@@ -508,4 +501,13 @@ func (o ExtractOptions) warn(msg string) {
 	if o.Logger != nil {
 		o.Logger.Warn(msg)
 	}
+}
+
+// withStderr adds a failed command's stderr to its error: the cause (a full
+// filesystem) is only there, and the caller classifies on the error text.
+func withStderr(err error, stderr []byte) error {
+	if s := executor.StderrExcerpt(stderr); s != "" {
+		return fmt.Errorf("%w: %s", err, s)
+	}
+	return err
 }

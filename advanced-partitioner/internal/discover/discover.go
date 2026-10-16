@@ -102,6 +102,10 @@ type Device struct {
 	ByPath string
 }
 
+// SAN reports a Fibre Channel or iSCSI LUN: shared storage, not the node's
+// own disk.
+func (d Device) SAN() bool { return d.Transport == "fc" || d.Transport == "iscsi" }
+
 // IdentityKey is a stable identity for ordering disks that are otherwise
 // equal (same size): WWN, else serial, else the by-path slot, and only as a
 // last resort the kernel name. Kernel names follow enumeration order, which
@@ -168,13 +172,12 @@ type Options struct {
 	SysBlockDir string
 }
 
-// ListDevices enumerates eligible LOCAL disks. Eligibility mirrors
-// intent_list_devices in lib/intent.sh: type=disk, transport not usb, fc or
-// iscsi, not a path of a device-mapper multipath map, not loop/ram/zram,
-// size>0, size in [MinBytes, MaxBytes] when set. USB disks are excluded by
-// design (install media, keys); FC/iSCSI LUNs and multipath paths are shared
-// SAN storage, never a node's own disk -- and every path of a multipath LUN
-// is the same LUN. The returned slice is sorted by Path for display; the
+// ListDevices enumerates eligible disks. Eligibility mirrors
+// intent_list_devices in lib/intent.sh: type=disk, transport not usb, not a
+// path of a device-mapper multipath map, not loop/ram/zram, size>0, size in
+// [MinBytes, MaxBytes] when set. USB disks are excluded by design (install
+// media, keys); every path of a multipath LUN is the same LUN. FC/iSCSI LUNs
+// are listed but are shared storage (SAN): only a set that opts in uses them. The returned slice is sorted by Path for display; the
 // discover resolver orders equal disks by IdentityKey.
 func ListDevices(ctx context.Context, opts Options) ([]Device, error) {
 	if opts.Runner == nil {
@@ -213,9 +216,8 @@ func ListDevices(ctx context.Context, opts Options) ([]Device, error) {
 		if e.Type != "disk" {
 			continue
 		}
-		// exclude USB (by design), and SAN LUNs: Fibre Channel, iSCSI
-		switch e.Tran {
-		case "usb", "fc", "iscsi":
+		// exclude USB (by design)
+		if e.Tran == "usb" {
 			continue
 		}
 		// exclude loop, ram, zram by kernel name

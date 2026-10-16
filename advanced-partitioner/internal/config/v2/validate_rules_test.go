@@ -1,9 +1,10 @@
 package v2
 
 // Table-driven tests for the build-feasibility rules: every layout the
-// partition/raid/lvm/fs builders cannot build must be refused at validation
-// (exit 3, before any disk is touched), and a nearby buildable layout must
-// still pass. A case with want == "" must validate.
+// partition/raid/lvm/fs builders cannot build, or whose cleanup would damage
+// the node, must be refused at validation (exit 3, before any disk is
+// touched); a layout that installs but looks like a mistake must validate
+// with a warning; a nearby buildable layout must validate without one.
 
 import (
 	"strconv"
@@ -11,10 +12,13 @@ import (
 	"testing"
 )
 
+// warnPrefix marks a want that is a warning on an accepted layout.
+const warnPrefix = "warn: "
+
 type ruleCase struct {
 	name string
 	json string
-	want string // substring of the refusal; "" = must validate
+	want string // substring of the refusal; "" = must validate with no warning; warnPrefix + substring = must validate with that warning
 }
 
 func runRuleCases(t *testing.T, cases []ruleCase) {
@@ -26,9 +30,17 @@ func runRuleCases(t *testing.T, cases []ruleCase) {
 				t.Fatalf("Parse: %v", err)
 			}
 			err = cfg.ValidateRaw([]byte(c.json))
-			if c.want == "" {
+			wantWarn, accepted := strings.CutPrefix(c.want, warnPrefix)
+			if c.want == "" || accepted {
 				if err != nil {
 					t.Fatalf("must validate, got: %v", err)
+				}
+				warnings := strings.Join(cfg.Warnings, "\n")
+				switch {
+				case wantWarn == "" && len(cfg.Warnings) > 0:
+					t.Fatalf("must validate without a warning, got: %s", warnings)
+				case !strings.Contains(warnings, wantWarn):
+					t.Fatalf("\n  got warnings: %q\n  want substring: %s", cfg.Warnings, wantWarn)
 				}
 				// The typed round trip (Validate re-encodes) must agree.
 				if err := cfg.Validate(); err != nil {
@@ -96,16 +108,24 @@ func TestRuleSetAndVolumeNames(t *testing.T) {
 	dataNamed := func(name string) string {
 		return osLayout(set(dataManual(name, "none", "/dev/sdb"), vol("d", "/d", "xfs", "lvm", "100%")))
 	}
+	raidNamed := func(name string) string {
+		return osLayout(set(dataManual(name, "1", "/dev/sdb", "/dev/sdc"), vol("d", "/d", "xfs", "lvm", "100%")))
+	}
 	dataVolNamed := func(name, provider string) string {
 		return osLayout(set(dataManual("data", "none", "/dev/sdb"), vol(name, "/d", "xfs", provider, "100%")))
 	}
 	runRuleCases(t, []ruleCase{
-		// set names: characters
-		{"set-name-space", dataNamed("my data"), `(set "my data"): name may only contain letters, digits, '_' and '-'`},
-		{"set-name-dot", dataNamed("data.1"), `(set "data.1"): name may only contain`},
-		{"set-name-slash", dataNamed("a/b"), `(set "a/b"): name may only contain`},
+		// set names: a path element leaves /dev under rm -rf; LVM refuses a
+		// leading '-'; any other odd character only earns a warning.
+		{"set-name-dot", dataNamed("."), `(set "."): name must not be "."`},
+		{"set-name-dotdot", raidNamed(".."), `(set ".."): name must not be ".."`},
+		{"set-name-slash", dataNamed("a/b"), `(set "a/b"): name must not contain '/'`},
+		{"set-name-slash-dotdot", dataNamed("a/.."), `name must not contain '/'`},
 		{"set-name-leading-hyphen", dataNamed("-data"), `(set "-data"): name must not start with '-'`},
 		{"set-name-folds-to-nothing", dataNamed("__"), `(set "__"): name must contain a letter or digit`},
+		{"set-name-space", dataNamed("my data"), warnPrefix + `(set "my data"): name "my data" has characters other than letters, digits, '_', '.' and '-'`},
+		{"set-name-ok-dotted", dataNamed("data.1"), ""},
+		{"set-name-ok-dots", raidNamed("a..b"), ""},
 		// set names: /dev entries cleanup would rm -rf
 		{"set-name-disk", dataNamed("disk"), `(set "disk"): name is reserved: /dev/disk exists`},
 		{"set-name-md", dataNamed("md"), `name is reserved: /dev/md exists`},
@@ -116,8 +136,10 @@ func TestRuleSetAndVolumeNames(t *testing.T) {
 		{"set-name-sda", dataNamed("sda"), `name is reserved: /dev/sda exists`},
 		{"set-name-nvme0n1", dataNamed("nvme0n1"), `name is reserved`},
 		{"set-name-md0", dataNamed("md0"), `name is reserved`},
-		{"set-name-too-long", dataNamed("scratch-nvme-local-2026"), `(set "scratch-nvme-local-2026"): name is 23 characters, at most 22 are allowed`},
-		{"set-name-longest-ok", dataNamed("scratch-nvme-local-202"), ""},
+		// the md array name limit binds raid sets only: raid none has no array.
+		{"set-name-too-long-raid", raidNamed("scratch-nvme-local-2026"), `(set "scratch-nvme-local-2026"): name is 23 characters, at most 22 are allowed on a raid set`},
+		{"set-name-longest-raid-ok", raidNamed("scratch-nvme-local-202"), ""},
+		{"set-name-too-long-raid-none-ok", dataNamed("scratch-nvme-local-2026-and-then-some"), ""},
 		{"set-name-ok-underscore", dataNamed("data_1"), ""},
 		{"set-name-ok-hyphen", dataNamed("data-1"), ""},
 		{"set-name-ok-nvme", dataNamed("nvme"), ""},
@@ -148,18 +170,22 @@ func TestRuleSetAndVolumeNames(t *testing.T) {
 		{"set-name-ok-prefix-without-lvm", osLayout(
 			set(dataManual("os-a", "none", "/dev/sdb"), vol("x", "/x", "xfs", "partition", "100%"))), ""},
 		// volume names
-		{"vol-name-slash", dataVolNamed("a/b", "lvm"), `(set "data", volume "a/b"): name may only contain`},
-		{"vol-name-space", dataVolNamed("my vol", "partition"), `name may only contain`},
+		{"vol-name-dot", dataVolNamed(".", "lvm"), `(set "data", volume "."): name must not be "."`},
+		{"vol-name-dotdot-partition", dataVolNamed("..", "partition"), `name must not be ".."`},
+		{"vol-name-slash", dataVolNamed("a/b", "lvm"), warnPrefix + `(set "data", volume "a/b"): name "a/b" has characters other than`},
+		{"vol-name-space", dataVolNamed("my vol", "partition"), warnPrefix + `name "my vol" has characters other than`},
 		{"vol-name-leading-hyphen", dataVolNamed("-d", "lvm"), `(set "data", volume "-d"): name must not start with '-'`},
-		{"lv-name-leading-underscore", dataVolNamed("_d", "lvm"), `an lvm volume name must not start with '_'`},
-		{"lv-name-snapshot", dataVolNamed("snapshot", "lvm"), `starting with "snapshot" are reserved by LVM`},
-		{"lv-name-snapshots", dataVolNamed("snapshots", "lvm"), `starting with "snapshot" are reserved by LVM`},
-		{"lv-name-pvmove", dataVolNamed("pvmove", "lvm"), `starting with "pvmove" are reserved by LVM`},
-		{"lv-name-tmeta", dataVolNamed("pool_tmeta", "lvm"), `containing "_tmeta" are reserved by LVM`},
-		{"lv-name-mlog", dataVolNamed("d_mlog", "lvm"), `containing "_mlog" are reserved`},
-		{"lv-name-rimage", dataVolNamed("d_rimage_0", "lvm"), `containing "_rimage" are reserved`},
+		{"lv-name-leading-underscore", dataVolNamed("_d", "lvm"), `lvm volume name "_d" matches "_", which LVM reserves`},
+		{"lv-name-snapshot", dataVolNamed("snapshot", "lvm"), `lvm volume name "snapshot" matches "snapshot", which LVM reserves`},
+		{"lv-name-snapshots", dataVolNamed("snapshots", "lvm"), `matches "snapshot", which LVM reserves`},
+		{"lv-name-pvmove", dataVolNamed("pvmove", "lvm"), `matches "pvmove", which LVM reserves`},
+		{"lv-name-tmeta", dataVolNamed("pool_tmeta", "lvm"), `matches "_tmeta", which LVM reserves`},
+		{"lv-name-mlog", dataVolNamed("d_mlog", "lvm"), `matches "_mlog"`},
+		{"lv-name-rimage", dataVolNamed("d_rimage_0", "lvm"), `matches "_rimage"`},
 		{"lv-name-ok", dataVolNamed("d_1-x", "lvm"), ""},
+		{"lv-name-ok-dotted", dataVolNamed("d.1", "lvm"), ""},
 		{"partition-name-snapshot-ok", dataVolNamed("snapshot", "partition"), ""},
+		{"partition-name-underscore-ok", dataVolNamed("_d", "partition"), ""},
 		{"vol-name-duplicate-in-set", osLayout(set(dataManual("data", "none", "/dev/sdb"),
 			vol("d", "/a", "xfs", "lvm", "10G"), vol("d", "/b", "xfs", "lvm", "100%"))),
 			`(set "data"): volume name "d" is used by volumes[0] and volumes[1]`},
@@ -182,31 +208,42 @@ func TestRuleVolumeSizes(t *testing.T) {
 		{"lvm-two-100pct", osLayout(set(dataManual("data", "none", "/dev/sdb"),
 			vol("a", "/a", "xfs", "lvm", "100%"), vol("b", "/b", "xfs", "lvm", "100%"))),
 			"at most one lvm volume per set may use size=100%"},
+		// sgdisk reads a fraction as a wrong size with exit 0; lvcreate reads it correctly.
+		{"partition-size-fraction", dataVolSized("partition", "1.5G"), `(set "data", volume "d"): size "1.5G" has a fraction, which sgdisk silently turns into a wrong partition`},
+		{"partition-size-fraction-zero", dataVolSized("partition", "0.0G"), `has a fraction`},
+		{"lvm-size-fraction-zero", dataVolSized("lvm", "0.0G"), `size "0.0G" must be greater than zero`},
 		// match sizes go through the resolver's own parser.
-		{"match-min-size-decimal", lay(set(osFields("os")+`,"match":{"min_size":"1.5T"}`, espVol(), rootLV())),
-			`(set "os"): match.min_size: cannot parse size "1.5T"`},
+		{"match-min-size-decimal-ok", lay(set(osFields("os")+`,"match":{"min_size":"1.5T"}`, espVol(), rootLV())), ""},
 		{"match-max-size-word", lay(set(osFields("os")+`,"match":{"max_size":"big"}`, espVol(), rootLV())),
-			`(set "os"): match.max_size: cannot parse size "big"`},
+			warnPrefix + `(set "os"): match.max_size: cannot parse size "big"`},
 		{"match-min-above-max", lay(set(osFields("os")+`,"match":{"min_size":"2T","max_size":"1T"}`, espVol(), rootLV())),
-			`match.min_size "2T" is larger than match.max_size "1T", so no disk can match`},
+			warnPrefix + `match.min_size "2T" is larger than match.max_size "1T", so no disk can match`},
 		{"match-sizes-ok", lay(set(osFields("os")+`,"match":{"min_size":"400G","max_size":"8TB"}`, espVol(), rootLV())), ""},
 	}
-	for _, bad := range []string{"1.5G", "50%", "20GB", "20", "-5G", "0G", "0M", "20g", "20 G", " 20G", "G", "100 %", "99999999999T", "99999999999999999999G"} {
+	// Measured: sgdisk makes "20" and "50%" into 20 and 50 sectors with exit 0;
+	// lvcreate reads "20" as 20 MiB and fails on the other forms after the wipe.
+	for _, bad := range []string{"50%", "20", "-5G", "20 G", " 20G", "G", "100 %"} {
 		for _, p := range []string{"partition", "lvm"} {
-			want := "is not valid"
-			switch bad {
-			case "0G", "0M":
-				want = "must be greater than zero"
-			case "99999999999T", "99999999999999999999G":
+			cases = append(cases, ruleCase{p + "-size-" + bad, dataVolSized(p, bad), `(set "data", volume "d"): size "` + bad + `" cannot be built`})
+		}
+	}
+	for _, bad := range []string{"0G", "0M", "0gb", "99999999999T", "99999999999999999999G"} {
+		for _, p := range []string{"partition", "lvm"} {
+			want := "must be greater than zero"
+			if strings.HasPrefix(bad, "9") {
 				want = "is too large"
 			}
 			cases = append(cases, ruleCase{p + "-size-" + bad, dataVolSized(p, bad), `(set "data", volume "d"): size "` + bad + `" ` + want})
 		}
 	}
-	for _, good := range []string{"512K", "600M", "20G", "2T", "100%"} {
+	// sgdisk and lvcreate both read a lowercase unit and a B/iB suffix as the binary unit.
+	for _, good := range []string{"512K", "600M", "600m", "20G", "20g", "20GB", "20gb", "20GiB", "20gib", "2T", "2TiB", "100%"} {
 		for _, p := range []string{"partition", "lvm"} {
 			cases = append(cases, ruleCase{p + "-size-ok-" + good, dataVolSized(p, good), ""})
 		}
+	}
+	for _, good := range []string{"1.5G", "0.5T", "1.25gib"} {
+		cases = append(cases, ruleCase{"lvm-size-ok-" + good, dataVolSized("lvm", good), ""})
 	}
 	runRuleCases(t, cases)
 }
@@ -220,7 +257,7 @@ func TestRulePartitionOrder(t *testing.T) {
 		// and a 100% root next to an lvm volume (which needs a storage
 		// partition after the direct partitions).
 		{"part-100pct-then-swap", lay(set(os1, espVol(), bootVol(), rootPart, swapPart)),
-			`(set "os", volume "root"): size=100% takes the rest of the disk, but direct partition "swap" is created after it (partition order: uefi (/boot/efi, 600M) -> boot (/boot, 1G) -> root (/, 100%) -> swap (swap, 2G))`},
+			`(set "os", volume "root"): size=100% takes the rest of the disk, but direct partition "swap" is created after it; only the last direct partition may use 100%`},
 		{"part-100pct-plus-lvm", lay(set(os1, espVol(), bootVol(), rootPart, vol("var", "/var", "xfs", "lvm", "20G"))),
 			`(set "os", volume "root"): size=100% takes the rest of the disk, but lvm volume(s) "var" need a storage partition after the direct partitions`},
 		{"part-100pct-plus-lvm-100pct", lay(set(os1, espVol(), rootPart, vol("var", "/var", "xfs", "lvm", "100%"))),
@@ -235,7 +272,7 @@ func TestRulePartitionOrder(t *testing.T) {
 		// position, so a 100% root listed before them is still last.
 		{"part-100pct-last-ok", lay(set(os1, espVol(), bootVol(), swapPart, rootPart)), ""},
 		{"part-100pct-json-first-swap-after", lay(set(os1, rootPart, swapPart, espVol(), bootVol())),
-			`size=100% takes the rest of the disk, but direct partition "swap" is created after it (partition order: uefi (/boot/efi, 600M) -> boot (/boot, 1G) -> root (/, 100%) -> swap (swap, 2G))`},
+			`size=100% takes the rest of the disk, but direct partition "swap" is created after it`},
 		{"part-100pct-json-first-boot-after-ok", lay(set(os1, rootPart, espVol(), bootVol())), ""},
 		{"part-fixed-plus-lvm-ok", lay(set(os1, espVol(), bootVol(), vol("root", "/", "xfs", "partition", "40G"), vol("var", "/var", "xfs", "lvm", "100%"))), ""},
 		{"part-data-fixed-plus-lvm-ok", osLayout(set(dataManual("data", "none", "/dev/sdb"),
@@ -265,29 +302,33 @@ func TestRuleSpares(t *testing.T) {
 		}
 		return out
 	}
+	const ignoredSpares = `is ignored: devices[] lists only the members; add the spare disk(s) to devices[]`
 	runRuleCases(t, []ruleCase{
-		// raid none / raid 0 have no member a spare could replace.
-		{"spares-raid-none-manual", data(withSpares(dataManual("data", "none", devs(2)...), 1)),
-			`(set "data"): raid=none takes no spares, got spares=1`},
+		// raid none / raid 0 have no member a spare could replace: the spares
+		// are dropped, and the member count is judged as it always was.
+		{"spares-raid-none-manual", data(withSpares(dataManual("data", "none", devs(1)...), 1)),
+			warnPrefix + `(set "data"): raid=none takes no spares, so spares=1 is ignored`},
+		{"spares-raid-none-manual-two-disks", data(withSpares(dataManual("data", "none", devs(2)...), 1)),
+			`raid=none needs exactly 1 device(s), but devices[] lists 2`},
 		{"spares-raid-none-discover", data(withSpares(`"name":"data","role":"data","selection":"discover","raid":"none"`, 1)),
-			`raid=none takes no spares`},
-		{"spares-raid0-discover", data(discover("0", 2, 1)), `(set "data"): raid=0 takes no spares, got spares=1`},
-		{"spares-os-raid-none", osRaid(withSpares(osFields("os"), 1)), `(set "os"): raid=none takes no spares`},
+			warnPrefix + `raid=none takes no spares`},
+		{"spares-raid0-discover", data(discover("0", 2, 1)), warnPrefix + `(set "data"): raid=0 takes no spares, so spares=1 is ignored`},
+		{"spares-os-raid-none", osRaid(withSpares(osFields("os"), 1)), warnPrefix + `(set "os"): raid=none takes no spares`},
 		// manual: devices[] lists every member, spares included.
 		{"spares-raid1-3dev-1spare-ok", data(withSpares(dataManual("data", "1", devs(3)...), 1)), ""},
 		{"spares-raid1-3dev-no-spare", data(dataManual("data", "1", devs(3)...)), "raid=1 needs exactly 2 device(s), but devices[] lists 3"},
 		{"spares-raid1-4dev-1spare", data(withSpares(dataManual("data", "1", devs(4)...), 1)),
-			`(set "data"): raid=1 needs exactly 2 device(s) active, but devices[] lists 4 with spares=1 (3 active)`},
-		{"spares-raid1-2dev-2spare", data(withSpares(dataManual("data", "1", devs(2)...), 2)),
-			`(set "data"): spares=2 leaves 0 active device(s) of the 2 in devices[]`},
+			`(set "data"): raid=1 needs exactly 2 device(s), but devices[] lists 3 active (4 devices minus spares=1)`},
 		{"spares-raid10-5dev-1spare-ok", data(withSpares(dataManual("data", "10", devs(5)...), 1)), ""},
-		{"spares-raid10-6dev-1spare-odd", data(withSpares(dataManual("data", "10", devs(6)...), 1)),
-			"raid=10 needs at least 4 device(s) active, but devices[] lists 6 with spares=1 (5 active)"},
 		{"spares-raid5-5dev-1spare-ok", data(withSpares(dataManual("data", "5", devs(5)...), 1)), ""},
-		{"spares-raid5-4dev-1spare", data(withSpares(dataManual("data", "5", devs(4)...), 1)),
-			"raid=5 needs at least 4 device(s) active, but devices[] lists 4 with spares=1 (3 active)"},
 		{"spares-raid6-6dev-1spare-ok", data(withSpares(dataManual("data", "6", devs(6)...), 1)), ""},
-		{"spares-raid6-5dev-1spare", data(withSpares(dataManual("data", "6", devs(5)...), 1)), "raid=6 needs at least 5 device(s) active"},
+		// A layout written when the installer ignored spares lists only the
+		// members: devices[] satisfies the level on its own, minus the spares
+		// it does not. It installs as it always did, with every disk active.
+		{"old-spares-raid1-2dev-2spare", data(withSpares(dataManual("data", "1", devs(2)...), 2)), warnPrefix + `(set "data"): spares=2 ` + ignoredSpares},
+		{"old-spares-raid10-6dev-1spare", data(withSpares(dataManual("data", "10", devs(6)...), 1)), warnPrefix + `spares=1 ` + ignoredSpares},
+		{"old-spares-raid5-4dev-1spare", data(withSpares(dataManual("data", "5", devs(4)...), 1)), warnPrefix + `spares=1 ` + ignoredSpares},
+		{"old-spares-raid6-5dev-1spare", data(withSpares(dataManual("data", "6", devs(5)...), 1)), warnPrefix + `spares=1 ` + ignoredSpares},
 		// discover: count active members, spares resolved on top.
 		{"spares-raid1-discover-ok", data(discover("1", 2, 1)), ""},
 		{"spares-raid10-discover-ok", data(discover("10", 4, 2)), ""},
@@ -295,11 +336,36 @@ func TestRuleSpares(t *testing.T) {
 		{"spares-os-raid1-3dev-1spare-ok", osRaid(withSpares(osManual("os", "1", devs(3)...), 1)), ""},
 		{"spares-os-raid10-5dev-1spare-ok", osRaid(withSpares(osManual("os", "10", devs(5)...), 1)), ""},
 		{"spares-os-raid10-discover-ok", osRaid(`"name":"os","role":"os","selection":"discover","raid":"10","count":4,"spares":1`), ""},
-		{"spares-os-raid1-2dev-1spare", osRaid(withSpares(osManual("os", "1", devs(2)...), 1)),
-			`(set "os"): raid=1 needs exactly 2 device(s) active, but devices[] lists 2 with spares=1 (1 active)`},
+		{"old-spares-os-raid1-2dev-1spare", osRaid(withSpares(osManual("os", "1", devs(2)...), 1)), warnPrefix + `(set "os"): spares=1 ` + ignoredSpares},
 		{"spares-os-raid10-7dev-1spare", osRaid(withSpares(osManual("os", "10", devs(7)...), 1)),
 			`(set "os"): the OS set uses exactly 1, 2 or 4 drives (raid none/1/0/10), got 6 active (7 devices minus spares=1)`},
 	})
+}
+
+// The spares a warning drops are gone from the Config every consumer reads
+// (SpareCount, the pinned layout), so the raid builder sees what the
+// installer that ignored spares saw: every device active. Warnings are what
+// the last validation found, not an accumulation.
+func TestOldSparesCountNormalised(t *testing.T) {
+	doc := lay(set(osFields("os"), espVol(), bootVol(), rootLV()),
+		set(dataManual("data", "1", "/dev/sdb", "/dev/sdc")+`,"spares":1`, vol("d", "/d", "xfs", "lvm", "100%")))
+	cfg, err := Parse([]byte(doc))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if err := cfg.ValidateRaw([]byte(doc)); err != nil {
+		t.Fatalf("must validate: %v", err)
+	}
+	if len(cfg.Warnings) != 1 || !strings.Contains(cfg.Warnings[0], "spares=1 is ignored") {
+		t.Fatalf("warnings = %q", cfg.Warnings)
+	}
+	s := &cfg.Sets[1]
+	if s.Spares != 0 || s.SpareCount() != 0 || s.MemberCount() != 2 {
+		t.Fatalf("spares not normalised: Spares=%d MemberCount=%d", s.Spares, s.MemberCount())
+	}
+	if err := cfg.Validate(); err != nil || len(cfg.Warnings) != 0 {
+		t.Fatalf("the normalised layout must validate cleanly: err=%v warnings=%q", err, cfg.Warnings)
+	}
 }
 
 func TestRuleDevicePathStyle(t *testing.T) {
@@ -320,10 +386,10 @@ func TestRuleDevicePathStyle(t *testing.T) {
 			`(set "os"): device "/dev/disk/by-uuid/0b6c1f9e-4d0a-4c4e-9a43-6f5d7c2b1a10" is a by-uuid link`},
 		{"by-uuid-data", dataOn("/dev/disk/by-uuid/1234-ABCD"), `(set "data"): device "/dev/disk/by-uuid/1234-ABCD" is a by-uuid link`},
 		{"by-uuid-raid1", osOn("/dev/disk/by-uuid/a", "/dev/disk/by-uuid/b"), `is a by-uuid link`},
-		{"by-label", dataOn("/dev/disk/by-label/scratch"), `is a /dev/disk/by-label link`},
-		{"by-partuuid", dataOn("/dev/disk/by-partuuid/5e1c-01"), `is a /dev/disk/by-partuuid link`},
-		{"by-partlabel", dataOn("/dev/disk/by-partlabel/DATA"), `is a /dev/disk/by-partlabel link`},
-		{"by-diskseq", dataOn("/dev/disk/by-diskseq/7"), `is a /dev/disk/by-diskseq link`},
+		{"by-label", dataOn("/dev/disk/by-label/scratch"), warnPrefix + `is a /dev/disk/by-label link`},
+		{"by-partuuid", dataOn("/dev/disk/by-partuuid/5e1c-01"), warnPrefix + `is a /dev/disk/by-partuuid link`},
+		{"by-partlabel", dataOn("/dev/disk/by-partlabel/DATA"), warnPrefix + `is a /dev/disk/by-partlabel link`},
+		{"by-diskseq", dataOn("/dev/disk/by-diskseq/7"), warnPrefix + `is a /dev/disk/by-diskseq link`},
 		{"by-id-ok", osOn("/dev/disk/by-id/ata-Samsung_SSD_870_S5Y1NX0R123456"), ""},
 		{"by-id-raid1-ok", osOn("/dev/disk/by-id/wwn-0x5002538e40a1b2c3", "/dev/disk/by-id/wwn-0x5002538e40a1b2c4"), ""},
 		{"by-path-ok", osOn("/dev/disk/by-path/pci-0000:00:1f.2-ata-1"), ""},
@@ -331,6 +397,14 @@ func TestRuleDevicePathStyle(t *testing.T) {
 		{"kernel-vd-ok", osOn("/dev/vda"), ""},
 		{"kernel-nvme-ok", osOn("/dev/nvme0n1"), ""},
 		{"mixed-styles", osOn("/dev/sda", "/dev/disk/by-id/wwn-0x1"), "all paths must use the same style (/dev/..., by-id, by-path)"},
+		// Paths that can name no disk fail on the node as "device not found".
+		{"blank-in-path", osOn("/dev/sda "), warnPrefix + `device "/dev/sda " contains a blank or control character`},
+		{"dotdot", osOn("/dev/../etc/passwd"), warnPrefix + `is not a clean path (write it as "/etc/passwd")`},
+		{"double-slash", osOn("/dev//sda"), warnPrefix + "is not a clean path"},
+		{"trailing-slash", osOn("/dev/sda/"), warnPrefix + "is not a clean path"},
+		{"dev-disk-dir", osOn("/dev/disk"), warnPrefix + "is a directory, not a disk"},
+		{"by-id-dir", osOn("/dev/disk/by-id"), warnPrefix + "must be /dev/disk/by-id/<link name>"},
+		{"by-id-nested", osOn("/dev/disk/by-id/a/b"), warnPrefix + "must be /dev/disk/by-id/<link name>"},
 	})
 }
 
@@ -362,10 +436,11 @@ func TestRuleDataSetMountpoints(t *testing.T) {
 			`mountpoint "/d" is declared twice: set "data" volume "a"`},
 		{"dup-esp-in-os-set", lay(set(osFields("os"), espVol(), vol("uefi2", "/boot/efi", "vfat", "partition", "600M"), rootLV())),
 			`mountpoint "/boot/efi" is declared twice`},
+		// Every builder compares mountpoints as exact strings.
 		{"mount-not-canonical", data(vol("d", "/data/", "xfs", "lvm", "100%")),
-			`(set "data", volume "d"): mountpoint "/data/" is not in canonical form; write it as "/data"`},
+			warnPrefix + `(set "data", volume "d"): mountpoint "/data/" is not in canonical form; write it as "/data"`},
 		{"mount-not-canonical-boot", lay(set(osFields("os"), espVol(), vol("boot", "/boot/", "xfs", "partition", "1G"), rootLV())),
-			`mountpoint "/boot/" is not in canonical form`},
+			warnPrefix + `mountpoint "/boot/" is not in canonical form`},
 		// Nearby layouts that must still pass.
 		{"data-mounts-ok", data(vol("d", "/data", "xfs", "lvm", "100%"), vol("s", "/data/scratch", "xfs", "lvm", "10G")), ""},
 		{"swap-in-two-sets-ok", lay(
@@ -375,12 +450,14 @@ func TestRuleDataSetMountpoints(t *testing.T) {
 	})
 }
 
+// persistent on the os set protects nothing (every osimage install rewrites
+// the root), so the operator is told; the layout installs as before.
 func TestRulePersistentDataOnly(t *testing.T) {
 	runRuleCases(t, []ruleCase{
 		{"persistent-os-set", lay(set(osManual("os", "none", "/dev/sda")+`,"persistent":true`, espVol(), bootVol(), rootLV())),
-			`sets[0] (set "os"): persistent=true is only valid on a role=data set`},
+			warnPrefix + `sets[0] (set "os"): persistent=true protects nothing on the os set`},
 		{"persistent-os-set-raid1", lay(set(osManual("os", "1", "/dev/sda", "/dev/sdb")+`,"persistent":true`, espVol(), bootVol(), rootLV())),
-			`persistent=true is only valid on a role=data set`},
+			warnPrefix + `persistent=true protects nothing on the os set`},
 		{"persistent-data-ok", osLayout(set(dataManual("data", "none", "/dev/sdb")+`,"persistent":true`, vol("d", "/d", "xfs", "lvm", "100%"))), ""},
 		{"persistent-data-only-layout-ok", lay(set(dataManual("data", "none", "/dev/sdb")+`,"persistent":true`, vol("d", "/d", "xfs", "lvm", "100%"))), ""},
 		{"persistent-data-discover", lay(set(`"name":"data","role":"data","selection":"discover","raid":"none","persistent":true`, vol("d", "/d", "xfs", "lvm", "100%"))),
@@ -505,45 +582,21 @@ func TestRunsDegradedWith(t *testing.T) {
 	}
 }
 
-// Review findings of the daemon-parity work (10 Oct): documents the validator
-// used to accept although they can never install as written.
+// Documents encoding/json reads differently from how they look: a repeated
+// or case-variant key keeps only its last value, a non-string comment is
+// dropped, a negative count means nothing to a manual set. They install as
+// they always did, and the operator is told what was read.
 func TestRuleStrictDocument(t *testing.T) {
-	base := func(dev string) string {
-		return `{"version":2,"sets":[{"name":"os","role":"os","selection":"manual","raid":"none","devices":["` + dev + `"],` +
-			`"volumes":[{"name":"uefi","mountpoint":"/boot/efi","fs":"vfat","provider":"partition","size":"600M"},` +
-			`{"name":"boot","mountpoint":"/boot","fs":"xfs","provider":"partition","size":"2G"},` +
-			`{"name":"root","mountpoint":"/","fs":"xfs","provider":"lvm","size":"100%"}]}]}`
-	}
-	cases := []struct{ name, doc, want string }{
-		{"ok", base("/dev/vda"), ""},
-		{"ok-by-id", base("/dev/disk/by-id/virtio-LAB-VDA"), ""},
-		{"blank-in-path", base("/dev/sda "), "contains a blank or control character"},
-		{"dotdot", base("/dev/../etc/passwd"), "is not a clean path"},
-		{"double-slash", base("/dev//sda"), "is not a clean path"},
-		{"trailing-slash", base("/dev/sda/"), "is not a clean path"},
-		{"dev-disk-dir", base("/dev/disk"), "is a directory, not a disk"},
-		{"by-id-dir", base("/dev/disk/by-id"), "must be /dev/disk/by-id/<link name>"},
-		{"dup-key", `{"version":2,"version":2,"sets":[]}`, `key "version" appears twice`},
-		{"case-variant-key", strings.Replace(base("/dev/vda"), `"raid":"none"`, `"raid":"none","RAID":"1"`, 1), `are the same field`},
-		{"stale-slice", strings.Replace(base("/dev/vda"), `"devices":["/dev/vda"]`, `"devices":["/dev/vda","/dev/vdb"],"devices":["/dev/vdc"]`, 1), `key "devices" appears twice`},
-		{"trailing-data", base("/dev/vda") + ` {}`, "not valid JSON"},
-		{"comment-not-string", strings.Replace(base("/dev/vda"), `{"version":2,`, `{"version":2,"comment":{"x":1},`, 1), "comment must be a string"},
-		{"negative-count-manual", strings.Replace(base("/dev/vda"), `"raid":"none",`, `"raid":"none","count":-1,`, 1), "count=-1 must not be negative"},
-	}
-	for _, c := range cases {
-		raw := []byte(c.doc)
-		cfg, err := Parse(raw)
-		if err == nil {
-			err = cfg.ValidateRaw(raw)
-		}
-		if c.want == "" {
-			if err != nil {
-				t.Errorf("%s: unexpected refusal: %v", c.name, err)
-			}
-			continue
-		}
-		if err == nil || !strings.Contains(err.Error(), c.want) {
-			t.Errorf("%s: got %v, want %q", c.name, err, c.want)
-		}
+	base := lay(set(osManual("os", "none", "/dev/vda"), espVol(), bootVol(), rootLV()))
+	runRuleCases(t, []ruleCase{
+		{"ok", base, ""},
+		{"dup-key", `{"version":2,"version":2,"sets":[` + set(osFields("os"), espVol(), rootLV()) + `]}`, warnPrefix + `top-level: key "version" appears twice`},
+		{"case-variant-key", strings.Replace(base, `"raid":"none"`, `"raid":"none","RAID":"none"`, 1), `sets[0]: unknown field 'RAID'`},
+		{"repeated-slice", strings.Replace(base, `"devices":["/dev/vda"]`, `"devices":["/dev/vda","/dev/vdb"],"devices":["/dev/vdc"]`, 1), warnPrefix + `sets[0]: key "devices" appears twice`},
+		{"comment-not-string", strings.Replace(base, `{"version":2,`, `{"version":2,"comment":{"x":1},`, 1), warnPrefix + "top-level: comment is not a string and is ignored"},
+		{"negative-count-manual", strings.Replace(base, `"raid":"none",`, `"raid":"none","count":-1,`, 1), warnPrefix + `(set "os"): count=-1 must not be negative`},
+	})
+	if _, err := Parse([]byte(base + ` {}`)); err == nil || !strings.Contains(err.Error(), "not valid JSON") {
+		t.Fatalf("data after the document must not parse, got %v", err)
 	}
 }

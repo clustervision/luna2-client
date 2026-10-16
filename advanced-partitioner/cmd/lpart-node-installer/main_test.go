@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"os"
 	"path/filepath"
@@ -112,5 +113,56 @@ func TestStopPipelineCancelsAndWaits(t *testing.T) {
 	}
 	if !strings.Contains(errBuf.String(), "stopping the unfinished phase") {
 		t.Fatalf("the operator must be told: %q", errBuf.String())
+	}
+}
+
+// TestFailureExitParksSafetyAndFatalApart pins the exit code per failure class:
+// the wrapper parks on 2 and 3 alike, and the install template reports 2 as
+// install.refused and 3 as install.fatal, so the two must not collapse again.
+func TestFailureExitParksSafetyAndFatalApart(t *testing.T) {
+	cases := []struct {
+		class pipeline.FailureClass
+		code  int
+		word  string
+	}{
+		{pipeline.FailSafety, 2, "safety refusal"},
+		{pipeline.FailFatal, 3, "non-retryable configuration error"},
+		{pipeline.FailRetryable, 1, "retryable failure"},
+	}
+	for _, c := range cases {
+		code, line := failureExit(c.class)
+		if code != c.code || !strings.Contains(line, c.word) {
+			t.Errorf("failureExit(%v) = %d %q, want %d and %q", c.class, code, line, c.code, c.word)
+		}
+	}
+}
+
+// TestPhaseExitRenderErrorKeepsTheVerdict pins that a render error never
+// overrides a finished phase's park verdict: the wrapper parks on 2 and 3 and
+// retries on 1, so a broken console must not turn a refusal into a retry loop.
+func TestPhaseExitRenderErrorKeepsTheVerdict(t *testing.T) {
+	renderErr := errors.New("tty: input/output error")
+	cases := []struct {
+		name string
+		res  pipeline.Result
+		err  error
+		code int
+	}{
+		{"safety refusal", pipeline.Result{Done: true, Failed: true, Class: pipeline.FailSafety}, renderErr, 2},
+		{"fatal config", pipeline.Result{Done: true, Failed: true, Class: pipeline.FailFatal}, renderErr, 3},
+		{"retryable", pipeline.Result{Done: true, Failed: true, Class: pipeline.FailRetryable}, renderErr, 1},
+		{"success, render failed", pipeline.Result{Done: true}, renderErr, 1},
+		{"unfinished, render failed", pipeline.Result{}, renderErr, 1},
+		{"success", pipeline.Result{Done: true}, nil, 0},
+		{"unfinished", pipeline.Result{}, nil, 1},
+	}
+	for _, c := range cases {
+		code, line := phaseExit(c.res, 0, c.err)
+		if code != c.code {
+			t.Errorf("%s: phaseExit = %d %q, want %d", c.name, code, line, c.code)
+		}
+		if c.err != nil && !strings.Contains(line, renderErr.Error()) {
+			t.Errorf("%s: line %q does not report the render error", c.name, line)
+		}
 	}
 }
