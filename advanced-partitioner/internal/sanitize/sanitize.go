@@ -37,6 +37,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"time"
@@ -262,6 +263,7 @@ func (s *Sanitizer) eraseDisk(ctx, parent context.Context, disk string) (Result,
 
 	// 2. zero-out, verified
 	s.info("%s: overwriting the whole device with zeroes (blkdiscard -z); this takes as long as writing the disk once", disk)
+	missing := ""
 	if _, err := s.runner.Run(ctx, executor.CommandSpec{
 		Path: "blkdiscard", Args: []string{"-z", disk},
 		CaptureStderr: true,
@@ -276,6 +278,9 @@ func (s *Sanitizer) eraseDisk(ctx, parent context.Context, disk string) (Result,
 		}
 	} else {
 		s.warn("%s: zero-fill failed (%v)", disk, err)
+		if errors.Is(err, exec.ErrNotFound) {
+			missing = "; blkdiscard is not installed in this ramdisk"
+		}
 	}
 
 	// 3. not erased: limit the damage, then fail closed.
@@ -290,7 +295,7 @@ func (s *Sanitizer) eraseDisk(ctx, parent context.Context, disk string) (Result,
 		Path: "sgdisk", Args: []string{"--zap-all", disk},
 		CaptureStderr: true,
 	})
-	return Result{}, fmt.Errorf("sanitize %s: the device could not be discarded or zero-filled and verified; only its signatures and partition table were cleared (wipefs: %v; sgdisk: %v) -- the data is still on the disk", disk, wipeErr, zapErr)
+	return Result{}, fmt.Errorf("sanitize %s: the device could not be discarded or zero-filled and verified%s; only its signatures and partition table were cleared (wipefs: %v; sgdisk: %v) -- the data is still on the disk", disk, missing, wipeErr, zapErr)
 }
 
 // verifySampleMiB is the size of each read-back sample. Three samples

@@ -2,7 +2,9 @@ package sanitize
 
 import (
 	"context"
+	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -109,6 +111,22 @@ func TestEraseDiskNotVerifiedFailsClosed(t *testing.T) {
 	got := calls(f)
 	if len(got) != 4 || got[2] != "wipefs -a /dev/sdd" || got[3] != "sgdisk --zap-all /dev/sdd" {
 		t.Fatalf("expected discard, zero-fill, wipefs, sgdisk; got %v", got)
+	}
+}
+
+// A ramdisk without blkdiscard fails the same way, but the error must name the
+// missing tool rather than read as a disk fault.
+func TestEraseDiskMissingBlkdiscardIsNamed(t *testing.T) {
+	stubBlank(t, false, nil)
+	notFound := fmt.Errorf("blkdiscard: %w", &exec.Error{Name: "blkdiscard", Err: exec.ErrNotFound})
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "blkdiscard", Response: executor.FakeResponse{ExitCode: -1, Err: notFound}})
+	_, err := New(Options{Runner: f}).EraseDisk(context.Background(), "/dev/sdf")
+	if err == nil || !strings.Contains(err.Error(), "blkdiscard is not installed") {
+		t.Fatalf("EraseDisk error = %v, want it to name the missing blkdiscard", err)
+	}
+	if got := calls(f); len(got) != 4 || got[2] != "wipefs -a /dev/sdf" {
+		t.Fatalf("expected the same damage limiting as any failed erase, got %v", got)
 	}
 }
 
