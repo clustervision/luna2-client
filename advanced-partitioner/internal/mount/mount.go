@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
@@ -259,7 +260,7 @@ func (m *Mounter) ensureNotMountedElsewhere(ctx context.Context, source string) 
 	if err != nil {
 		return nil // not mounted anywhere
 	}
-	target := strings.TrimSpace(string(res.Stdout))
+	target := UnescapeFindmnt(strings.TrimSpace(string(res.Stdout)))
 	if target == "" {
 		return nil
 	}
@@ -279,7 +280,7 @@ func (m *Mounter) mountedSource(ctx context.Context, target string) (string, boo
 	if err != nil {
 		return "", false
 	}
-	source := strings.TrimSpace(string(res.Stdout))
+	source := UnescapeFindmnt(strings.TrimSpace(string(res.Stdout)))
 	if source == "" {
 		return "", false
 	}
@@ -324,7 +325,7 @@ func (m *Mounter) liveSysrootTargets(ctx context.Context) []string {
 	}
 	out := []string{}
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		t := strings.TrimSpace(line)
+		t := UnescapeFindmnt(strings.TrimSpace(line))
 		if t == "" {
 			continue
 		}
@@ -385,4 +386,21 @@ func targetsFromFilesystems(filesystems fs.Filesystems, sysroot string) []string
 		out = append(out, sysroot+f.Mount)
 	}
 	return out
+}
+
+// UnescapeFindmnt undoes findmnt -r's \xNN escaping (a space, a backslash, any
+// non-ASCII byte), so a target compares equal to the path on disk.
+func UnescapeFindmnt(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) && s[i+1] == 'x' {
+			if v, err := strconv.ParseUint(s[i+2:i+4], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }

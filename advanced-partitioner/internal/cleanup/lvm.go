@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lvm/vgselect"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/mount"
 )
 
 // EnsureNoLVMAutoActivate writes an LVM local override disabling event-based
@@ -420,7 +421,7 @@ func (c *Cleaner) findmntTargetForSource(ctx context.Context, source string) str
 	if !ok {
 		return ""
 	}
-	return strings.TrimSpace(string(res.Stdout))
+	return mount.UnescapeFindmnt(strings.TrimSpace(string(res.Stdout)))
 }
 
 // lvsPaths returns the absolute LV paths for a VG.

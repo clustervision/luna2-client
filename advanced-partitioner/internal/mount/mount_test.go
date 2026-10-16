@@ -281,3 +281,20 @@ func equalSlices(a, b []string) bool {
 	}
 	return true
 }
+
+// findmnt -r escapes a space as \x20: a sysroot whose path has one must still
+// be recognised in the live mount list and as the place a source is mounted.
+func TestFindmntTargetsAreDecoded(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET"},
+		Response: executor.FakeResponse{Stdout: []byte("/proc\n/sys\\x20root\n/sys\\x20root/boot\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-S", "/dev/sdb1"},
+		Response: executor.FakeResponse{Stdout: []byte("/sys\\x20root/boot\n")}})
+	m := New(Options{Runner: f, Sysroot: "/sys root"})
+	if got := m.liveSysrootTargets(context.Background()); len(got) != 2 || got[1] != "/sys root/boot" {
+		t.Errorf("liveSysrootTargets = %q, want [/sys root /sys root/boot]", got)
+	}
+	if err := m.ensureNotMountedElsewhere(context.Background(), "/dev/sdb1"); err != nil {
+		t.Errorf("a source mounted below the sysroot is not mounted elsewhere: %v", err)
+	}
+}

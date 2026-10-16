@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/mount"
 )
 
 // unmountUnderSysroot is _cleanup_unmount_all: collect every live mount
@@ -89,7 +90,7 @@ func (c *Cleaner) findSysrootMounts(ctx context.Context, vgName string, ownsSysr
 		if len(fields) < 2 {
 			continue
 		}
-		target, source := fields[0], fields[1]
+		target, source := mount.UnescapeFindmnt(fields[0]), mount.UnescapeFindmnt(fields[1])
 		if target == sysroot {
 			if ownsSysroot {
 				seen[target] = struct{}{}

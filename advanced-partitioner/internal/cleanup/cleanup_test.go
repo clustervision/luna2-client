@@ -827,3 +827,25 @@ func TestRemoveLVMDevicesFile(t *testing.T) {
 		t.Fatalf("removing a missing devices file must succeed, got %v", err)
 	}
 }
+
+// findmnt -r prints a space and non-ASCII bytes as \xNN: the targets come back
+// as real paths, so the unmount and the lookups by target find them.
+func TestFindmntTargetsAreDecoded(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET,SOURCE"},
+		Response: executor.FakeResponse{Stdout: []byte("/sysroot /dev/mapper/os-root\n/sysroot/my\\x20data /dev/sdb1\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-S", "/dev/sdc1"},
+		Response: executor.FakeResponse{Stdout: []byte("/sysroot/d\\xc3\\xa4ta\n")}})
+	c := New(Options{Runner: f, Sysroot: "/sysroot", CommandAvailable: alwaysAvailable})
+	got := c.findSysrootMounts(context.Background(), "os", true, nil)
+	found := false
+	for _, g := range got {
+		found = found || g == "/sysroot/my data"
+	}
+	if !found {
+		t.Errorf("findSysrootMounts = %q, want /sysroot/my data among them", got)
+	}
+	if mt := c.findmntTargetForSource(context.Background(), "/dev/sdc1"); mt != "/sysroot/däta" {
+		t.Errorf("findmntTargetForSource = %q, want /sysroot/däta", mt)
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -8,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/osimage"
 )
 
 // runFullExtract runs install_mode=full end to end on the classic path: the
@@ -117,5 +121,35 @@ func writeStub(t *testing.T, dir, name, body string) {
 	}
 	if !strings.HasPrefix(os.Getenv("PATH"), dir+":") {
 		t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
+	}
+}
+
+// findmnt -r prints a space, a backslash and non-ASCII bytes as \xNN: a data
+// set mounted at such a path must still count as mounted and keep its files.
+func TestPrepareSysrootKeepsMountsFindmntEscapes(t *testing.T) {
+	sysroot := t.TempDir()
+	dirs := []string{"my data", `a\b`, "dä ta"}
+	listing := "/\n" + sysroot + "\n"
+	for _, d := range dirs {
+		if err := os.MkdirAll(filepath.Join(sysroot, d), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(sysroot, d, "precious"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listing += sysroot + `/my\x20data` + "\n" + sysroot + `/a\x5cb` + "\n" + sysroot + `/d\xc3\xa4\x20ta` + "\n"
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET"},
+		Response: executor.FakeResponse{Stdout: []byte(listing)}})
+	if err := osimage.PrepareSysroot(context.Background(), osimage.PrepareOptions{
+		Sysroot: sysroot, FindmntTargets: findmntTargets(f),
+	}); err != nil {
+		t.Fatalf("PrepareSysroot: %v", err)
+	}
+	for _, d := range dirs {
+		if _, err := os.Stat(filepath.Join(sysroot, d, "precious")); err != nil {
+			t.Errorf("mounted %q was wiped: %v", d, err)
+		}
 	}
 }

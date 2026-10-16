@@ -683,7 +683,7 @@ func findmntTargets(runner executor.Runner) func() ([]string, error) {
 		for _, line := range strings.Split(string(res.Stdout), "\n") {
 			line = strings.TrimSpace(line)
 			if line != "" {
-				out = append(out, line)
+				out = append(out, mount.UnescapeFindmnt(line))
 			}
 		}
 		return out, nil
