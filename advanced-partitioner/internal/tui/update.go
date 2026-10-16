@@ -223,8 +223,9 @@ func (m *Model) applyEvent(ev engine.InstallerEvent) {
 
 // FailureExitCode maps the failure class carried on EvInstallerFailed.Data
 // (any type exposing Fatal() bool — pipeline.FailureClass does) to the
-// process exit code: fatal/safety-refusal failures exit 3 — the code
-// luna-installer.sh PARKS on — everything else exits 1 (retry). FTA Cluster B
+// renderer's exit code: 3 for fatal and safety refusal alike, 1 otherwise.
+// It is not the process exit: lpart-node-installer's phaseExit decides that
+// from the pipeline result and keeps 2 for a safety refusal. FTA Cluster B
 // (B1): the class used to be flattened to a hardcoded 1 here.
 func FailureExitCode(data any) int {
 	type classed interface{ Fatal() bool }

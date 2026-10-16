@@ -61,8 +61,8 @@ type Options struct {
 // failureFile is the one-shot failure summary written into Options.LogDir on a
 // stage failure: the stage, the untruncated reason and the failing step's
 // stderr. The per-tool logs and the loghost keep everything, but the boot
-// wrapper starts the next attempt ~30 s later, so it prints this file on the
-// console — there is no second look.
+// wrapper starts the next attempt after a short countdown, so it prints this
+// file on the console — there is no second look.
 const failureFile = "last-failure.txt"
 
 // stepStderrLines bounds the stderr kept for the failure file. A step logs the

@@ -1,5 +1,5 @@
-// Package bootloader is the Go port of /root/NEWTREE/lib/bootloader_*.sh
-// and the orchestrator at /root/NEWTREE/bin/lpart-bootloader-finalise.
+// Package bootloader is the Go port of the bash lib/bootloader_*.sh and of
+// its lpart-bootloader-finalise orchestrator.
 //
 // The package is split for diff-ability:
 //
@@ -17,7 +17,7 @@
 //	                 the broken `grub*-install --target=x86_64-efi`
 //	                 rebuild that produced rescue-prompt-only binaries
 //	debian.go       Debian/Ubuntu path (update-initramfs + grub-install + update-grub)
-//	suse.go         SUSE stub — fails with a clear "not implemented" error
+//	suse.go         SUSE/openSUSE path (the RHEL flow: dracut + grub2-*)
 //
 // Cross-distribution / architecture notes:
 //   - The Adapter interface fans out by detected family. Adding a new

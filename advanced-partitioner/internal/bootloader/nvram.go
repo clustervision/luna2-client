@@ -13,7 +13,7 @@ import (
 )
 
 // BootloaderID is the EFI bootloader-id stamp used everywhere. Mirrors
-// LPART_BOOTLOADER_ID in /root/NEWTREE/lib/common.sh.
+// LPART_BOOTLOADER_ID in the bash lib/common.sh.
 const BootloaderID = "TrinityX"
 
 // efibootmgrChrootPath returns the in-image absolute path to efibootmgr,
