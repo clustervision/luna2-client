@@ -143,7 +143,7 @@ function luna_start () {
     # then the loop ends instead of resending it every 20s for as long as it parks.
     ( _plh=$(getargs luna.loghost=)
       [ -n "$_plh" ] && while sleep 20; do
-          readable_log < /tmp/luna_install.log 2>/dev/null | tail -n 120 2>/dev/null \
+          readable_log 2>/dev/null < /tmp/luna_install.log | tail -n 120 2>/dev/null \
             | logger -d -n "$_plh" -P 514 -t luna-progress 2>/dev/null
           [ -e "$LUNA_PROGRESS_STOP" ] && break
       done ) &
@@ -271,6 +271,8 @@ function luna_finish () {
                 done
         fi
     fi
+    # The install is over: the forwarder ends instead of reading a log that is moved next.
+    : > "$LUNA_PROGRESS_STOP"
     mv /tmp/luna_install.log /sysroot/var/log/
     # The lpart steps write their own per-tool logs, and /tmp is the initramfs --
     # it does not survive the pivot, so without this the detailed record of the
