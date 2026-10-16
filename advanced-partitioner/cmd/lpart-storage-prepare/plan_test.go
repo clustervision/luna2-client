@@ -480,6 +480,29 @@ func TestForeignVGProbeErrorRetriesBeforeCleanup(t *testing.T) {
 	}
 }
 
+// A stale same-named VG on another create set's disks is judged by listing
+// those disks; when that listing fails the run retries rather than refusing.
+func TestStaleVGDiskProbeErrorRetriesBeforeCleanup(t *testing.T) {
+	sp, f := testProcessor(t)
+	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "vg_uuid,vg_name,pv_name"},
+		Response: executor.FakeResponse{Stdout: []byte("  OLDOS os /dev/vdb1\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/vda"},
+		Response: executor.FakeResponse{Stdout: []byte("vda\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/vdb"},
+		Response: executor.FakeResponse{Err: errors.New("exit status 32")}})
+	_, _, err := sp.runDecision(context.Background(), installcontext.ModeFull,
+		&v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("none", "/dev/vda"), dataOnlyConfig().Sets[0]}}, "uefi", false, true)
+	if err == nil {
+		t.Fatal("a failed lsblk probe must fail the run")
+	}
+	if code := exitForError(io.Discard, err); code != 1 {
+		t.Fatalf("exit = %d, want 1 (retryable): %v", code, err)
+	}
+	if d := destructive(f); d != "" {
+		t.Fatalf("probe failure must precede cleanup; ran %s", d)
+	}
+}
+
 // --- item 1: mount-existing records the boot partition numbers -------------
 
 // A refreshed os set (no Layout built) must still report its ESP and BIOS

@@ -461,7 +461,7 @@ func (sp *setProcessor) checkForeignVGs(ctx context.Context, plans []plannedSet)
 		}
 		wiped, err := vgselect.StackedKernelNames(ctx, sp.runner, createDisks)
 		if err != nil {
-			wiped = nil
+			return fmt.Errorf("set %q: list the disks of the sets being recreated: %w; no disk was touched", p.set.Name, err)
 		}
 		for _, f := range loc.Foreign {
 			if f.OnlyOn(wiped) {
