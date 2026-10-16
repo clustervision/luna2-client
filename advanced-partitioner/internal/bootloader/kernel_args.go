@@ -6,8 +6,9 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
 )
 
-// KernelArgs returns the GRUB_CMDLINE_LINUX value that
-// bootloader_kernel_args in the bash predecessor assembles:
+// KernelArgs returns lpart's own part of GRUB_CMDLINE_LINUX (the image's and
+// the Luna options follow it), as bootloader_kernel_args in the bash predecessor
+// assembles it:
 //
 //	always:                rd.auto
 //	if raid_mode != none:  rd.md=1
@@ -39,8 +40,8 @@ func KernelArgs(sr result.StorageResult) string {
 }
 
 // GrubCmdlineValue formats the GRUB_CMDLINE_LINUX= line that goes into
-// /etc/default/grub. Mirrors bootloader_grub_cmdline_value. The file is
-// sourced by sh, so a quoted Luna option must not end the value early.
+// /etc/default/grub. The file is sourced by sh, so a quoted Luna option must
+// not end the value early.
 func GrubCmdlineValue(kernelArgs string) string {
 	return `GRUB_CMDLINE_LINUX="` + grubQuoteEscaper.Replace(kernelArgs) + `"`
 }

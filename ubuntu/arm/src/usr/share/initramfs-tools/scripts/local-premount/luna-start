@@ -310,7 +310,7 @@ luna_sanitize_stop() {
     done
 }
 
-# install.sh exit 2 (safety refusal) or 3 (non-retryable config error) recurs
+# install.sh exit 2 (safety refusal) or 3 (config error or crash) recurs
 # on every attempt: show the reason, park in a shell, never retry.
 fatal_park() {
     local _kind _r=/lunatmp/luna-report.txt
@@ -321,7 +321,7 @@ fatal_park() {
             print_failure_reason
             case "$1" in
                 "$LUNA_SAFETY_RC") _kind="a safety refusal" ;;
-                *) _kind="a non-retryable configuration error" ;;
+                *) _kind="a configuration error or a crash" ;;
             esac
             echo "Luna2: lpart reported the reason above: ${_kind}, which would recur on"
             echo "Luna2: every attempt."

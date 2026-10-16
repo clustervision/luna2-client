@@ -25,16 +25,16 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sysenv"
 )
 
-// exitFatalConfig is the exit code for a non-retryable configuration error: one
-// that will fail identically on every retry, so the install wrapper
-// (luna-installer.sh) must stop the retry loop rather than spin forever. Distinct
-// from the generic exit 1 (a transient/operational failure that may be worth a
-// retry).
+// exitFatalConfig is the exit code for a non-retryable failure (a configuration
+// error or a sub-tool crash): one that will fail identically on every retry, so
+// the install wrapper (luna-installer.sh) must stop the retry loop rather than
+// spin forever. Distinct from the generic exit 1 (a transient/operational
+// failure that may be worth a retry).
 const exitFatalConfig = 3
 
 // exitSafetyRefusal is the exit code for a safety refusal (a sub-tool's exit
-// 2): the wrapper parks on it like on 3, and the install template reports it
-// as install.refused rather than install.fatal.
+// 2 with a safety_refusal= verdict): the wrapper parks on it like on 3, and the
+// install template reports it as install.refused rather than install.fatal.
 const exitSafetyRefusal = 2
 
 // failureExit is the exit code and console line for a phase that failed. Say
@@ -45,7 +45,7 @@ func failureExit(class pipeline.FailureClass) (int, string) {
 	case class == pipeline.FailSafety:
 		return exitSafetyRefusal, fmt.Sprintf("lpart-node-installer: exit %d -- safety refusal; the node is parked for an operator, not retried", exitSafetyRefusal)
 	case class.Fatal():
-		return exitFatalConfig, fmt.Sprintf("lpart-node-installer: exit %d -- non-retryable configuration error; the node is parked for an operator, not retried", exitFatalConfig)
+		return exitFatalConfig, fmt.Sprintf("lpart-node-installer: exit %d -- non-retryable failure (configuration error or crash); the node is parked for an operator, not retried", exitFatalConfig)
 	}
 	return 1, "lpart-node-installer: exit 1 -- retryable failure; the install wrapper retries after a countdown"
 }

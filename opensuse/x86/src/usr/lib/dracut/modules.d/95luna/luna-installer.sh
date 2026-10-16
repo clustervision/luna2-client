@@ -584,7 +584,7 @@ function luna_sanitize_stop () {
 LUNA_FATAL_RC=3   # keep in sync with lpart-node-installer exitFatalConfig
 # Exit 2 is the lpart tools' safety_refusal contract (data fence, persistent-
 # set protection): also deterministic, also parks. lpart-node-installer exits
-# 2 for a safety refusal and 3 for a non-retryable configuration error.
+# 2 for a safety refusal and 3 for a configuration error or a crash.
 LUNA_SAFETY_RC=2  # keep in sync with internal/cli ExitSafetyRefusal
 # The state the install template reported for lpart's park exit (lpart_phase).
 function lpart_park_state () {
@@ -609,7 +609,7 @@ function fatal_park () {
         print_failure_reason
         case "$rc" in
             "$LUNA_SAFETY_RC") kind="a safety refusal" ;;
-            *) kind="a non-retryable configuration error" ;;
+            *) kind="a configuration error or a crash" ;;
         esac
         echo "Luna2: lpart reported the reason above: ${kind}, which would recur on"
         echo "Luna2: every attempt."

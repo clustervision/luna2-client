@@ -126,7 +126,7 @@ func TestFailureExitParksSafetyAndFatalApart(t *testing.T) {
 		word  string
 	}{
 		{pipeline.FailSafety, 2, "safety refusal"},
-		{pipeline.FailFatal, 3, "non-retryable configuration error"},
+		{pipeline.FailFatal, 3, "non-retryable failure (configuration error or crash)"},
 		{pipeline.FailRetryable, 1, "retryable failure"},
 	}
 	for _, c := range cases {

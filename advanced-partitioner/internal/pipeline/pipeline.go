@@ -80,13 +80,13 @@ type FailureClass int
 const (
 	// FailRetryable is a transient/operational failure — worth a retry.
 	FailRetryable FailureClass = iota
-	// FailFatal will fail identically on every retry: a non-retryable
-	// configuration error (exit 3). The wrapper must PARK for an operator
-	// instead of retrying forever.
+	// FailFatal will fail identically on every retry: a configuration error
+	// (exit 3) or a sub-tool crash (exit 2 without a verdict, out of memory
+	// included). The wrapper must PARK for an operator instead of retrying forever.
 	FailFatal
-	// FailSafety is a safety refusal (exit 2 from a sub-tool — data fence,
-	// persistent protection). It parks like FailFatal; kept apart so the
-	// node reports it as refused rather than fatal.
+	// FailSafety is a safety refusal (exit 2 from a sub-tool with a
+	// safety_refusal= verdict — data fence, persistent protection). It parks
+	// like FailFatal; kept apart so the node reports it as refused rather than fatal.
 	FailSafety
 )
 
