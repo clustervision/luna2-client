@@ -150,20 +150,26 @@ type stepError struct {
 	Bin   string
 	Stage string
 	Code  int
+	// The Go runtime exits 2 too, so exit 2 is a refusal only with the verdict.
+	Refused bool // the step printed a safety_refusal= verdict
 }
 
 func (e *stepError) Error() string {
 	return fmt.Sprintf("%s exited %d", e.Bin, e.Code)
 }
 
-// classify maps a phase error to its FailureClass. Sub-tool exit 2 is the
-// repo-wide safety_refusal contract (cli.ExitSafetyRefusal: data fence,
-// persistent protection, device overlap) and exit 3 a non-retryable config
-// error — both fail identically on every retry, so both park.
+// classify maps a phase error to its FailureClass. Sub-tool exit 2 with a
+// safety_refusal= verdict is the repo-wide safety_refusal contract
+// (cli.ExitSafetyRefusal: data fence, persistent protection, device overlap)
+// and exit 3 a non-retryable config error — both fail identically on every
+// retry, so both park. Any other exit 2 is a crash (out of memory included): fatal.
 func classify(err error) FailureClass {
 	var se *stepError
 	if errors.As(err, &se) && se.Code == 2 {
-		return FailSafety
+		if se.Refused {
+			return FailSafety
+		}
+		return FailFatal
 	}
 	if errors.As(err, &se) && se.Code == 3 {
 		return FailFatal
@@ -592,7 +598,8 @@ func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []st
 	// stepError is built from the code first: returning the raw err dropped
 	// it, and a park (exit 2 or 3) became a retry loop.
 	if code != 0 {
-		return &stepError{Bin: filepath.Base(argv[0]), Stage: stage, Code: code}
+		return &stepError{Bin: filepath.Base(argv[0]), Stage: stage, Code: code,
+			Refused: refused(p.stepStderr)}
 	}
 	if err != nil {
 		return err // code==0 but a genuine non-exit failure
@@ -691,6 +698,19 @@ func verdict(stderr []string) string {
 		}
 	}
 	return ""
+}
+
+// refused reports whether the step's verdict is a safety refusal.
+func refused(stderr []string) bool {
+	for i := len(stderr) - 1; i >= 0; i-- {
+		if strings.Contains(stderr[i], "safety_refusal=") {
+			return true
+		}
+		if strings.Contains(stderr[i], "fatal_config=") {
+			return false
+		}
+	}
+	return false
 }
 
 func (p *Pipeline) bin(name string) string { return filepath.Join(p.opts.BinDir, name) }

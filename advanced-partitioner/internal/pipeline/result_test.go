@@ -40,12 +40,13 @@ func TestClassifyFatalCodes(t *testing.T) {
 		err  error
 		want FailureClass
 	}{
-		{&stepError{Code: 2}, FailSafety},    // safety refusal (data fence)
-		{&stepError{Code: 3}, FailFatal},     // fatal config
-		{&stepError{Code: 1}, FailRetryable}, // generic failure
+		{&stepError{Code: 2, Refused: true}, FailSafety}, // safety refusal (data fence)
+		{&stepError{Code: 2}, FailFatal},                 // Go runtime crash
+		{&stepError{Code: 3}, FailFatal},                 // fatal config
+		{&stepError{Code: 1}, FailRetryable},             // generic failure
 		{&stepError{Code: 5}, FailRetryable},
 		{errors.New("plain"), FailRetryable},
-		{fmt.Errorf("wrap: %w", &stepError{Code: 2}), FailSafety},
+		{fmt.Errorf("wrap: %w", &stepError{Code: 2, Refused: true}), FailSafety},
 	}
 	for _, c := range cases {
 		if got := classify(c.err); got != c.want {
@@ -129,6 +130,32 @@ func TestRunStepArgvPreservesExitCode(t *testing.T) {
 	// a successful child returns nil
 	if err := p.runStepArgv("test", []string{"/bin/sh", "-c", "exit 0"}); err != nil {
 		t.Fatalf("exit 0 should be nil, got %v", err)
+	}
+}
+
+// A sub-tool exit 2 is a safety refusal only when the step said so; a Go
+// runtime crash also exits 2 and must not park as a refusal. Runs real
+// children so the stderr reaches classify the way it does in an install.
+func TestRunStepArgvExit2ClassByStepStderr(t *testing.T) {
+	p := New(context.Background(), Options{Phase: PhasePart, StepTimeout: 30 * time.Second})
+	go func() {
+		for range p.Events() {
+		}
+	}()
+	trace := `i=0; while [ $i -lt 100 ]; do echo "goroutine $i [running]:" >&2; i=$((i+1)); done; `
+	for _, c := range []struct {
+		name, script string
+		want         FailureClass
+	}{
+		{"refusal", `echo "lpart-storage-prepare: safety_refusal=data-fence set os is broken" >&2; exit 2`, FailSafety},
+		{"runtime fatal", `echo "fatal error: concurrent map writes" >&2; ` + trace + `exit 2`, FailFatal},
+		{"goroutine panic", `echo "panic: boom" >&2; ` + trace + `exit 2`, FailFatal},
+		{"out of memory", `echo "fatal error: runtime: out of memory" >&2; ` + trace + `exit 2`, FailFatal},
+	} {
+		err := p.runStepArgv("test", []string{"/bin/sh", "-c", c.script})
+		if got := classify(err); got != c.want {
+			t.Errorf("%s: classify = %v, want %v", c.name, got, c.want)
+		}
 	}
 }
 
