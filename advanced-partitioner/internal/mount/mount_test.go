@@ -354,3 +354,23 @@ func TestMountSysrootTreeRefusesSymlinkedTarget(t *testing.T) {
 		}
 	}
 }
+
+// The refusal is an error naming the link, and no mkdir or mount reaches the
+// directory the link points to. Uses no API the fix added.
+func TestMountSysrootTreeNeverFollowsASymlinkedTarget(t *testing.T) {
+	sysroot, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(sysroot, "srv")); err != nil {
+		t.Fatal(err)
+	}
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	_, err := New(Options{Runner: f, Sysroot: sysroot}).MountSysrootTree(context.Background(),
+		fs.Filesystems{Filesystems: []fs.Filesystem{{Mount: "/srv/data", Device: "/dev/vdb2", FS: "xfs"}}})
+	if err == nil || !strings.Contains(err.Error(), filepath.Join(sysroot, "srv")) {
+		t.Fatalf("want an error naming %s/srv, got %v", sysroot, err)
+	}
+	for _, c := range f.Calls() {
+		if (c.Path == "mkdir" || c.Path == "mount") && strings.Contains(strings.Join(c.Args, " "), "/srv/data") {
+			t.Fatalf("ran %s %v through the symlink", c.Path, c.Args)
+		}
+	}
+}
