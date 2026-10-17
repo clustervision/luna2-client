@@ -31,8 +31,7 @@ data-loss cut sets:
 
 **Health probes are read-only, with one exception: the filesystem's own crash recovery.**
 - ext: `e2fsck -f -p` (preen — journal replay and provably-safe fixes only; anything risky
-  exits >1 = unhealthy). Never `-y`. A raid data set is assembled read-only, which a preen
-  cannot open: it is checked with `e2fsck -f -n` (only rc 0 is healthy).
+  exits >1 = unhealthy). Never `-y`.
 - xfs: `xfs_repair -n`. A dirty log is recovered by mount+umount (native journal replay, which
   preserves all committed data) and re-checked once. **`xfs_repair -L` is banned** on every
   probe path; a filesystem that journal replay cannot bring clean is reported unhealthy and the

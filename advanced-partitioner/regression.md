@@ -824,15 +824,16 @@ needs a legacy-BIOS node. 25 of 36 are destructive. Lab helpers: `/root/lpart-ue
   `mdadm --examine /dev/vdc2` still shows the superblock; marker survives an assemble.
 - **Recover.** `mdadm --stop md77; wipefs` both members by hand.
 
-### 3.48  dirty-log data set: read-only classify, journal survives  [DESTRUCTIVE]
+### 3.48  dirty-log data set: replayed, classified healthy, journal survives  [DESTRUCTIVE]
 - **FTA.** BE-A10 / MCS-4, BR-7 — the probe-mutates class, live.
 - **Setup.** OS + xfs data set installed; from the booted OS start a write loop onto
   /data, then `echo b > /proc/sysrq-trigger` (unclean power loss with a DIRTY xfs log).
   PXE with install_mode=auto (data set now needs classification).
-- **Expect.** rsyslog shows `xfs_repair -n` / read-only probes ONLY (grep the runtime log
-  for `-L` = **zero hits**); verdict healthy-after-replay or broken→HALT — either is
-  acceptable, what is FORBIDDEN is repair-with-mutation during classify; after boot the
-  journal replay happens at MOUNT time and the last-synced data is present.
+- **Expect.** rsyslog shows `xfs_repair -n` and the replay mount+umount only (grep the runtime
+  log for `-L` = **zero hits**); the log is replayed (mount+umount) and the set classifies
+  healthy, the node boots with its data — a power cut must not park it (ADR 0010). HALT only
+  when the replay itself fails; what is FORBIDDEN is repair-with-mutation (`-L`) during
+  classify. The last-synced data is present.
 - **Recover.** Normal reinstall.
 
 ### 3.49  guard-input sabotage: missing probe tool ⇒ fail closed  [DESTRUCTIVE attempt]

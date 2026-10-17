@@ -44,7 +44,7 @@ func activateWith(t *testing.T, detail string, allowDegraded bool) (Activation, 
 	set := &v2.Set{Name: "os", Role: "os", Selection: "manual", Raid: "1", Devices: []string{"/dev/sda", "/dev/sdb"},
 		AllowDegraded: allowDegraded,
 		Volumes:       []v2.Volume{{Name: "root", Mountpoint: "/", FS: "xfs", Provider: "lvm", Size: "100%"}}}
-	act := ActivateExisting(context.Background(), f, set, set.Devices, logger, false)
+	act := ActivateExisting(context.Background(), f, set, set.Devices, logger)
 	_ = logger.Close()
 	b, _ := os.ReadFile(logFile)
 	return act, string(b)

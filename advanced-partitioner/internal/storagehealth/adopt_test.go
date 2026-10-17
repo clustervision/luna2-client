@@ -27,7 +27,7 @@ func heldBy(name, md, state string) *executor.FakeRunner {
 func TestAssembleAdoptsInactiveAutoAssembledArray(t *testing.T) {
 	var got []string
 	run := func(path string, args ...string) { got = append(got, path+" "+strings.Join(args, " ")) }
-	_, degraded := assembleExplicit(context.Background(), heldBy("os-efi", "md125", "inactive"), "os-efi", []string{"/dev/vda"}, run, nil, false, true)
+	_, degraded := assembleExplicit(context.Background(), heldBy("os-efi", "md125", "inactive"), "os-efi", []string{"/dev/vda"}, run, nil, true)
 	want := []string{"mdadm --run /dev/md125", "mkdir -p /dev/md", "ln -sfn ../md125 /dev/md/os-efi"}
 	if degraded || strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("calls = %q degraded=%v, want %q", got, degraded, want)
@@ -38,7 +38,7 @@ func TestAssembleAdoptsInactiveAutoAssembledArray(t *testing.T) {
 func TestAssembleLeavesInactiveAutoAssembledArrayDegraded(t *testing.T) {
 	var got []string
 	run := func(path string, args ...string) { got = append(got, path+" "+strings.Join(args, " ")) }
-	assembled, degraded := assembleExplicit(context.Background(), heldBy("os-efi", "md125", "inactive"), "os-efi", []string{"/dev/vda"}, run, nil, true, false)
+	assembled, degraded := assembleExplicit(context.Background(), heldBy("os-efi", "md125", "inactive"), "os-efi", []string{"/dev/vda"}, run, nil, false)
 	if assembled || !degraded || len(got) != 0 {
 		t.Fatalf("calls = %q assembled=%v degraded=%v, want nothing run and degraded", got, assembled, degraded)
 	}
@@ -48,7 +48,7 @@ func TestAssembleLeavesInactiveAutoAssembledArrayDegraded(t *testing.T) {
 func TestAssembleAdoptsRunningArrayWithoutRun(t *testing.T) {
 	var got []string
 	run := func(path string, args ...string) { got = append(got, path+" "+strings.Join(args, " ")) }
-	assembleExplicit(context.Background(), heldBy("os-boot", "md126", "clean"), "os-boot", []string{"/dev/vda"}, run, nil, true, false)
+	assembleExplicit(context.Background(), heldBy("os-boot", "md126", "clean"), "os-boot", []string{"/dev/vda"}, run, nil, false)
 	want := []string{"mkdir -p /dev/md", "ln -sfn ../md126 /dev/md/os-boot"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("calls = %q, want %q", got, want)
@@ -71,7 +71,7 @@ func TestAssembleRefusesArrayWithStaleMember(t *testing.T) {
 		Response: executor.FakeResponse{Stdout: []byte("clean\n")}})
 	var got []string
 	run := func(path string, args ...string) { got = append(got, path+" "+strings.Join(args, " ")) }
-	_, degraded := assembleExplicit(context.Background(), f, "os", []string{"/dev/vda", "/dev/vdb"}, run, nil, false, true)
+	_, degraded := assembleExplicit(context.Background(), f, "os", []string{"/dev/vda", "/dev/vdb"}, run, nil, true)
 	if !degraded || len(got) != 0 {
 		t.Fatalf("calls = %q degraded=%v, want the array left alone and degraded", got, degraded)
 	}

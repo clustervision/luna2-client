@@ -2,7 +2,7 @@ package storagehealth
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -154,9 +154,8 @@ func TestVerifyDiskSetIgnoresForeignSameNameVG(t *testing.T) {
 	}
 }
 
-// A raid data set lpart assembles read-only is checked with -n (a preen cannot
-// open it); one already running read-write (Ubuntu's initramfs assembles it)
-// and a non-raid data set keep the preen.
+// A data set gets the preen, which replays the journal a power cut leaves,
+// whether lpart assembles its array, the initramfs already did, or it has none.
 func TestVerifyDiskSetExtDataProbe(t *testing.T) {
 	for _, c := range []struct {
 		name, raid string
@@ -165,7 +164,7 @@ func TestVerifyDiskSetExtDataProbe(t *testing.T) {
 		running    bool
 		want       string
 	}{
-		{"raid read-only", "1", []string{"/dev/sda", "/dev/sdb"}, "/dev/md127", false, "-f -n /dev/data/d"},
+		{"raid assembled by lpart", "1", []string{"/dev/sda", "/dev/sdb"}, "/dev/md127", false, "-f -p /dev/data/d"},
 		{"raid already running", "1", []string{"/dev/sda", "/dev/sdb"}, "/dev/md127", true, "-f -p /dev/data/d"},
 		{"non-raid", "none", []string{"/dev/vda"}, "/dev/vda1", false, "-f -p /dev/data/d"},
 	} {
@@ -189,10 +188,6 @@ func TestVerifyDiskSetExtDataProbe(t *testing.T) {
 				Response: executor.FakeResponse{Stdout: []byte("           Name : any:data  (local to host any)\n")}})
 			addFS(f, "/dev/data/d", "ext4")
 			addVG(f, "  DUUID data "+c.pv+"\n", kn)
-			if c.raid != "none" && !c.running {
-				f.AddMatch(executor.FakeMatch{Path: "e2fsck", ArgsPrefix: []string{"-f", "-p"},
-					Response: executor.FakeResponse{ExitCode: 8, Err: errors.New("exit status 8")}})
-			}
 			set := &v2.Set{Name: "data", Role: "data", Raid: c.raid, Devices: c.disks,
 				Volumes: []v2.Volume{{Name: "d", Mountpoint: "/data", FS: "ext4", Size: "100%", Provider: "lvm"}}}
 			checker := fscheck.New(fscheck.Options{Runner: f})
@@ -209,5 +204,39 @@ func TestVerifyDiskSetExtDataProbe(t *testing.T) {
 				t.Fatalf("e2fsck ran %q, want exactly %q", got, c.want)
 			}
 		})
+	}
+}
+
+// replayRunner answers xfs_repair -n with the dirty-log alert until the
+// filesystem has been mounted once, as a power cut leaves an XFS volume.
+type replayRunner struct {
+	*executor.FakeRunner
+	mounted bool
+}
+
+func (r *replayRunner) Run(ctx context.Context, spec executor.CommandSpec) (executor.CommandResult, error) {
+	if spec.Path == "mount" {
+		r.mounted = true
+	}
+	if spec.Path == "xfs_repair" && len(spec.Args) > 0 && spec.Args[0] == "-n" && !r.mounted {
+		return executor.CommandResult{ExitCode: 1, Stderr: []byte("ALERT: The filesystem has valuable metadata changes in a log\n")}, fmt.Errorf("exit status 1")
+	}
+	return r.FakeRunner.Run(ctx, spec)
+}
+
+// A data set written to before a power cut is healthy: the probe replays its
+// XFS log like the os set's, instead of parking the node for an operator.
+func TestVerifyDiskSetDataSetAfterPowerCut(t *testing.T) {
+	withAllDevices(t)
+	r := &replayRunner{FakeRunner: executor.NewFakeRunner(executor.FakeResponse{})}
+	addFS(r.FakeRunner, "/dev/sdb1", "xfs")
+	set := &v2.Set{Name: "data", Role: "data", Raid: "none", Devices: []string{"/dev/sdb"},
+		Volumes: []v2.Volume{{Name: "data", Mountpoint: "/srv/data", FS: "xfs", Size: "100%", Provider: "partition"}}}
+	checker := fscheck.New(fscheck.Options{Runner: r, MountDir: t.TempDir()})
+	if fails := VerifyDiskSet(context.Background(), r, checker, set, resolved("/dev/sdb"), nil); len(fails) != 0 {
+		t.Fatalf("data set after a power cut judged %+v, want healthy after its log replay", fails)
+	}
+	if !r.mounted {
+		t.Fatal("the dirty log was not replayed")
 	}
 }

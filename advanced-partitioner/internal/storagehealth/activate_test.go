@@ -26,7 +26,7 @@ func TestAssembleExplicitUsesExaminedMembers(t *testing.T) {
 		Response: executor.FakeResponse{Stdout: []byte("           Name : any:data  (local to host any)\n")}})
 	var got [][]string
 	run := func(path string, args ...string) { got = append(got, append([]string{path}, args...)) }
-	assembleExplicit(context.Background(), fake, "data", []string{"/dev/vdb", "/dev/vdc"}, run, logger, false, false)
+	assembleExplicit(context.Background(), fake, "data", []string{"/dev/vdb", "/dev/vdc"}, run, logger, false)
 	if len(got) != 1 {
 		t.Fatalf("want 1 assemble call, got %v", got)
 	}
@@ -45,7 +45,7 @@ func TestAssembleExplicitNoMembersIsNoop(t *testing.T) {
 	fake := executor.NewFakeRunner(executor.FakeResponse{ExitCode: 1, Err: fmt.Errorf("no superblock")})
 	var got [][]string
 	run := func(path string, args ...string) { got = append(got, append([]string{path}, args...)) }
-	assembleExplicit(context.Background(), fake, "data", []string{"/dev/vdb"}, run, logger, false, false)
+	assembleExplicit(context.Background(), fake, "data", []string{"/dev/vdb"}, run, logger, false)
 	if len(got) != 0 {
 		t.Fatalf("want no assemble call without members, got %v", got)
 	}
@@ -102,14 +102,14 @@ func TestAssembleExplicitStartsDegradedArray(t *testing.T) {
 		got = append(got, append([]string{path}, args...))
 		m.assembled = true
 	}
-	_, degraded := assembleExplicit(context.Background(), m, "os", []string{"/dev/vdc"}, run, nil, false, true)
+	_, degraded := assembleExplicit(context.Background(), m, "os", []string{"/dev/vdc"}, run, nil, true)
 	if degraded || len(got) != 1 || strings.Join(got[0], " ") != "mdadm --assemble --run /dev/md/os /dev/vdc1" {
 		t.Fatalf("degraded assemble = %v (degraded=%v), want mdadm --assemble --run /dev/md/os /dev/vdc1", got, degraded)
 	}
 }
 
 // The same dead disk under the health probe of a set that does not allow it:
-// read-only, no --run, the array stays inactive and is reported degraded.
+// no --run, the array stays inactive and is reported degraded.
 func TestProbeLeavesDegradedArrayInactive(t *testing.T) {
 	m := newSurvivingMember("inactive")
 	var got [][]string
@@ -117,9 +117,9 @@ func TestProbeLeavesDegradedArrayInactive(t *testing.T) {
 		got = append(got, append([]string{path}, args...))
 		m.assembled = true
 	}
-	assembled, degraded := assembleExplicit(context.Background(), m, "os", []string{"/dev/vdc"}, run, nil, true, false)
-	if !assembled || !degraded || len(got) != 1 || strings.Join(got[0], " ") != "mdadm --assemble --readonly /dev/md/os /dev/vdc1" {
-		t.Fatalf("probe assemble = %v (assembled=%v degraded=%v), want mdadm --assemble --readonly /dev/md/os /dev/vdc1, degraded", got, assembled, degraded)
+	assembled, degraded := assembleExplicit(context.Background(), m, "os", []string{"/dev/vdc"}, run, nil, false)
+	if !assembled || !degraded || len(got) != 1 || strings.Join(got[0], " ") != "mdadm --assemble /dev/md/os /dev/vdc1" {
+		t.Fatalf("probe assemble = %v (assembled=%v degraded=%v), want mdadm --assemble /dev/md/os /dev/vdc1, degraded", got, assembled, degraded)
 	}
 }
 

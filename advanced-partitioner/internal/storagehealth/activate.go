@@ -48,11 +48,10 @@ func HasBIOSBootPartition(ctx context.Context, runner executor.Runner, disk stri
 // health probe (sync/auto/local verdicts) and the mount-existing path, so both
 // see the same devices.
 //
-// readOnly assembles the arrays read-only (the health probe on a data set). A
-// degraded array is started (--run) only when the set allows it
+// A degraded array is started (--run) only when the set allows it
 // (allow_degraded); otherwise it stays inactive and its name is returned in
 // Degraded. Assembled names the arrays this call assembled, for Release.
-func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, disks []string, logger *txlog.Logger, readOnly bool) Activation {
+func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, disks []string, logger *txlog.Logger) Activation {
 	var act Activation
 	if runner == nil || set == nil {
 		return act
@@ -73,7 +72,7 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 			names = append(names, mdName+"-efi", mdName+"-boot")
 		}
 		for _, n := range names {
-			assembled, degraded := assembleExplicit(ctx, runner, n, disks, run, logger, readOnly, set.AllowDegraded)
+			assembled, degraded := assembleExplicit(ctx, runner, n, disks, run, logger, set.AllowDegraded)
 			if assembled {
 				act.Assembled = append(act.Assembled, n)
 			}
@@ -147,7 +146,7 @@ func Release(ctx context.Context, runner executor.Runner, act Activation, vgSele
 // Without --run mdadm leaves an array that misses a member inactive; start
 // adds --run, so it runs degraded. assembled reports that this call assembled
 // the array, degraded that it is left inactive.
-func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string, disks []string, run func(string, ...string), logger *txlog.Logger, readOnly, start bool) (assembled, degraded bool) {
+func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string, disks []string, run func(string, ...string), logger *txlog.Logger, start bool) (assembled, degraded bool) {
 	var members []string
 	for _, d := range disks {
 		for _, p := range partitionsOn(ctx, runner, d) {
@@ -168,9 +167,6 @@ func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string
 		}
 	}
 	args := []string{"--assemble"}
-	if readOnly {
-		args = append(args, "--readonly")
-	}
 	if start {
 		args = append(args, "--run")
 	}

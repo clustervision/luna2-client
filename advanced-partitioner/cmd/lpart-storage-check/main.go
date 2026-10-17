@@ -334,7 +334,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			paths = append(paths, r.ResolvedPath)
 		}
 		if len(paths) > 0 {
-			storagehealth.ActivateExisting(context.Background(), runner, set, paths, logger, false)
+			storagehealth.ActivateExisting(context.Background(), runner, set, paths, logger)
 		}
 	}
 	predicted := fsmod.PredictFilesystemsFromConfig(cfg, func(set *v2.Set) bool {

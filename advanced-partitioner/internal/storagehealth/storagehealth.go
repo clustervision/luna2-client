@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"slices"
 	"strings"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -105,17 +104,12 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 	for _, r := range resolved {
 		disks = append(disks, r.ResolvedPath)
 	}
-	// Data sets are assembled read-only; nothing is started degraded unless
-	// the set allows it. On a raid set what the probe brought up (arrays, VG)
-	// is released after it; a raid=none set's VG stays active (mount and
-	// create handle it).
+	// Nothing is started degraded unless the set allows it. On a raid set
+	// what the probe brought up (arrays, VG) is released after it; a
+	// raid=none set's VG stays active (mount and create handle it).
 	vgSelect := ""
-	readOnly, noWrite := false, false
 	if rm := set.RAIDMode(); rm != "" && rm != "none" {
-		readOnly = set.Role != "os"
-		act := ActivateExisting(ctx, runner, set, disks, logger, readOnly)
-		// an array that was already running is read-write and gets the preen
-		noWrite = readOnly && slices.Contains(act.Assembled, set.MDName())
+		act := ActivateExisting(ctx, runner, set, disks, logger)
 		defer func() { Release(ctx, runner, act, vgSelect, logger) }()
 		if len(act.Degraded) > 0 {
 			failures = append(failures, Unhealthy{SetName: set.Name, VolumeName: "(raid)", Degraded: true,
@@ -184,16 +178,9 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 			}
 		}
 		if vol.FS != "" {
-			// only the os set's XFS log may be replayed by the probe; a data
-			// set's is left for the operator
-			probe := checker.CheckFSReadOnly
-			if noWrite {
-				probe = checker.CheckFSNoWrite
-			}
-			res := probe(ctx, device, vol.FS)
-			if set.Role == "os" {
-				res = checker.CheckFS(ctx, device, vol.FS)
-			}
+			// every set gets the filesystem's own crash recovery (ADR 0010): a
+			// power cut must not park a node carrying a data set
+			res := checker.CheckFS(ctx, device, vol.FS)
 			switch {
 			case res.Unavailable:
 				markUnknown(vol.Name, res.Reason)
