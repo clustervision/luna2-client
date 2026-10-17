@@ -154,17 +154,20 @@ func TestVerifyDiskSetIgnoresForeignSameNameVG(t *testing.T) {
 	}
 }
 
-// A raid data set is assembled read-only, so its ext filesystem is checked with
-// -n (a preen cannot open it); a non-raid data set keeps the preen.
+// A raid data set lpart assembles read-only is checked with -n (a preen cannot
+// open it); one already running read-write (Ubuntu's initramfs assembles it)
+// and a non-raid data set keep the preen.
 func TestVerifyDiskSetExtDataProbe(t *testing.T) {
 	for _, c := range []struct {
 		name, raid string
 		disks      []string
 		pv         string
+		running    bool
 		want       string
 	}{
-		{"raid read-only", "1", []string{"/dev/sda", "/dev/sdb"}, "/dev/md127", "-f -n /dev/data/d"},
-		{"non-raid", "none", []string{"/dev/vda"}, "/dev/vda1", "-f -p /dev/data/d"},
+		{"raid read-only", "1", []string{"/dev/sda", "/dev/sdb"}, "/dev/md127", false, "-f -n /dev/data/d"},
+		{"raid already running", "1", []string{"/dev/sda", "/dev/sdb"}, "/dev/md127", true, "-f -p /dev/data/d"},
+		{"non-raid", "none", []string{"/dev/vda"}, "/dev/vda1", false, "-f -p /dev/data/d"},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			withAllDevices(t)
@@ -175,12 +178,18 @@ func TestVerifyDiskSetExtDataProbe(t *testing.T) {
 				f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME,TYPE", d},
 					Response: executor.FakeResponse{Stdout: []byte(b + " disk\n" + b + "1 part\n")}})
 				kn[d] = b + "\n" + b + "1\n" + strings.TrimPrefix(c.pv, "/dev/") + "\n"
+				if c.running {
+					f.AddMatch(executor.FakeMatch{Path: "ls", ArgsPrefix: []string{"-1", "/sys/class/block/" + b + "1/holders"},
+						Response: executor.FakeResponse{Stdout: []byte("md127\n")}})
+				}
 			}
+			f.AddMatch(executor.FakeMatch{Path: "cat", ArgsPrefix: []string{"/sys/block/md127/md/array_state"},
+				Response: executor.FakeResponse{Stdout: []byte("clean\n")}})
 			f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine"},
 				Response: executor.FakeResponse{Stdout: []byte("           Name : any:data  (local to host any)\n")}})
 			addFS(f, "/dev/data/d", "ext4")
 			addVG(f, "  DUUID data "+c.pv+"\n", kn)
-			if c.raid != "none" {
+			if c.raid != "none" && !c.running {
 				f.AddMatch(executor.FakeMatch{Path: "e2fsck", ArgsPrefix: []string{"-f", "-p"},
 					Response: executor.FakeResponse{ExitCode: 8, Err: errors.New("exit status 8")}})
 			}

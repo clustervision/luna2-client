@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -109,10 +110,12 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 	// is released after it; a raid=none set's VG stays active (mount and
 	// create handle it).
 	vgSelect := ""
-	readOnly := false
+	readOnly, noWrite := false, false
 	if rm := set.RAIDMode(); rm != "" && rm != "none" {
 		readOnly = set.Role != "os"
 		act := ActivateExisting(ctx, runner, set, disks, logger, readOnly)
+		// an array that was already running is read-write and gets the preen
+		noWrite = readOnly && slices.Contains(act.Assembled, set.MDName())
 		defer func() { Release(ctx, runner, act, vgSelect, logger) }()
 		if len(act.Degraded) > 0 {
 			failures = append(failures, Unhealthy{SetName: set.Name, VolumeName: "(raid)", Degraded: true,
@@ -184,7 +187,7 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 			// only the os set's XFS log may be replayed by the probe; a data
 			// set's is left for the operator
 			probe := checker.CheckFSReadOnly
-			if readOnly {
+			if noWrite {
 				probe = checker.CheckFSNoWrite
 			}
 			res := probe(ctx, device, vol.FS)
