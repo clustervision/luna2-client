@@ -276,3 +276,22 @@ func TestZeroStartZeroesTheFirst4MiB(t *testing.T) {
 		t.Fatal("a device that cannot be opened must be an error")
 	}
 }
+
+// The PV start is never zeroed through dd: the Ubuntu ramdisk's klibc dd
+// rejects conv=fsync. Uses no API the fix added.
+func TestBuildRunsNoDDBeforePvcreate(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "dd", Response: executor.FakeResponse{ExitCode: 1, Stderr: []byte("dd: bad conversion")}})
+	set := &v2.Set{Name: "os", Role: "os", Raid: "none", Volumes: []v2.Volume{
+		{Name: "root", Provider: "lvm", Mountpoint: "/", FS: "xfs", Size: "100%"},
+	}}
+	if _, err := New(Options{Runner: f}).Build(context.Background(), set,
+		partition.Layout{StoragePartitions: []string{"/dev/sda3"}}, raid.State{RAIDMode: "none"}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, c := range f.Calls() {
+		if c.Path == "dd" {
+			t.Fatalf("ran dd %v", c.Args)
+		}
+	}
+}
