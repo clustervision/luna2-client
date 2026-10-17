@@ -133,11 +133,19 @@ func cmdlineFields(s string) []string {
 	return out
 }
 
-// uniqueArgs keeps the first occurrence of every argument.
+// uniqueArgs keeps the first occurrence of every argument, but the last of a
+// console=: the last one given is /dev/console.
 func uniqueArgs(args []string) []string {
+	last := make(map[string]int, len(args))
+	for i, a := range args {
+		last[a] = i
+	}
 	seen := make(map[string]bool, len(args))
 	out := make([]string, 0, len(args))
-	for _, a := range args {
+	for i, a := range args {
+		if strings.HasPrefix(a, "console=") && last[a] != i {
+			continue
+		}
 		if !seen[a] {
 			seen[a] = true
 			out = append(out, a)

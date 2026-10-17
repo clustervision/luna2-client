@@ -165,6 +165,20 @@ func TestGrubDefaultFileKeepsQuotedLunaOptionsWhole(t *testing.T) {
 	}
 }
 
+// The last console= is /dev/console: a repeat in the Luna options must not be
+// dropped as a duplicate of the image's, and a re-run must not grow the line.
+func TestGrubDefaultFileKeepsTheLastConsole(t *testing.T) {
+	image := `GRUB_CMDLINE_LINUX="console=ttyS0,115200"`
+	luna := "console=tty0 console=ttyS0,115200 quiet quiet"
+	once := grubDefaultFile(image, "rd.auto", luna, "saved")
+	if want := `GRUB_CMDLINE_LINUX="rd.auto console=tty0 console=ttyS0,115200 quiet"`; !strings.Contains(once, want+"\n") {
+		t.Fatalf("want %s in:\n%s", want, once)
+	}
+	if twice := grubDefaultFile(once, "rd.auto", luna, "saved"); twice != once {
+		t.Fatalf("second run changed the file:\n--- once ---\n%s\n--- twice ---\n%s", once, twice)
+	}
+}
+
 // Finalise is re-run on every sync: the file it wrote is a valid input and
 // produces itself.
 func TestGrubDefaultFileIdempotent(t *testing.T) {
