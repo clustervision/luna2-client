@@ -638,6 +638,44 @@ function fatal_park () {
     done
 }
 
+# dracut sources this hook again when its shell was killed: the first run's
+# lpart steps may still be writing, so park instead of starting a second install.
+function restart_park () {
+    local ctty
+    ctty=$(_get_luna_ctty)
+    luna_loghost=$(getargs luna.loghost=)
+    luna_url=$(getargs luna.url=)
+    luna_node=$(getargs luna.node=)
+    luna_verifycert=$(getargs luna.verifycert= | tr 'A-Z' 'a-z')
+    if [ "$luna_verifycert" == "no" ] || [ "$luna_verifycert" == "false" ]; then
+        INSECURE='--insecure'
+    fi
+    : > "$LUNA_PROGRESS_STOP"
+    echo ""
+    echo "Luna2: ============================================================"
+    echo "Luna2: INSTALL INCOMPLETE -- the installer stopped before it finished"
+    echo "Luna2: and dracut started it again; NOT starting a second install."
+    echo "Luna2: (its process was killed, e.g. out of memory; the steps it had"
+    echo "Luna2: started may still be running.) The node is parked: it would stop"
+    echo "Luna2: the same way again. Fix the cause in Luna (more memory, a disk"
+    echo "Luna2: layout instead of memboot), then reboot the node."
+    echo "Luna2: Logs: /tmp/luna_install.log"
+    echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
+    echo "Luna2: ============================================================"
+    if [ "$luna_loghost" ]; then
+        readable_log < /tmp/luna_install.log | logger -d -n $luna_loghost -P 514
+    fi
+    luna_post_state install.fatal
+    while true; do
+        if { exec 9<>"$ctty"; } 2>/dev/null; then
+            exec 9<&-
+            setsid -c /bin/sh -i -l 0<>"$ctty" 1<>"$ctty" 2<>"$ctty"
+        else
+            sleep 3600
+        fi
+    done
+}
+
 # --- ADR 0009: host the decoupled install dashboard --------------------------
 # When the kernel cmdline carries `lpart.hosttui` (set together with the
 # structural-template daemon patch), the entrypoint runs ONE lpart-tui renderer
@@ -710,6 +748,9 @@ function run_install_sh () {
 # exports it as $ROOT. Normalise so the same guard works under both frameworks.
 root="${root:-$ROOT}"
 if [ "x$root" = "xluna" ]; then
+    if [ -e /run/luna-install-started ] && [ ! -e /run/luna-install-finished ]; then
+        restart_park   # never returns
+    fi
     # An install starts in this boot: from now on the pre-pivot guard boots
     # /sysroot only after luna_finish (luna-pivot-guard.sh).
     : > /run/luna-install-started
