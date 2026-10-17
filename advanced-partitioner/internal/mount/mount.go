@@ -260,15 +260,15 @@ func (m *Mounter) ensureNotMountedElsewhere(ctx context.Context, source string) 
 	if err != nil {
 		return nil // not mounted anywhere
 	}
-	target := UnescapeFindmnt(strings.TrimSpace(string(res.Stdout)))
-	if target == "" {
-		return nil
+	for _, line := range strings.Split(string(res.Stdout), "\n") {
+		target := UnescapeFindmnt(strings.TrimSpace(line))
+		if target == "" || target == m.o.Sysroot || strings.HasPrefix(target, m.o.Sysroot+"/") {
+			continue
+		}
+		return fmt.Errorf("device already mounted outside %s: %s -> %s",
+			m.o.Sysroot, source, target)
 	}
-	if target == m.o.Sysroot || strings.HasPrefix(target, m.o.Sysroot+"/") {
-		return nil
-	}
-	return fmt.Errorf("device already mounted outside %s: %s -> %s",
-		m.o.Sysroot, source, target)
+	return nil
 }
 
 func (m *Mounter) mountedSource(ctx context.Context, target string) (string, bool) {

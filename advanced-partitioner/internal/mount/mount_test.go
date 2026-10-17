@@ -311,3 +311,16 @@ func TestFindmntSourceIsDecoded(t *testing.T) {
 		t.Errorf("mountedSource = %q, %v, want /dev/disk/by-label/my data, true", got, mounted)
 	}
 }
+
+// findmnt -S prints one line per mount of the source: a device mounted below
+// the sysroot and somewhere else is still mounted elsewhere.
+func TestEnsureNotMountedElsewhereReadsEveryLine(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-S", "/dev/sdb1"},
+		Response: executor.FakeResponse{Stdout: []byte("/sysroot/data\n/mnt/x\n")}})
+	m := New(Options{Runner: f, Sysroot: "/sysroot"})
+	err := m.ensureNotMountedElsewhere(context.Background(), "/dev/sdb1")
+	if err == nil || !strings.Contains(err.Error(), "/mnt/x") {
+		t.Fatalf("want a refusal naming /mnt/x, got %v", err)
+	}
+}
