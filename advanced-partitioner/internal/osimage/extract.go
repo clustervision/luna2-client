@@ -467,7 +467,6 @@ func buildMountSet(targets []string) map[string]struct{} {
 	out := make(map[string]struct{}, len(targets))
 	sort.Strings(targets)
 	for _, t := range targets {
-		t = strings.TrimSpace(t)
 		if t == "" {
 			continue
 		}

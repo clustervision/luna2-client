@@ -124,6 +124,30 @@ func writeStub(t *testing.T, dir, name, body string) {
 	}
 }
 
+// A decoded target keeps its trailing space: a data set mounted at "data "
+// is a mount like any other and keeps its files.
+func TestPrepareSysrootKeepsMountEndingInSpace(t *testing.T) {
+	sysroot := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(sysroot, "data "), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(sysroot, "data ", "precious"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	listing := "/\n" + sysroot + "\n" + sysroot + `/data\x20` + "\n"
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET"},
+		Response: executor.FakeResponse{Stdout: []byte(listing)}})
+	if err := osimage.PrepareSysroot(context.Background(), osimage.PrepareOptions{
+		Sysroot: sysroot, FindmntTargets: findmntTargets(f),
+	}); err != nil {
+		t.Fatalf("PrepareSysroot: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sysroot, "data ", "precious")); err != nil {
+		t.Fatalf("the data set mounted at %q was wiped: %v", "data ", err)
+	}
+}
+
 // findmnt -r prints a space, a backslash and non-ASCII bytes as \xNN: a data
 // set mounted at such a path must still count as mounted and keep its files.
 func TestPrepareSysrootKeepsMountsFindmntEscapes(t *testing.T) {
