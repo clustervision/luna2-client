@@ -2,6 +2,9 @@ package mount
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -322,5 +325,32 @@ func TestEnsureNotMountedElsewhereReadsEveryLine(t *testing.T) {
 	err := m.ensureNotMountedElsewhere(context.Background(), "/dev/sdb1")
 	if err == nil || !strings.Contains(err.Error(), "/mnt/x") {
 		t.Fatalf("want a refusal naming /mnt/x, got %v", err)
+	}
+}
+
+// A mount target is made and mounted only through real directories below the
+// sysroot: a symlinked component refuses, naming the link.
+func TestMountSysrootTreeRefusesSymlinkedTarget(t *testing.T) {
+	sysroot, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(sysroot, "srv")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sysroot, "home"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	m := New(Options{Runner: f, Sysroot: sysroot})
+	_, err := m.MountSysrootTree(context.Background(), fs.Filesystems{Filesystems: []fs.Filesystem{
+		{Mount: "/home/a", Device: "/dev/vdb1", FS: "xfs"},
+		{Mount: "/srv/data", Device: "/dev/vdb2", FS: "xfs"},
+	}})
+	var se *SymlinkError
+	if !errors.As(err, &se) || se.Link != filepath.Join(sysroot, "srv") {
+		t.Fatalf("want a SymlinkError naming %s/srv, got %v", sysroot, err)
+	}
+	for _, c := range f.Calls() {
+		if strings.Contains(strings.Join(c.Args, " "), "/srv/data") {
+			t.Fatalf("ran %s %v through the symlink", c.Path, c.Args)
+		}
 	}
 }

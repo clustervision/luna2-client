@@ -12,6 +12,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -89,6 +90,14 @@ func New(o Options) *Mounter {
 	return &Mounter{o: o}
 }
 
+// SymlinkError refuses a mount target with a symlink below the sysroot: mkdir -p
+// and mount(8) would follow it, out of the sysroot when it is absolute.
+type SymlinkError struct{ Target, Link string }
+
+func (e *SymlinkError) Error() string {
+	return fmt.Sprintf("mount target %s: %s is a symlink in the existing root, and a mount never goes through one -- set the mountpoint to the real directory, or remove the link", e.Target, e.Link)
+}
+
 // MountSysrootTree mounts every entry in filesystems under the sysroot.
 // Root (/) first, then other mountpoints in shallow-first depth order.
 // Swap entries and mountpoint=="" are skipped. Mirrors
@@ -126,6 +135,9 @@ func (m *Mounter) MountSysrootTree(ctx context.Context, filesystems fs.Filesyste
 				continue
 			}
 			target := m.o.Sysroot + mp
+			if err := m.refuseSymlinkBelowSysroot(target); err != nil {
+				return Result{}, err
+			}
 			if err := m.ensureDir(target); err != nil {
 				return Result{}, err
 			}
@@ -334,6 +346,23 @@ func (m *Mounter) liveSysrootTargets(ctx context.Context) []string {
 		}
 	}
 	return out
+}
+
+// refuseSymlinkBelowSysroot refuses the first symlinked component of target below
+// the sysroot; a missing one is made by mkdir -p as a real directory.
+func (m *Mounter) refuseSymlinkBelowSysroot(target string) error {
+	p := filepath.Clean(m.o.Sysroot)
+	for _, c := range strings.Split(strings.TrimPrefix(filepath.Clean(target), p+"/"), "/") {
+		p = filepath.Join(p, c)
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return nil
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return &SymlinkError{Target: target, Link: p}
+		}
+	}
+	return nil
 }
 
 func (m *Mounter) ensureDir(path string) error {

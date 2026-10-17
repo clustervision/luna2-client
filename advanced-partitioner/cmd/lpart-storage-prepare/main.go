@@ -623,6 +623,10 @@ func (sp *setProcessor) process(ctx context.Context, p plannedSet, detectedFirmw
 		fs := fsmod.PredictFilesystemsOnDisk(set, firstConfigured, biosBoot)
 		sp.logger.SetStage("mounts")
 		mt, err := sp.mount.MountSysrootTree(ctx, fs)
+		var symlinked *mount.SymlinkError
+		if errors.As(err, &symlinked) {
+			return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("mount-symlink", "set %q: %v", set.Name, err)
+		}
 		if err != nil {
 			// The layout already exists and is not rebuilt here, so a mount
 			// that fails now fails identically on every retry (local on a

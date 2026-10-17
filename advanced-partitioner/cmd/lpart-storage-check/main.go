@@ -345,6 +345,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return storagehealth.HasBIOSBootPartition(context.Background(), runner, disk)
 	})
 	mt, err := mounter.MountSysrootTree(context.Background(), predicted)
+	var symlinked *mount.SymlinkError
+	if errors.As(err, &symlinked) {
+		return cli.ExitFatalConfig(stderr, toolName, "mount-symlink", "%v", err)
+	}
 	if err != nil {
 		// Every set probed healthy, yet the existing layout does not mount: it
 		// is not rebuilt in this mode, so this fails identically on every

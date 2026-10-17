@@ -561,6 +561,27 @@ func TestMountExistingRecordsBootPartitionNumbers(t *testing.T) {
 	}
 }
 
+// A mountpoint reached through a symlink in the existing root would be
+// mounted wherever the link points: fatal config, nothing mounted there.
+func TestMountExistingThroughSymlinkIsFatal(t *testing.T) {
+	sp, f := testProcessor(t)
+	sysroot, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, sysroot+"/srv"); err != nil {
+		t.Fatal(err)
+	}
+	sp.mount = mount.New(mount.Options{Runner: f, Logger: sp.logger, Sysroot: sysroot})
+	set := v2.Set{Name: "data", Role: "data", Selection: "manual", Raid: "none", Devices: []string{"/dev/vdb"},
+		Volumes: []v2.Volume{{Name: "d", Mountpoint: "/srv/data", FS: "xfs", Size: "100%", Provider: "partition"}}}
+	_, _, err := sp.process(context.Background(), plannedSet{set: &set, act: actMount,
+		disks: []selector.Resolved{{ConfiguredPath: "/dev/vdb", ResolvedPath: "/dev/vdb"}}}, "uefi", true)
+	wantFatal(t, err, "mount-symlink")
+	for _, c := range f.Calls() {
+		if (c.Path == "mount" || c.Path == "mkdir") && strings.Contains(strings.Join(c.Args, " "), "/srv/data") {
+			t.Fatalf("ran %s %v through the symlink", c.Path, c.Args)
+		}
+	}
+}
+
 // A degraded mount anchors raw partition paths on the first PRESENT disk.
 func TestMountExistingDegradedUsesPresentDisk(t *testing.T) {
 	sp, _ := testProcessor(t)
