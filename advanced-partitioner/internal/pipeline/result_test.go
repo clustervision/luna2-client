@@ -151,6 +151,8 @@ func TestRunStepArgvExit2ClassByStepStderr(t *testing.T) {
 		{"runtime fatal", `echo "fatal error: concurrent map writes" >&2; ` + trace + `exit 2`, FailFatal},
 		{"goroutine panic", `echo "panic: boom" >&2; ` + trace + `exit 2`, FailFatal},
 		{"out of memory", `echo "fatal error: runtime: out of memory" >&2; ` + trace + `exit 2`, FailFatal},
+		{"refusal longer than the stderr tail", `echo "lpart-storage-prepare: safety_refusal=sanitize-incomplete erase failed:" >&2; ` +
+			`i=0; while [ $i -lt 44 ]; do echo "/dev/sd$i: could not be discarded" >&2; i=$((i+1)); done; exit 2`, FailSafety},
 	} {
 		err := p.runStepArgv("test", []string{"/bin/sh", "-c", c.script})
 		if got := classify(err); got != c.want {

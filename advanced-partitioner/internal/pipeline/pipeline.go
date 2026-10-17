@@ -567,6 +567,8 @@ func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []st
 	// name the cause in the failure file. The forward stays blocking, so the
 	// bus behaves exactly as it does when RunCommand writes to it directly.
 	p.stepStderr = nil
+	// The last verdict line, kept apart: a long refusal pushes it out of the tail.
+	var verdictLine string
 	mirror := make(chan engine.InstallerEvent, 64)
 	var mirrored sync.WaitGroup
 	mirrored.Add(1)
@@ -577,6 +579,9 @@ func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []st
 				p.stepLine(ev.Message)
 			}
 			if ev.Type == engine.EvCommandStderr {
+				if strings.Contains(ev.Message, "safety_refusal=") || strings.Contains(ev.Message, "fatal_config=") {
+					verdictLine = ev.Message
+				}
 				p.stepStderr = append(p.stepStderr, ev.Message)
 				if len(p.stepStderr) > stepStderrLines {
 					p.stepStderr = p.stepStderr[len(p.stepStderr)-stepStderrLines:]
@@ -599,7 +604,7 @@ func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []st
 	// it, and a park (exit 2 or 3) became a retry loop.
 	if code != 0 {
 		return &stepError{Bin: filepath.Base(argv[0]), Stage: stage, Code: code,
-			Refused: refused(p.stepStderr)}
+			Refused: refused([]string{verdictLine})}
 	}
 	if err != nil {
 		return err // code==0 but a genuine non-exit failure
