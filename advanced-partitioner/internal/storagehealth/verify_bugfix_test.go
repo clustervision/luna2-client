@@ -180,10 +180,14 @@ func TestVerifyDiskSetExtDataProbe(t *testing.T) {
 				if c.running {
 					f.AddMatch(executor.FakeMatch{Path: "ls", ArgsPrefix: []string{"-1", "/sys/class/block/" + b + "1/holders"},
 						Response: executor.FakeResponse{Stdout: []byte("md127\n")}})
+					f.AddMatch(executor.FakeMatch{Path: "cat", ArgsPrefix: []string{"/sys/block/md127/md/dev-" + b + "1/state"},
+						Response: executor.FakeResponse{Stdout: []byte("in_sync\n")}})
 				}
 			}
 			f.AddMatch(executor.FakeMatch{Path: "cat", ArgsPrefix: []string{"/sys/block/md127/md/array_state"},
 				Response: executor.FakeResponse{Stdout: []byte("clean\n")}})
+			f.AddMatch(executor.FakeMatch{Path: "cat", ArgsPrefix: []string{"/sys/block/md127/md/degraded"},
+				Response: executor.FakeResponse{Stdout: []byte("0\n")}})
 			f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine"},
 				Response: executor.FakeResponse{Stdout: []byte("           Name : any:data  (local to host any)\n")}})
 			addFS(f, "/dev/data/d", "ext4")

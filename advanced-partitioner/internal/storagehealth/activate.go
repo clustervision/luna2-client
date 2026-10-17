@@ -222,11 +222,11 @@ func adoptAssembledArray(ctx context.Context, runner executor.Runner, mdName, md
 	}
 	switch state {
 	case "clean", "active", "active-idle", "readonly", "read-auto", "write-pending":
-		// a member that missed writes (a stale disk put back) must not be
-		// taken over with the others; never used, whatever allow_degraded says
-		if events := memberEvents(ctx, runner, members); len(events) > 1 {
+		// the kernel decides which members of a running array are in sync: their
+		// superblock event counts can differ by one after an unclean shutdown
+		if why := kernelOutOfSync(ctx, runner, md, members); why != "" {
 			if logger != nil {
-				logger.Warn(fmt.Sprintf("activate: array %s (/dev/%s) members disagree on their event count (%s); not taken over", mdName, md, strings.Join(events, ", ")))
+				logger.Warn(fmt.Sprintf("activate: array %s (/dev/%s) %s; not taken over", mdName, md, why))
 			}
 			return true
 		}
@@ -234,11 +234,41 @@ func adoptAssembledArray(ctx context.Context, runner executor.Runner, mdName, md
 		if !start {
 			return true
 		}
+		// a member that missed writes (a stale disk put back) must not be
+		// started with the others; never, whatever allow_degraded says
+		if events := memberEvents(ctx, runner, members); len(events) > 1 {
+			if logger != nil {
+				logger.Warn(fmt.Sprintf("activate: array %s (/dev/%s) members disagree on their event count (%s); not started", mdName, md, strings.Join(events, ", ")))
+			}
+			return true
+		}
 		run("mdadm", "--run", "/dev/"+md)
 	}
 	run("mkdir", "-p", "/dev/md")
 	run("ln", "-sfn", "../"+md, "/dev/md/"+mdName)
 	return false
+}
+
+// kernelOutOfSync says why the kernel does not run every member of a running
+// array in sync, or "" when it does: md/degraded and each member's state.
+func kernelOutOfSync(ctx context.Context, runner executor.Runner, md string, members []string) string {
+	read := func(path string) string {
+		res, err := runner.Run(ctx, executor.CommandSpec{Path: "cat", Args: []string{path}, CaptureStdout: true, CaptureStderr: true})
+		if err != nil {
+			return "unreadable"
+		}
+		return strings.TrimSpace(string(res.Stdout))
+	}
+	if d := read("/sys/block/" + md + "/md/degraded"); d != "0" {
+		return fmt.Sprintf("runs degraded (md/degraded %s)", d)
+	}
+	for _, m := range members {
+		st := read("/sys/block/" + md + "/md/dev-" + filepath.Base(m) + "/state")
+		if !slices.Contains(strings.Split(st, ","), "in_sync") {
+			return fmt.Sprintf("member %s is not in sync (state %q)", m, st)
+		}
+	}
+	return ""
 }
 
 // MDNamesOnDisks maps the md array name in every superblock found on the
