@@ -205,9 +205,6 @@ luna_finish() {
                 ip link set dev $iface down
             done
     fi
-    # initramfs-tools mounts the new root at $rootmnt (/root), not /sysroot:
-    # the move to /sysroot failed on every node and the log was lost
-    mv /tmp/luna_install.log "${rootmnt:-/root}/var/log/"
     # The lpart per-tool logs are the detailed record of the install, and /tmp
     # does not survive run-init: keep them, as the dracut hook does.
     if [ -d /tmp/install_files/logs ]; then
@@ -217,6 +214,11 @@ luna_finish() {
     fi
     # kill shell on tty2, by its pid: busybox ps has no 'h t o' selectors
     [ -f /run/luna-tty2.pid ] && kill -9 "$(cat /run/luna-tty2.pid)" 2>/dev/null
+
+    # Copied last, not moved: tee still writes the log, and a move to another
+    # filesystem leaves it writing into a deleted file. initramfs-tools mounts
+    # the new root at $rootmnt (/root), not /sysroot.
+    cp /tmp/luna_install.log "${rootmnt:-/root}/var/log/"
 
     # The installer reached its end, the root is complete (as the dracut hook).
     : > /run/luna-install-finished

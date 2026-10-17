@@ -273,7 +273,6 @@ function luna_finish () {
     fi
     # The install is over: the forwarder ends instead of reading a log that is moved next.
     : > "$LUNA_PROGRESS_STOP"
-    mv /tmp/luna_install.log /sysroot/var/log/
     # The lpart steps write their own per-tool logs, and /tmp is the initramfs --
     # it does not survive the pivot, so without this the detailed record of the
     # install is discarded exactly when someone would want to read it. These are
@@ -284,14 +283,18 @@ function luna_finish () {
         cp -a /tmp/install_files/logs/. /sysroot/var/log/luna/ 2>/dev/null \
             || echo "Luna2: could not preserve the lpart logs"
     fi
+    # kill shell on tty2
+    ps h t tty2 o pid | while read pid; do kill -9 $pid; done
+
+    # Copied last, not moved: tee still writes the log, and a move to another
+    # filesystem leaves it writing into a deleted file.
+    cp /tmp/luna_install.log /sysroot/var/log/
     # On a pty the install's children see a terminal and emit control sequences
     # (aria2c and curl draw progress meters, the lpart steps draw a TUI). Strip
     # them so the saved log stays readable; a failure here must not cost us the
     # log, hence the guard.
     sed -i 's/\x1b\[[0-9:;<=>?]*[a-zA-Z]//g; s/\r$//' /sysroot/var/log/luna_install.log 2>/dev/null \
         || echo "Luna2: could not strip terminal escapes from luna_install.log"
-    # kill shell on tty2
-    ps h t tty2 o pid | while read pid; do kill -9 $pid; done
 
     # The pre-pivot guard (luna-pivot-guard.sh) boots /sysroot only when this
     # exists: the installer reached its end, the root is complete.
