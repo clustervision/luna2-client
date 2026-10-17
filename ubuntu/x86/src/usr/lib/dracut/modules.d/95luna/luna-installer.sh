@@ -373,15 +373,17 @@ function luna_curl () {
 
 function fetch_token {
     CREDENTIALS=$(get_credentials)
-    USERNAME=$(echo "$CREDENTIALS" | awk -F':' '{ print $1 }')
-    PASSWORD=$(echo "$CREDENTIALS" | awk -F':' '{ print $2 }')
+    # the password may hold ':', '"' or '\': split on the first ':' only, and let jq quote
+    USERNAME=${CREDENTIALS%%:*}
+    PASSWORD=${CREDENTIALS#*:}
     export TPM2TOOLS_TCTI="device:/dev/tpm0"
     command -v ldconfig >/dev/null 2>&1 && ldconfig
     TPM=$(tpm2_pcrread sha256:0 2> /dev/null | grep '0x' | awk -F' : ' '{ print $2 }')
 #    if [ "$TPM" == "" ]; then
 #        TPM=$(ip a| grep -oE '[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+'|grep -v '00:00:00'|tr '\n' ':')
 #    fi
-    json='{"tpm_sha256":"'$TPM'","username":"'$USERNAME'","password":"'$PASSWORD'"}'
+    json=$(jq -cn --arg tpm "$TPM" --arg user "$USERNAME" --arg pass "$PASSWORD" \
+        '{tpm_sha256: $tpm, username: $user, password: $pass}')
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
     luna_verifycert=$(getargs luna.verifycert= | tr 'A-Z' 'a-z')
