@@ -131,6 +131,7 @@ luna_start() {
     echo "Luna2: Start shell on tty2"
     luna_ctty2=/dev/tty2
     setsid -c /bin/sh -i -l 0<>$luna_ctty2 1<>$luna_ctty2 2<>$luna_ctty2 &
+    echo $! > /run/luna-tty2.pid
     udevadm settle
     # settle is not really reliable
     sleep 5
@@ -214,8 +215,8 @@ luna_finish() {
         cp -a /tmp/install_files/logs/. "${rootmnt:-/root}/var/log/luna/" 2>/dev/null \
             || echo "Luna2: could not preserve the lpart logs"
     fi
-    # kill shell on tty2
-    ps h t tty2 o pid | while read pid; do kill -9 $pid; done
+    # kill shell on tty2, by its pid: busybox ps has no 'h t o' selectors
+    [ -f /run/luna-tty2.pid ] && kill -9 "$(cat /run/luna-tty2.pid)" 2>/dev/null
 
     # The installer reached its end, the root is complete (as the dracut hook).
     : > /run/luna-install-finished
