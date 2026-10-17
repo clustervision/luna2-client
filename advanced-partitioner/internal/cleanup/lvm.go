@@ -3,6 +3,7 @@ package cleanup
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -279,7 +280,10 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 	}
 
 	toRemove := map[string]struct{}{}
-	allPVs, _ := c.allPVs(ctx)
+	allPVs, err := c.allPVs(ctx)
+	if err != nil {
+		return fmt.Errorf("cleanup: cannot list the physical volumes to tear down the selected disks' VGs; no disk was wiped: %w", err)
+	}
 	for pvPath, vg := range allPVs {
 		if vg == "" {
 			continue

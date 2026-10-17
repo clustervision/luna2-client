@@ -136,3 +136,20 @@ func TestCleanupFailedPVsRefusesBeforeTouching(t *testing.T) {
 	}
 	assertNoDestruction(t, f)
 }
+
+// The VG teardown lists the PVs again; a pvs that fails there must not read as
+// "no VG on the selected disks" and let the wipe run under live mappings.
+func TestTeardownSameDiskVGsFailedPVsIsRetryable(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "pvs", Response: executor.FakeResponse{
+		ExitCode: 5, Err: errors.New("pvs --noheadings -o pv_name,vg_name: exit status 5")}})
+	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep})
+	err := c.teardownSameDiskVGs(context.Background(), SelectedDisksSet([]string{"/dev/sda"}), nil)
+	if err == nil {
+		t.Fatal("a failed pvs must stop the teardown before the wipe")
+	}
+	if errors.Is(err, ErrProtected) {
+		t.Fatalf("a failed probe is retryable, not a safety refusal: %v", err)
+	}
+	assertNoDestruction(t, f)
+}
