@@ -31,7 +31,7 @@ func TestWriteFstabBasic(t *testing.T) {
 	for _, want := range []string{
 		"UUID=root-uuid / xfs defaults 0 0",
 		"UUID=boot-uuid /boot xfs defaults 0 0",
-		"UUID=efi-uuid /boot/efi vfat umask=0077,shortname=winnt 0 0",
+		"UUID=efi-uuid /boot/efi vfat umask=0077,shortname=winnt,nofail,x-systemd.device-timeout=10s 0 0",
 		"UUID=swap-uuid none swap defaults 0 0",
 	} {
 		if !strings.Contains(string(body), want) {

@@ -104,7 +104,8 @@ func fstabLineFor(fs result.Filesystem) (string, error) {
 	case "swap":
 		return fmt.Sprintf("UUID=%s none swap defaults 0 0", fs.UUID), nil
 	case "/boot/efi":
-		return fmt.Sprintf("UUID=%s %s %s umask=0077,shortname=winnt 0 0",
+		// nofail: a mirrored ESP that is not assembled must not stop the boot
+		return fmt.Sprintf("UUID=%s %s %s umask=0077,shortname=winnt,nofail,x-systemd.device-timeout=10s 0 0",
 			fs.UUID, fs.Mount, fs.FS), nil
 	}
 	dump, pass := dumpAndPassFor(fs.FS, fs.Mount)
