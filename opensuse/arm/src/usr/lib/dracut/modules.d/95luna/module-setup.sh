@@ -77,6 +77,8 @@ install() {
     # device nodes itself (vgmknodes, then dmsetup mknodes); dracut's lvm
     # module does not ship vgmknodes (an lvm symlink).
     inst_multiple -o vgmknodes
+    # the installer flushes with sync before it parks or reboots
+    dracut_install sync
     if ! type -P fsck.fat >/dev/null 2>&1 && ! type -P fsck.vfat >/dev/null 2>&1; then
         derror "95luna: neither fsck.fat nor fsck.vfat found (dosfstools): lpart-storage-check cannot run"
     fi
