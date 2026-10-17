@@ -588,6 +588,10 @@ func (sp *setProcessor) process(ctx context.Context, p plannedSet, detectedFirmw
 		fs := fsmod.MemoryFilesystems(set)
 		sp.logger.SetStage("mounts")
 		mt, err := sp.mount.MountSysrootTree(ctx, fs)
+		var symlinked *mount.SymlinkError
+		if errors.As(err, &symlinked) {
+			return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("mount-symlink", "set %q: %v", set.Name, err)
+		}
 		if err != nil {
 			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("mount: %w", err)
 		}
@@ -698,6 +702,10 @@ func (sp *setProcessor) process(ctx context.Context, p plannedSet, detectedFirmw
 
 	sp.logger.SetStage("mounts")
 	mt, err := sp.mount.MountSysrootTree(ctx, fs)
+	var symlinked *mount.SymlinkError
+	if errors.As(err, &symlinked) {
+		return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("mount-symlink", "set %q: %v", set.Name, err)
+	}
 	if err != nil {
 		return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("mount: %w", err)
 	}

@@ -582,6 +582,32 @@ func TestMountExistingThroughSymlinkIsFatal(t *testing.T) {
 	}
 }
 
+// The create and memory paths refuse a symlinked mountpoint the same way: a
+// retry would meet the same link.
+func TestCreateAndMemoryThroughSymlinkAreFatal(t *testing.T) {
+	for _, c := range []struct {
+		name string
+		vol  v2.Volume
+	}{
+		{"create", v2.Volume{Name: "d", Mountpoint: "/srv/data", FS: "xfs", Size: "100%", Provider: "partition"}},
+		{"memory", v2.Volume{Name: "d", Mountpoint: "/srv/data", FS: "tmpfs", Size: "1G", Provider: "memory"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sp, f := testProcessor(t)
+			sysroot, outside := t.TempDir(), t.TempDir()
+			if err := os.Symlink(outside, sysroot+"/srv"); err != nil {
+				t.Fatal(err)
+			}
+			sp.mount = mount.New(mount.Options{Runner: f, Logger: sp.logger, Sysroot: sysroot})
+			set := v2.Set{Name: "data", Role: "data", Selection: "manual", Raid: "none", Devices: []string{"/dev/vdb"},
+				Volumes: []v2.Volume{c.vol}}
+			_, _, err := sp.process(context.Background(), plannedSet{set: &set, act: actCreate,
+				disks: []selector.Resolved{{ConfiguredPath: "/dev/vdb", ResolvedPath: "/dev/vdb"}}}, "uefi", true)
+			wantFatal(t, err, "mount-symlink")
+		})
+	}
+}
+
 // A degraded mount anchors raw partition paths on the first PRESENT disk.
 func TestMountExistingDegradedUsesPresentDisk(t *testing.T) {
 	sp, _ := testProcessor(t)
