@@ -88,7 +88,12 @@ func ExcludedByTar(rel string, excludes []string) bool {
 	for _, ex := range excludes {
 		pat := strings.TrimPrefix(strings.TrimPrefix(ex, "--exclude="), "./")
 		if base, ok := strings.CutSuffix(pat, "/*"); ok {
-			if strings.HasPrefix(rel, base+"/") {
+			if strings.HasPrefix(rel, unescapeTarPattern(base)+"/") {
+				return true
+			}
+		} else if strings.Contains(pat, `\`) {
+			// Only EscapeTarPattern writes a backslash: filter paths refuse one.
+			if within(rel, unescapeTarPattern(pat)) {
 				return true
 			}
 		} else if pat != "" && (globMatch(pat, rel) || within(rel, pat)) {
@@ -96,6 +101,22 @@ func ExcludedByTar(rel string, excludes []string) bool {
 		}
 	}
 	return false
+}
+
+var tarPatternEscaper = strings.NewReplacer(`\`, `\\`, "[", `\[`, "]", `\]`, "*", `\*`, "?", `\?`)
+
+// EscapeTarPattern makes p match itself literally as a tar --exclude pattern.
+func EscapeTarPattern(p string) string { return tarPatternEscaper.Replace(p) }
+
+func unescapeTarPattern(p string) string {
+	var b strings.Builder
+	for i := 0; i < len(p); i++ {
+		if p[i] == '\\' && i+1 < len(p) {
+			i++
+		}
+		b.WriteByte(p[i])
+	}
+	return b.String()
 }
 
 // SyncOptions configures SyncExtract.

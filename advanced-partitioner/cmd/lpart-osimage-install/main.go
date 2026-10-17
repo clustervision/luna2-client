@@ -318,14 +318,15 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// mountpoint becomes "./<mountpoint>" plus "./<mountpoint>/*" so
 	// both the directory entry and its contents survive the extract.
 	for _, mp := range srSummary.PersistentMountpoints {
-		// tar matches members literally: "/home/" or "//home" would exclude nothing.
+		// tar matches members as written: "/home/" or "//home" would exclude
+		// nothing, and "[", "*" or "?" would be wildcards.
 		clean := strings.Trim(path.Clean("/"+mp), "/")
 		if clean == "" {
 			continue
 		}
 		excludes = append(excludes,
-			"--exclude=./"+clean,
-			"--exclude=./"+clean+"/*",
+			"--exclude=./"+osimage.EscapeTarPattern(clean),
+			"--exclude=./"+osimage.EscapeTarPattern(clean)+"/*",
 		)
 		logger.UserInfo("persistent-set-mountpoint excluded from extract: %s", mp)
 	}

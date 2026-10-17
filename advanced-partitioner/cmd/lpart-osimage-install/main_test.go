@@ -5,8 +5,12 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/osimage"
 )
 
 // Per the cross-tool convention, cmd-level tests cover the orchestrator
@@ -309,6 +313,80 @@ func TestPersistentMountpointExcludesAreCanonical(t *testing.T) {
 	for _, f := range files {
 		if got, _ := os.ReadFile(filepath.Join(dst, f)); string(got) != "USERDATA" { //nolint:gosec // test path
 			t.Errorf("%s overwritten by the image (excludes %q)", f, excludes)
+		}
+	}
+}
+
+// A persistent mountpoint is matched literally by the real tar and by
+// ExcludedByTar: "[", "*" and "?" in it are not wildcards.
+func TestPersistentMountpointExcludesAreLiteral(t *testing.T) {
+	tmp := t.TempDir()
+	ic := filepath.Join(tmp, "install-context.json")
+	if err := os.WriteFile(ic, []byte(`{"install_mode":"auto","osimage_sync":"Full"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sr := filepath.Join(tmp, "storage-result.json")
+	body := `{"version":2,"sets":[
+        {"name":"os","role":"os","persistent":false,"filesystems":[{"mount":"/","device":"tmpfs","fs":"tmpfs"}]},
+        {"name":"data","role":"data","persistent":true,"filesystems":[
+            {"mount":"/data[1]","device":"/dev/data/a","fs":"xfs"},
+            {"mount":"/st*r","device":"/dev/data/b","fs":"xfs"},
+            {"mount":"/q?x","device":"/dev/data/c","fs":"xfs"}]}
+    ]}`
+	if err := os.WriteFile(sr, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := writeInstallScript(t, `LUNA_TOKEN="x"`+"\n"+`luna_url="http://controller/files/image.tar.bz2"`+"\n")
+	stderr, logBody, rc := runEnvWithLog(t, "--install-context", ic, "--storage-result", sr, "--skip-sysroot-check",
+		"--skip-download", "--allow-non-installer", "--luna-install-script", script, "--luna-token", "envtoken")
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+	_, rest, ok := strings.Cut(logBody, `tar_excludes="`)
+	if !ok {
+		t.Fatalf("no tar_excludes in the log:\n%s", logBody)
+	}
+	quoted, _, _ := strings.Cut(rest, `"`)
+	excludes, err := strconv.Unquote(`"` + quoted + `"`)
+	if err != nil {
+		t.Fatalf("tar_excludes %q: %v", quoted, err)
+	}
+
+	src, dst := filepath.Join(tmp, "image"), filepath.Join(tmp, "sysroot")
+	kept := []string{"data[1]/state", "st*r/f", "q?x/f"}
+	written := []string{"data1/state", "stXr/f", "qyx/f"}
+	for _, f := range append(slices.Clone(kept), written...) {
+		for root, body := range map[string]string{src: "image", dst: "USERDATA"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(root, f)), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, f), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	tarball := filepath.Join(tmp, "image.tar")
+	if out, err := exec.Command("tar", "-cf", tarball, "-C", src, ".").CombinedOutput(); err != nil { //nolint:gosec // test paths
+		t.Fatalf("build image: %v: %s", err, out)
+	}
+	args := append(strings.Fields(excludes), "-xf", tarball, "-C", dst)
+	if out, err := exec.Command("tar", args...).CombinedOutput(); err != nil { //nolint:gosec // test paths
+		t.Fatalf("extract: %v: %s", err, out)
+	}
+	for _, f := range kept {
+		if got, _ := os.ReadFile(filepath.Join(dst, f)); string(got) != "USERDATA" { //nolint:gosec // test path
+			t.Errorf("%s overwritten by the image (excludes %q)", f, excludes)
+		}
+		if !osimage.ExcludedByTar(f, strings.Fields(excludes)) {
+			t.Errorf("ExcludedByTar disagrees with tar: %s is excluded", f)
+		}
+	}
+	for _, f := range written {
+		if got, _ := os.ReadFile(filepath.Join(dst, f)); string(got) != "image" { //nolint:gosec // test path
+			t.Errorf("%s was not extracted (excludes %q)", f, excludes)
+		}
+		if osimage.ExcludedByTar(f, strings.Fields(excludes)) {
+			t.Errorf("ExcludedByTar disagrees with tar: %s is extracted", f)
 		}
 	}
 }
