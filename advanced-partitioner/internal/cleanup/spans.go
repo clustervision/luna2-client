@@ -2,6 +2,7 @@ package cleanup
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -13,7 +14,10 @@ import (
 // Even lpart's array is refused when the other disk is an FC/iSCSI LUN.
 func (c *Cleaner) refuseOutsideSpans(ctx context.Context, selected map[string]struct{}) error {
 	if c.o.CommandAvailable("pvs") {
-		all := c.allPVs(ctx)
+		all, err := c.allPVs(ctx)
+		if err != nil {
+			return fmt.Errorf("cleanup: cannot list the physical volumes, so a VG spanning other disks cannot be ruled out; no disk was touched: %w", err)
+		}
 		touched := map[string]bool{}
 		for pv, vg := range all {
 			if vg != "" && c.reachesSelected(ctx, pv, selected) {

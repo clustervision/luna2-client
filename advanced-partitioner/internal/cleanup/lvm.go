@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lvm/vgselect"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/mount"
 )
@@ -278,7 +279,7 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 	}
 
 	toRemove := map[string]struct{}{}
-	allPVs := c.allPVs(ctx)
+	allPVs, _ := c.allPVs(ctx)
 	for pvPath, vg := range allPVs {
 		if vg == "" {
 			continue
@@ -463,10 +464,13 @@ func (c *Cleaner) pvsForVG(ctx context.Context, vgName string) []string {
 // allPVs returns a pv_name → vg_name map for every PV the system knows.
 // Empty vg_name values are passed through so callers can distinguish
 // orphaned PVs from missing-VG entries.
-func (c *Cleaner) allPVs(ctx context.Context) map[string]string {
-	res, ok := c.runOK(ctx, "pvs", "--noheadings", "-o", "pv_name,vg_name")
-	if !ok {
-		return nil
+func (c *Cleaner) allPVs(ctx context.Context) (map[string]string, error) {
+	res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
+		Path: "pvs", Args: []string{"--noheadings", "-o", "pv_name,vg_name"},
+		CaptureStdout: true, CaptureStderr: true,
+	})
+	if err != nil {
+		return nil, err
 	}
 	out := map[string]string{}
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
@@ -481,5 +485,5 @@ func (c *Cleaner) allPVs(ctx context.Context) map[string]string {
 		}
 		out[pv] = vg
 	}
-	return out
+	return out, nil
 }

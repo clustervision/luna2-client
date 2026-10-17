@@ -2,6 +2,7 @@ package cleanup
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -116,4 +117,22 @@ func TestCleanupAcceptsVGOnOwnArrayReachingSelection(t *testing.T) {
 	if err := runSpan(c); err != nil {
 		t.Fatalf("lpart's own array reaching the selection must be torn down: %v", err)
 	}
+}
+
+// A pvs that fails gives no PV map, so neither the span refusal nor the
+// spanning barrier can judge anything: retryable error, nothing touched.
+func TestCleanupFailedPVsRefusesBeforeTouching(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "pvs", Response: executor.FakeResponse{
+		ExitCode: 5, Err: errors.New("pvs --noheadings -o pv_name,vg_name: exit status 5")}})
+	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep,
+		MDStatPath: filepath.Join(t.TempDir(), "mdstat"), Stat: statNotExist})
+	err := runSpan(c)
+	if err == nil {
+		t.Fatal("a failed pvs must stop the cleanup before anything is wiped")
+	}
+	if errors.Is(err, ErrProtected) {
+		t.Fatalf("a failed probe is retryable, not a safety refusal: %v", err)
+	}
+	assertNoDestruction(t, f)
 }
