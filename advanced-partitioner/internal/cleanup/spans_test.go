@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
@@ -147,6 +148,10 @@ func TestTeardownSameDiskVGsFailedPVsIsRetryable(t *testing.T) {
 	err := c.teardownSameDiskVGs(context.Background(), SelectedDisksSet([]string{"/dev/sda"}), nil, false)
 	if err == nil {
 		t.Fatal("a failed pvs must stop the teardown before the wipe")
+	}
+	// the set's own VG is removed before this step: the operator must not read the set as intact
+	if !strings.Contains(err.Error(), "own volume group (if any) was already removed") {
+		t.Fatalf("the message must say the set's own VG is already gone: %v", err)
 	}
 	if errors.Is(err, ErrProtected) {
 		t.Fatalf("a failed probe is retryable, not a safety refusal: %v", err)

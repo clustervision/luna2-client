@@ -286,7 +286,7 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("cleanup: cannot list the physical volumes to tear down the selected disks' VGs; no disk was wiped: %w", err)
+		return fmt.Errorf("cleanup: cannot list the physical volumes to tear down the selected disks' VGs; the selected disks were not wiped, but the set's own volume group (if any) was already removed: %w", err)
 	}
 	for pvPath, vg := range allPVs {
 		if vg == "" {
