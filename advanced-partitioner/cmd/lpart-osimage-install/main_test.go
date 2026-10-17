@@ -517,6 +517,32 @@ func TestImageWinsIntoPersistentRefused(t *testing.T) {
 	}
 }
 
+// The refusal compares normalised mountpoints, as the extract excludes do, so
+// a non-canonical spelling of the persistent mountpoint is refused too.
+func TestImageWinsIntoNonCanonicalPersistentRefused(t *testing.T) {
+	for _, mp := range []string{"/home/alice", "/home/./alice", "/home//alice", "/home/alice/"} {
+		tmp := t.TempDir()
+		pm := filepath.Join(tmp, "mounts")
+		cfg := filepath.Join(tmp, "filter.json")
+		sr := filepath.Join(tmp, "storage-result.json")
+		for p, body := range map[string]string{
+			pm:  "tmpfs /sysroot tmpfs rw 0 0\n",
+			cfg: `{"image_wins": ["home/alice/.bashrc"]}`,
+			sr: `{"version":2,"sets":[{"name":"os","role":"os","filesystems":[{"mount":"/"}]},
+			{"name":"home","role":"data","persistent":true,"filesystems":[{"mount":"` + mp + `"}]}]}`,
+		} {
+			if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		stderr, rc := runEnv(t, "--proc-mounts", pm, "--sysroot", "/sysroot", "--config", cfg, "--storage-result", sr,
+			"--luna-token", "x", "--osimage-file", "img.tar.bz2", "--luna-install-script", "/nonexistent-for-test", "--skip-download")
+		if rc != 3 || !strings.Contains(stderr, "persistent mountpoint /home/alice,") {
+			t.Fatalf("%s: want exit 3 naming the persistent mountpoint; rc=%d stderr=%s", mp, rc, stderr)
+		}
+	}
+}
+
 // A bad command line is the same on every attempt: exit 3 parks with a
 // fatal_config line, as in every lpart tool; exit 2 is reserved for safety
 // refusals.

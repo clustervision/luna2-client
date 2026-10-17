@@ -714,11 +714,11 @@ func resolveStreamPolicy(flagVal, cmdlinePath string) (policy, note string) {
 	}
 }
 
-// relMounts turns absolute mountpoints into sysroot-relative ones, dropping "/".
+// relMounts turns absolute mountpoints into clean sysroot-relative ones, dropping "/".
 func relMounts(lists ...[]string) []string {
 	out := []string{}
 	for _, mp := range slices.Concat(lists...) {
-		if c := strings.Trim(mp, "/"); c != "" {
+		if c := strings.Trim(path.Clean("/"+mp), "/"); c != "" {
 			out = append(out, c)
 		}
 	}
