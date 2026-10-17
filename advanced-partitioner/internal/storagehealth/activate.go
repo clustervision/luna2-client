@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -170,9 +171,34 @@ func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string
 	if start {
 		args = append(args, "--run")
 	}
-	run("mdadm", append(append(args, "/dev/md/"+mdName), members...)...)
+	args = append(append(args, "/dev/md/"+mdName), members...)
+	res, err := runner.Run(ctx, executor.CommandSpec{Path: "mdadm", Args: args, CaptureStdout: true, CaptureStderr: true})
+	if err != nil && logger != nil {
+		logger.Info("activate (best-effort) mdadm " + strings.Join(args, " ") + ": " + err.Error())
+	}
 	md := mdHolder(ctx, runner, members[0])
-	return true, md != "" && arrayState(ctx, runner, md) == "inactive"
+	if md == "" {
+		// mdadm would not start it: a member is missing, also when only its
+		// superblock is gone and the disk is there
+		return false, strings.Contains(string(res.Stderr), "need all") || len(members) < raidDevices(ctx, runner, members[0])
+	}
+	return true, arrayState(ctx, runner, md) == "inactive"
+}
+
+// raidDevices is the member count the array was created with, from one
+// member's superblock (0 when it cannot be read).
+func raidDevices(ctx context.Context, runner executor.Runner, member string) int {
+	res, err := runner.Run(ctx, executor.CommandSpec{Path: "mdadm", Args: []string{"--examine", member}, CaptureStdout: true, CaptureStderr: true})
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(string(res.Stdout), "\n") {
+		if k, v, ok := strings.Cut(strings.TrimSpace(line), " : "); ok && strings.TrimSpace(k) == "Raid Devices" {
+			n, _ := strconv.Atoi(strings.TrimSpace(v))
+			return n
+		}
+	}
+	return 0
 }
 
 // arrayState is the md array's sysfs state ("clean", "inactive", ...), or "".
