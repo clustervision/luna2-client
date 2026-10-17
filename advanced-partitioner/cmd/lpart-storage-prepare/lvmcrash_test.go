@@ -4,8 +4,12 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lvm"
 )
 
 // Lab, RHEL 8: lvm2 2.03.14 crashed (SIGSEGV) in pvcreate on a new raid0 that
@@ -24,5 +28,22 @@ func TestLVMCrashParks(t *testing.T) {
 	stderr.Reset()
 	if rc := exitForError(&stderr, errors.New("pvcreate /dev/md/data: exit status 5")); rc != 1 {
 		t.Fatalf("plain lvm failure: exit %d, want 1", rc)
+	}
+}
+
+// The same crash comes back if the LVM builder loses its PV zeroing: a real
+// run zeroes with lvm.ZeroStart, and a dry run never writes the device.
+func TestLVMOptionsZeroThePVOnlyOutsideDryRun(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	logger := silentLogger(t)
+	o := lvmOptions(f, logger, false)
+	if o.Runner != executor.Runner(f) || o.Logger != logger {
+		t.Fatalf("runner or logger not passed through: %+v", o)
+	}
+	if o.ZeroDevice == nil || reflect.ValueOf(o.ZeroDevice).Pointer() != reflect.ValueOf(lvm.ZeroStart).Pointer() {
+		t.Fatal("a real run must zero the PV start with lvm.ZeroStart")
+	}
+	if o := lvmOptions(f, logger, true); o.ZeroDevice != nil {
+		t.Fatal("a dry run must not zero the PV start")
 	}
 }
