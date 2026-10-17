@@ -148,6 +148,23 @@ func TestGrubDefaultFileSourcesLunaOptionsVerbatim(t *testing.T) {
 	}
 }
 
+// A quoted Luna option is one argument: a word it shares with another quoted
+// value is no duplicate, and dropping it would leave a quote open in grub.cfg.
+func TestGrubDefaultFileKeepsQuotedLunaOptionsWhole(t *testing.T) {
+	luna := `a="x y" b="z y" quiet rd.auto quiet`
+	file := filepath.Join(t.TempDir(), "grub")
+	if err := os.WriteFile(file, []byte(grubDefaultFile("", "rd.auto", luna, "saved")), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("sh", "-ec", `. "$1"; printf %s "$GRUB_CMDLINE_LINUX"`, "sh", file).CombinedOutput() //nolint:gosec // test-built path
+	if err != nil {
+		t.Fatalf("sourcing the file failed: %v: %s", err, out)
+	}
+	if want := `rd.auto a="x y" b="z y" quiet`; string(out) != want {
+		t.Fatalf("GRUB_CMDLINE_LINUX = %q, want %q", out, want)
+	}
+}
+
 // Finalise is re-run on every sync: the file it wrote is a valid input and
 // produces itself.
 func TestGrubDefaultFileIdempotent(t *testing.T) {

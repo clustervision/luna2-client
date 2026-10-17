@@ -58,7 +58,7 @@ func grubDefaultFile(image, kernelArgs, lunaOptions, defaultEntry string) string
 	}
 	args := strings.Fields(kernelArgs)
 	args = append(args, imageArgs...)
-	args = append(args, strings.Fields(lunaOptions)...)
+	args = append(args, cmdlineFields(lunaOptions)...)
 	lines = append(lines, GrubCmdlineValue(strings.Join(uniqueArgs(args), " ")))
 	return strings.Join(lines, "\n") + "\n"
 }
@@ -105,6 +105,32 @@ func shellValue(rhs string) string {
 		return rhs[:i]
 	}
 	return rhs
+}
+
+// cmdlineFields splits a kernel command line as the kernel does: a double
+// quoted value with blanks in it stays one argument.
+func cmdlineFields(s string) []string {
+	var out []string
+	var cur strings.Builder
+	quoted := false
+	for _, r := range s {
+		switch {
+		case r == '"':
+			quoted = !quoted
+			cur.WriteRune(r)
+		case !quoted && (r == ' ' || r == '\t' || r == '\n'):
+			if cur.Len() > 0 {
+				out = append(out, cur.String())
+				cur.Reset()
+			}
+		default:
+			cur.WriteRune(r)
+		}
+	}
+	if cur.Len() > 0 {
+		out = append(out, cur.String())
+	}
+	return out
 }
 
 // uniqueArgs keeps the first occurrence of every argument.
