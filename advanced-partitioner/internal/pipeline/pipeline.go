@@ -120,6 +120,7 @@ type Pipeline struct {
 	storageState model.Storage // last emitted storage, for re-emit with InUse/Method
 	methodLine   string        // config-derived Method (selection + counts), shown from resolve onward
 	stepStderr   []string      // tail of the current step's stderr, for the failure file
+	stepVerdict  string        // the step's last verdict line, which a long refusal pushes out of the tail
 	// stepLine, when set, sees every stdout/stderr line of the running step
 	// (from the mirror goroutine; read it only after the step returned).
 	stepLine func(string)
@@ -267,7 +268,7 @@ func (p *Pipeline) recoverPanic() {
 	}
 	msg := fmt.Sprintf("internal error: %v", r)
 	p.info(msg + "\n" + string(debug.Stack()))
-	p.stepStderr = nil
+	p.stepStderr, p.stepVerdict = nil, ""
 	p.writeFailure("internal", msg)
 	p.setResult(Result{Done: true, Failed: true, Class: FailFatal, Message: msg})
 	p.emit(engine.InstallerEvent{Time: time.Now(), Type: engine.EvInstallerFailed, Stream: engine.StreamSystem, Message: msg, Data: FailFatal})
@@ -566,9 +567,7 @@ func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []st
 	// Mirror the step's stderr on its way to the renderers so a failure can
 	// name the cause in the failure file. The forward stays blocking, so the
 	// bus behaves exactly as it does when RunCommand writes to it directly.
-	p.stepStderr = nil
-	// The last verdict line, kept apart: a long refusal pushes it out of the tail.
-	var verdictLine string
+	p.stepStderr, p.stepVerdict = nil, ""
 	mirror := make(chan engine.InstallerEvent, 64)
 	var mirrored sync.WaitGroup
 	mirrored.Add(1)
@@ -580,7 +579,7 @@ func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []st
 			}
 			if ev.Type == engine.EvCommandStderr {
 				if strings.Contains(ev.Message, "safety_refusal=") || strings.Contains(ev.Message, "fatal_config=") {
-					verdictLine = ev.Message
+					p.stepVerdict = ev.Message
 				}
 				p.stepStderr = append(p.stepStderr, ev.Message)
 				if len(p.stepStderr) > stepStderrLines {
@@ -604,7 +603,7 @@ func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []st
 	// it, and a park (exit 2 or 3) became a retry loop.
 	if code != 0 {
 		return &stepError{Bin: filepath.Base(argv[0]), Stage: stage, Code: code,
-			Refused: refused([]string{verdictLine})}
+			Refused: refused([]string{p.stepVerdict})}
 	}
 	if err != nil {
 		return err // code==0 but a genuine non-exit failure
@@ -657,7 +656,7 @@ func (p *Pipeline) stageFail(id, note string) {
 const DegradedMarker = "degraded.done"
 
 func (p *Pipeline) markDegraded() {
-	for _, line := range p.stepStderr {
+	for _, line := range append([]string{p.stepVerdict}, p.stepStderr...) {
 		if strings.Contains(line, "safety_refusal=degraded") {
 			if err := os.WriteFile(p.rt(DegradedMarker), []byte(line+"\n"), 0o600); err != nil {
 				p.info("could not write " + p.rt(DegradedMarker) + ": " + err.Error())
@@ -673,7 +672,7 @@ func (p *Pipeline) failurePath() string { return filepath.Join(p.opts.LogDir, fa
 // the boot wrapper to print. Best-effort: a failure to write is reported into
 // the install log rather than masking the failure that is being reported.
 func (p *Pipeline) writeFailure(stage, reason string) {
-	if v := verdict(p.stepStderr); v != "" {
+	if v := verdict([]string{p.stepVerdict}); v != "" {
 		reason = v
 	}
 	var b strings.Builder

@@ -89,6 +89,25 @@ echo 'lpart-storage-prepare: safety_refusal=data-fence set "os" is broken and in
 	}
 }
 
+// A refusal longer than the stderr tail keeps its verdict: the reason and the
+// degraded marker come from the verdict line, not from the lines after it.
+func TestALongRefusalKeepsItsVerdict(t *testing.T) {
+	dir := t.TempDir()
+	p := New(context.Background(), Options{Phase: PhasePart, LogDir: dir, RuntimeDir: dir, StepTimeout: 30 * time.Second})
+	err := p.runStepArgv("storage-prepare", []string{"/bin/sh", "-c", `echo 'lpart-storage-prepare: safety_refusal=degraded set "data" is degraded:' >&2
+i=0; while [ $i -lt 44 ]; do echo "/dev/sd$i: member missing" >&2; i=$((i+1)); done; exit 2`})
+	if err == nil {
+		t.Fatal("expected the step to fail")
+	}
+	p.stageFail("storage-prepare", err.Error())
+	if got := failureBanner(t, dir); !strings.Contains(got, `reason: degraded: set "data" is degraded:`) {
+		t.Fatalf("the banner lost the verdict of a long refusal:\n%s", got)
+	}
+	if _, err := os.Stat(p.rt(DegradedMarker)); err != nil {
+		t.Fatalf("a long degraded refusal left no marker: %v", err)
+	}
+}
+
 // Without a verdict line the cause is at the end of stderr: the banner shows the
 // tail, not the debug lines a step prints first.
 func TestTheParkBannerShowsTheEndOfStderr(t *testing.T) {
