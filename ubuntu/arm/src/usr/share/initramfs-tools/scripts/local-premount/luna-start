@@ -434,6 +434,9 @@ print_failure_reason() {
 }
 
 if [ "x$ROOT" = "xluna" ]; then
+    # An install starts in this boot: from now on the local-bottom guard lets
+    # init boot /root only after luna_finish (scripts/local-bottom/luna-guard).
+    : > /run/luna-install-started
     luna_init
     luna_start
     luna_ctty=$(_get_luna_ctty)
