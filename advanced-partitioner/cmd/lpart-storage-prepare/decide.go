@@ -161,6 +161,14 @@ func (sp *setProcessor) planSets(ctx context.Context, mode installcontext.Mode, 
 	if err := sp.checkForeignVGs(ctx, plans); err != nil {
 		return nil, err
 	}
+	for _, p := range plans {
+		if p.act != actCreate {
+			continue
+		}
+		if err := sp.cleaner.RefuseOutsideSpans(ctx, diskPaths(p.disks)); err != nil {
+			return nil, cleanupError(p.set.Name, err)
+		}
+	}
 	return plans, nil
 }
 

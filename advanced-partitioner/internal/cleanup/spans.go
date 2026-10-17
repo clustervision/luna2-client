@@ -8,6 +8,12 @@ import (
 	"strings"
 )
 
+// RefuseOutsideSpans is CleanupSelectedSet's read-only span check, for a caller
+// that must refuse before the first of several sets is cleaned.
+func (c *Cleaner) RefuseOutsideSpans(ctx context.Context, selectedDisks []string) error {
+	return c.refuseOutsideSpans(ctx, SelectedDisksSet(selectedDisks))
+}
+
 // refuseOutsideSpans refuses a VG or md array that reaches from the selected
 // disks onto another disk, unless it is lpart's own leftover: lpart never
 // builds a VG across disks, and its md arrays are created with homehost "any".

@@ -503,6 +503,20 @@ func TestStaleVGDiskProbeErrorRetriesBeforeCleanup(t *testing.T) {
 	}
 }
 
+// A VG reaching from the second create set's disk onto another disk refuses
+// while planning: the first set's disks are not wiped first.
+func TestSpanRefusalOnSecondSetBeforeFirstIsCleaned(t *testing.T) {
+	sp, f := testProcessor(t)
+	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "pv_name,vg_name"},
+		Response: executor.FakeResponse{Stdout: []byte("  /dev/vdb2 scratch\n  /dev/vdc2 scratch\n")}})
+	_, _, err := sp.runDecision(context.Background(), installcontext.ModeFull,
+		&v2.Config{Version: 2, Sets: []v2.Set{raidOSSet("none", "/dev/vda"), dataOnlyConfig().Sets[0]}}, "uefi", false, true)
+	wantSafety(t, err, "protected-disk")
+	if d := destructive(f); d != "" {
+		t.Fatalf("the span refusal must precede every cleanup; ran %s", d)
+	}
+}
+
 // --- item 1: mount-existing records the boot partition numbers -------------
 
 // A refreshed os set (no Layout built) must still report its ESP and BIOS
