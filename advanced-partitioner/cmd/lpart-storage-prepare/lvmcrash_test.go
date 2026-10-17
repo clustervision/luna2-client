@@ -60,9 +60,14 @@ func TestLVMOptionsZeroThePVOnlyOutsideDryRun(t *testing.T) {
 // signal, as lvm2 is by some old LVM remnants.
 func crashingPVsProcessor(t *testing.T) (*setProcessor, *executor.FakeRunner) {
 	t.Helper()
+	return failingPVsProcessor(t, -1, errors.New("pvs --noheadings -o pv_name,vg_name: signal: segmentation fault (core dumped)"))
+}
+
+// failingPVsProcessor is a set processor on one local disk whose pvs fails.
+func failingPVsProcessor(t *testing.T, exitCode int, pvsErr error) (*setProcessor, *executor.FakeRunner) {
+	t.Helper()
 	f := executor.NewFakeRunner(executor.FakeResponse{})
-	f.AddMatch(executor.FakeMatch{Path: "pvs", Response: executor.FakeResponse{
-		ExitCode: -1, Err: errors.New("pvs --noheadings -o pv_name,vg_name: signal: segmentation fault (core dumped)")}})
+	f.AddMatch(executor.FakeMatch{Path: "pvs", Response: executor.FakeResponse{ExitCode: exitCode, Err: pvsErr}})
 	tmp := t.TempDir()
 	mdstat := filepath.Join(tmp, "mdstat")
 	if err := os.WriteFile(mdstat, nil, 0o600); err != nil {
@@ -93,6 +98,46 @@ func TestSanitizeErasesWhenPVsCrashes(t *testing.T) {
 	if !erased || sp.sanitized != 1 {
 		t.Fatalf("disk not erased (blkdiscard ran: %v, sanitized %d)", erased, sp.sanitized)
 	}
+}
+
+// assertNothingWiped fails when any wipe or erase command ran.
+func assertNothingWiped(t *testing.T, f *executor.FakeRunner) {
+	t.Helper()
+	for _, c := range f.Calls() {
+		if c.Path == "wipefs" || c.Path == "sgdisk" || c.Path == "dd" || c.Path == "blkdiscard" {
+			t.Fatalf("%s ran after the pvs failure: %v", c.Path, c.Args)
+		}
+	}
+}
+
+// A VG may reach from the local disk onto the LUN, which sanitize does not
+// erase: with pvs crashing that cannot be ruled out, so it parks as an install.
+func TestSanitizeParksWhenPVsCrashesBesideASANDisk(t *testing.T) {
+	sp, f := crashingPVsProcessor(t)
+	sp.pool = append(sp.pool, discover.Device{Path: "/dev/sdb", KernelPath: "/dev/sdb", Size: gib(100), Transport: "iscsi"})
+	_, _, err := sp.runSanitize(context.Background(), false)
+	if err == nil {
+		t.Fatal("sanitize erased the local disk with a LUN present and pvs crashing")
+	}
+	var stderr bytes.Buffer
+	if rc := exitForError(&stderr, err); rc != 2 || !strings.Contains(stderr.String(), "safety_refusal=lvm-crashed") {
+		t.Fatalf("exit %d, want 2 lvm-crashed; stderr %s", rc, stderr.String())
+	}
+	assertNothingWiped(t, f)
+}
+
+// Only a crash is passed: a pvs that merely fails stops sanitize, retryable.
+func TestSanitizeStopsWhenPVsFails(t *testing.T) {
+	sp, f := failingPVsProcessor(t, 5, errors.New("pvs --noheadings -o pv_name,vg_name: exit status 5"))
+	_, _, err := sp.runSanitize(context.Background(), false)
+	if err == nil {
+		t.Fatal("sanitize erased past a failing pvs")
+	}
+	var stderr bytes.Buffer
+	if rc := exitForError(&stderr, err); rc != 1 {
+		t.Fatalf("exit %d, want 1 (retry); stderr %s", rc, stderr.String())
+	}
+	assertNothingWiped(t, f)
 }
 
 // A full install still parks on the same crash before anything is wiped.

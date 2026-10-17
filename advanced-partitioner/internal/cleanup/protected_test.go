@@ -94,7 +94,7 @@ func TestTeardownSameDiskVGsRefusesSpanningVG(t *testing.T) {
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep})
 	err := c.teardownSameDiskVGs(context.Background(),
 		SelectedDisksSet([]string{"/dev/sda"}),
-		SelectedDisksSet([]string{"/dev/sdb"}), false)
+		SelectedDisksSet([]string{"/dev/sdb"}), nil)
 	if err == nil {
 		t.Fatal("spanning VG must refuse")
 	}
@@ -113,7 +113,7 @@ func TestTeardownSameDiskVGsRefusesSpanningMDVG(t *testing.T) {
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep, MDAdmDetail: md.detail})
 	err := c.teardownSameDiskVGs(context.Background(),
 		SelectedDisksSet([]string{"/dev/sda"}),
-		SelectedDisksSet([]string{"/dev/sdb"}), false)
+		SelectedDisksSet([]string{"/dev/sdb"}), nil)
 	if err == nil {
 		t.Fatal("md-backed spanning VG must refuse")
 	}

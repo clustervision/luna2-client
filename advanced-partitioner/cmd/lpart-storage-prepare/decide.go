@@ -754,12 +754,12 @@ func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.
 	// table from ever re-reading (measured live on the 3.0 battery, S26).
 	// Persistent sets were refused earlier (sanitize × persistent = safety
 	// halt), so nothing here is protected — every disk is being erased.
-	if _, err := sp.cleaner.CleanupSelectedSet(ctx, cleanup.Set{
-		Name:            "sanitize",
-		SelectedDisks:   disks,
-		OwnsSysroot:     true,
-		ErasesEveryDisk: true,
-	}); err != nil {
+	set := cleanup.Set{Name: "sanitize", SelectedDisks: disks, OwnsSysroot: true}
+	// Past a crashing pvs only when no LUN is left unerased for a VG to reach.
+	if len(local) == len(sp.pool) {
+		set.ErasesPastPVsError = func(err error) bool { return lvmCrashed(err) != "" }
+	}
+	if _, err := sp.cleaner.CleanupSelectedSet(ctx, set); err != nil {
 		if errors.Is(err, cleanup.ErrProtected) {
 			return nil, nil, cleanupError("sanitize", err)
 		}
