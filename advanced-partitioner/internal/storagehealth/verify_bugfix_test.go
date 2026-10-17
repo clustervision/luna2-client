@@ -2,6 +2,7 @@ package storagehealth
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -150,5 +151,54 @@ func TestVerifyDiskSetIgnoresForeignSameNameVG(t *testing.T) {
 	}
 	if !sawOwn {
 		t.Fatal("own VG not activated")
+	}
+}
+
+// A raid data set is assembled read-only, so its ext filesystem is checked with
+// -n (a preen cannot open it); a non-raid data set keeps the preen.
+func TestVerifyDiskSetExtDataProbe(t *testing.T) {
+	for _, c := range []struct {
+		name, raid string
+		disks      []string
+		pv         string
+		want       string
+	}{
+		{"raid read-only", "1", []string{"/dev/sda", "/dev/sdb"}, "/dev/md127", "-f -n /dev/data/d"},
+		{"non-raid", "none", []string{"/dev/vda"}, "/dev/vda1", "-f -p /dev/data/d"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			withAllDevices(t)
+			f := executor.NewFakeRunner(executor.FakeResponse{})
+			kn := map[string]string{}
+			for _, d := range c.disks {
+				b := strings.TrimPrefix(d, "/dev/")
+				f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME,TYPE", d},
+					Response: executor.FakeResponse{Stdout: []byte(b + " disk\n" + b + "1 part\n")}})
+				kn[d] = b + "\n" + b + "1\n" + strings.TrimPrefix(c.pv, "/dev/") + "\n"
+			}
+			f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine"},
+				Response: executor.FakeResponse{Stdout: []byte("           Name : any:data  (local to host any)\n")}})
+			addFS(f, "/dev/data/d", "ext4")
+			addVG(f, "  DUUID data "+c.pv+"\n", kn)
+			if c.raid != "none" {
+				f.AddMatch(executor.FakeMatch{Path: "e2fsck", ArgsPrefix: []string{"-f", "-p"},
+					Response: executor.FakeResponse{ExitCode: 8, Err: errors.New("exit status 8")}})
+			}
+			set := &v2.Set{Name: "data", Role: "data", Raid: c.raid, Devices: c.disks,
+				Volumes: []v2.Volume{{Name: "d", Mountpoint: "/data", FS: "ext4", Size: "100%", Provider: "lvm"}}}
+			checker := fscheck.New(fscheck.Options{Runner: f})
+			if fails := VerifyDiskSet(context.Background(), f, checker, set, resolved(c.disks...), nil); len(fails) != 0 {
+				t.Fatalf("clean data set judged unhealthy: %+v", fails)
+			}
+			var got []string
+			for _, call := range f.Calls() {
+				if call.Path == "e2fsck" {
+					got = append(got, strings.Join(call.Args, " "))
+				}
+			}
+			if len(got) != 1 || got[0] != c.want {
+				t.Fatalf("e2fsck ran %q, want exactly %q", got, c.want)
+			}
+		})
 	}
 }

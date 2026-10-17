@@ -109,8 +109,10 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 	// is released after it; a raid=none set's VG stays active (mount and
 	// create handle it).
 	vgSelect := ""
+	readOnly := false
 	if rm := set.RAIDMode(); rm != "" && rm != "none" {
-		act := ActivateExisting(ctx, runner, set, disks, logger, set.Role != "os")
+		readOnly = set.Role != "os"
+		act := ActivateExisting(ctx, runner, set, disks, logger, readOnly)
 		defer func() { Release(ctx, runner, act, vgSelect, logger) }()
 		if len(act.Degraded) > 0 {
 			failures = append(failures, Unhealthy{SetName: set.Name, VolumeName: "(raid)", Degraded: true,
@@ -181,7 +183,11 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 		if vol.FS != "" {
 			// only the os set's XFS log may be replayed by the probe; a data
 			// set's is left for the operator
-			res := checker.CheckFSReadOnly(ctx, device, vol.FS)
+			probe := checker.CheckFSReadOnly
+			if readOnly {
+				probe = checker.CheckFSNoWrite
+			}
+			res := probe(ctx, device, vol.FS)
 			if set.Role == "os" {
 				res = checker.CheckFS(ctx, device, vol.FS)
 			}

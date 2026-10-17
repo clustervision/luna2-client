@@ -25,6 +25,10 @@
 //	  >1 needs human attention — unhealthy (no -y: it answers yes to
 //	     destructive questions too)
 //
+//	ext2/3/4 on a device assembled read-only (e2fsck -f -n — check only):
+//	  0  clean
+//	  else unhealthy (4: errors left uncorrected; 8: operational error)
+//
 //	xfs (xfs_repair -n — check only):
 //	  0  clean
 //	  else: if the log is dirty, replay it the safe way (mount+umount,
@@ -141,19 +145,25 @@ func New(o Options) *Checker {
 // returns the typed Result. The Logger receives one INFO line per
 // outcome. An XFS log that needs replaying is replayed (mount+umount).
 func (c *Checker) CheckFS(ctx context.Context, device, fs string) Result {
-	return c.check(ctx, device, fs, true)
+	return c.check(ctx, device, fs, true, true)
 }
 
 // CheckFSReadOnly is CheckFS without the XFS log replay: a log that needs
 // replaying makes the result Unavailable (unknown), for the operator.
 func (c *Checker) CheckFSReadOnly(ctx context.Context, device, fs string) Result {
-	return c.check(ctx, device, fs, false)
+	return c.check(ctx, device, fs, false, true)
 }
 
-func (c *Checker) check(ctx context.Context, device, fs string, replay bool) Result {
+// CheckFSNoWrite is CheckFSReadOnly for a device assembled read-only: ext is
+// checked with -n, because a preen cannot open the device.
+func (c *Checker) CheckFSNoWrite(ctx context.Context, device, fs string) Result {
+	return c.check(ctx, device, fs, false, false)
+}
+
+func (c *Checker) check(ctx context.Context, device, fs string, replay, preen bool) Result {
 	switch fs {
 	case "ext2", "ext3", "ext4":
-		return c.checkExt(ctx, device, fs)
+		return c.checkExt(ctx, device, fs, preen)
 	case "xfs":
 		return c.checkXFS(ctx, device, replay)
 	case "vfat", "fat", "fat32":
@@ -177,23 +187,28 @@ func (c *Checker) check(ctx context.Context, device, fs string, replay bool) Res
 // checkExt runs e2fsck -f -p (preen): journal replay plus fixes e2fsck
 // proves safe; it refuses (rc>1) anything that could lose data, unlike -y
 // which answers yes to destructive questions too. rc 0 (clean) and rc 1
-// (safe fixes applied) are healthy; anything else is unhealthy.
-func (c *Checker) checkExt(ctx context.Context, device, fs string) Result {
+// (safe fixes applied) are healthy; anything else is unhealthy. Without
+// preen it runs e2fsck -f -n, where only rc 0 is healthy.
+func (c *Checker) checkExt(ctx context.Context, device, fs string, preen bool) Result {
+	mode := "-n"
+	if preen {
+		mode = "-p"
+	}
 	res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
-		Path: "e2fsck", Args: []string{"-f", "-p", device},
+		Path: "e2fsck", Args: []string{"-f", mode, device},
 		CaptureStdout: true, CaptureStderr: true,
 	})
 	if checkerUnavailable(res, err) {
 		return unavailable(device, fs, "e2fsck", err)
 	}
 	rc := exitCode(res, err)
-	if rc == 0 || rc == 1 {
+	if rc == 0 || (preen && rc == 1) {
 		c.log("fsck OK (rc=%d): %s (%s)", rc, device, fs)
 		return Result{Device: device, FS: fs, OK: true}
 	}
 	return Result{
 		Device: device, FS: fs, OK: false,
-		Reason: fmt.Sprintf("e2fsck -p rc=%d on %s (needs operator attention; no destructive auto-repair)", rc, device),
+		Reason: fmt.Sprintf("e2fsck %s rc=%d on %s (needs operator attention; no destructive auto-repair)", mode, rc, device),
 	}
 }
 
