@@ -335,7 +335,7 @@ func TestTeardownSameDiskVGsMDMemberIntersectionBugFix(t *testing.T) {
 		CommandAvailable: alwaysAvailable,
 		MDAdmDetail:      md.detail,
 	})
-	_ = c.teardownSameDiskVGs(context.Background(), selected, nil)
+	_ = c.teardownSameDiskVGs(context.Background(), selected, nil, false)
 
 	calls := f.Calls()
 	var removedVGs []string

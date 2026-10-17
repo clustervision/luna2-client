@@ -755,9 +755,10 @@ func (sp *setProcessor) runSanitize(ctx context.Context, dryRun bool) ([]result.
 	// Persistent sets were refused earlier (sanitize × persistent = safety
 	// halt), so nothing here is protected — every disk is being erased.
 	if _, err := sp.cleaner.CleanupSelectedSet(ctx, cleanup.Set{
-		Name:          "sanitize",
-		SelectedDisks: disks,
-		OwnsSysroot:   true,
+		Name:            "sanitize",
+		SelectedDisks:   disks,
+		OwnsSysroot:     true,
+		ErasesEveryDisk: true,
 	}); err != nil {
 		if errors.Is(err, cleanup.ErrProtected) {
 			return nil, nil, cleanupError("sanitize", err)

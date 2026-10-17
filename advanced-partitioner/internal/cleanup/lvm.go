@@ -271,7 +271,7 @@ func (c *Cleaner) removeDMMappers(ctx context.Context, mappers []string) {
 // be removed at all — removing it would destroy the persistent data on the
 // non-selected members. That state is a config/operator conflict; refuse
 // (hard error → install halts for review).
-func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected map[string]struct{}) error {
+func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected map[string]struct{}, erasesEveryDisk bool) error {
 	if len(selected) == 0 {
 		return nil
 	}
@@ -281,6 +281,10 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 
 	toRemove := map[string]struct{}{}
 	allPVs, err := c.allPVs(ctx)
+	if err != nil && erasesEveryDisk {
+		c.warn("cleanup: cannot list the physical volumes (%v); no VG is removed before the erase", err)
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("cleanup: cannot list the physical volumes to tear down the selected disks' VGs; no disk was wiped: %w", err)
 	}

@@ -11,17 +11,19 @@ import (
 // RefuseOutsideSpans is CleanupSelectedSet's read-only span check, for a caller
 // that must refuse before the first of several sets is cleaned.
 func (c *Cleaner) RefuseOutsideSpans(ctx context.Context, selectedDisks []string) error {
-	return c.refuseOutsideSpans(ctx, SelectedDisksSet(selectedDisks))
+	return c.refuseOutsideSpans(ctx, SelectedDisksSet(selectedDisks), false)
 }
 
 // refuseOutsideSpans refuses a VG or md array that reaches from the selected
 // disks onto another disk, unless it is lpart's own leftover: lpart never
 // builds a VG across disks, and its md arrays are created with homehost "any".
 // Even lpart's array is refused when the other disk is an FC/iSCSI LUN.
-func (c *Cleaner) refuseOutsideSpans(ctx context.Context, selected map[string]struct{}) error {
+func (c *Cleaner) refuseOutsideSpans(ctx context.Context, selected map[string]struct{}, erasesEveryDisk bool) error {
 	if c.o.CommandAvailable("pvs") {
 		all, err := c.allPVs(ctx)
-		if err != nil {
+		if err != nil && erasesEveryDisk {
+			c.warn("cleanup: cannot list the physical volumes (%v); no VG is removed, and every local disk is erased regardless", err)
+		} else if err != nil {
 			return fmt.Errorf("cleanup: cannot list the physical volumes, so a VG spanning other disks cannot be ruled out; no disk was touched: %w", err)
 		}
 		touched := map[string]bool{}

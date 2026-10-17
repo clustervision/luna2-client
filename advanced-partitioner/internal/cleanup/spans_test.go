@@ -144,7 +144,7 @@ func TestTeardownSameDiskVGsFailedPVsIsRetryable(t *testing.T) {
 	f.AddMatch(executor.FakeMatch{Path: "pvs", Response: executor.FakeResponse{
 		ExitCode: 5, Err: errors.New("pvs --noheadings -o pv_name,vg_name: exit status 5")}})
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep})
-	err := c.teardownSameDiskVGs(context.Background(), SelectedDisksSet([]string{"/dev/sda"}), nil)
+	err := c.teardownSameDiskVGs(context.Background(), SelectedDisksSet([]string{"/dev/sda"}), nil, false)
 	if err == nil {
 		t.Fatal("a failed pvs must stop the teardown before the wipe")
 	}

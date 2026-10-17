@@ -45,6 +45,9 @@ type Set struct {
 	// or when a VG/md array under teardown has any member on a protected
 	// disk — whatever the selection logic upstream decided. Tests pin this.
 	Protected map[string]struct{}
+	// ErasesEveryDisk is sanitize: every local disk is erased after the
+	// cascade, so a PV list that cannot be read does not stop it.
+	ErasesEveryDisk bool
 }
 
 // ErrProtected is matched (errors.Is) by every refusal of the protected-disk
@@ -187,14 +190,14 @@ func (c *Cleaner) CleanupSelectedSet(ctx context.Context, set Set) (Result, erro
 		}
 	}
 
-	if err := c.refuseOutsideSpans(ctx, selected); err != nil {
+	if err := c.refuseOutsideSpans(ctx, selected, set.ErasesEveryDisk); err != nil {
 		return Result{}, err
 	}
 	c.unmountUnderSysroot(ctx, set.Name, set.OwnsSysroot, selected)
 	if err := c.teardownVG(ctx, set.Name, selected, set.Protected); err != nil {
 		return Result{}, err
 	}
-	if err := c.teardownSameDiskVGs(ctx, selected, set.Protected); err != nil {
+	if err := c.teardownSameDiskVGs(ctx, selected, set.Protected, set.ErasesEveryDisk); err != nil {
 		return Result{}, err
 	}
 	if err := c.stopMDArrays(ctx, set.Name, selected, set.Protected); err != nil {
