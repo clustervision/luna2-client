@@ -1,8 +1,11 @@
 package lvm
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -50,7 +53,12 @@ func TestBuildHappyPathNoRAID(t *testing.T) {
 			{Name: "root", Provider: "lvm", Mountpoint: "/", FS: "xfs", Size: "100%"},
 		},
 	}
-	state, err := New(Options{Runner: f}).Build(context.Background(), set,
+	// The zeroing is recorded in the runner's call list, in its place.
+	zero := func(dev string) error {
+		_, err := f.Run(context.Background(), executor.CommandSpec{Path: "(zero)", Args: []string{dev}})
+		return err
+	}
+	state, err := New(Options{Runner: f, ZeroDevice: zero}).Build(context.Background(), set,
 		partition.Layout{StoragePartitions: []string{"/dev/sda3"}},
 		raid.State{RAIDMode: "none"})
 	if err != nil {
@@ -62,12 +70,13 @@ func TestBuildHappyPathNoRAID(t *testing.T) {
 	// Verify order: defensive superblock clear (FTA D7 - a stale md 1.2
 	// superblock inside the re-created partition would otherwise be
 	// re-assembled by udev and hold the device busy), the first 4 MiB
-	// zeroed (old LVM remnants crash lvm2 2.03.14), then pvcreate,
+	// zeroed from Go (old LVM remnants crash lvm2 2.03.14; klibc dd rejects
+	// conv=fsync), then pvcreate,
 	// vgcreate, fixed-size LVs in JSON order, 100% LV last.
 	want := []string{
 		"mdadm --zero-superblock /dev/sda3",
 		"wipefs -a /dev/sda3",
-		"dd if=/dev/zero of=/dev/sda3 bs=1M count=4 conv=fsync",
+		"(zero) /dev/sda3",
 		"pvcreate -ff -y /dev/sda3",
 		"pvs --noheadings -o vg_uuid,vg_name,pv_name",
 		"vgcreate os /dev/sda3",
@@ -244,5 +253,26 @@ func TestBuildRefusesForeignSameNameVG(t *testing.T) {
 		if c.Path == "vgremove" || c.Path == "vgchange" || c.Path == "vgcreate" {
 			t.Fatalf("foreign VG case must not run %s %v", c.Path, c.Args)
 		}
+	}
+}
+
+// ZeroStart overwrites the first 4 MiB and nothing after them.
+func TestZeroStartZeroesTheFirst4MiB(t *testing.T) {
+	dev := filepath.Join(t.TempDir(), "pv")
+	if err := os.WriteFile(dev, bytes.Repeat([]byte{0xff}, 8<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ZeroStart(dev); err != nil {
+		t.Fatalf("ZeroStart: %v", err)
+	}
+	got, err := os.ReadFile(dev) //nolint:gosec // test path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 8<<20 || !bytes.Equal(got[:4<<20], make([]byte, 4<<20)) || !bytes.Equal(got[4<<20:], bytes.Repeat([]byte{0xff}, 4<<20)) {
+		t.Fatal("want the first 4 MiB zeroed and the rest untouched")
+	}
+	if err := ZeroStart(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("a device that cannot be opened must be an error")
 	}
 }

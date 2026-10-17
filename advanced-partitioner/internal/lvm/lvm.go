@@ -8,6 +8,7 @@ package lvm
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
@@ -61,6 +62,27 @@ func (e *ForeignVGError) Error() string {
 type Options struct {
 	Runner executor.Runner
 	Logger *txlog.Logger
+	// ZeroDevice zeroes the start of a new PV (ZeroStart); nil skips it, as
+	// for a dry run.
+	ZeroDevice func(device string) error
+}
+
+// ZeroStart writes zeros over the first 4 MiB of device and flushes them to
+// the disk, as `dd bs=1M count=4 conv=fsync` would.
+func ZeroStart(device string) error {
+	f, err := os.OpenFile(device, os.O_WRONLY, 0) //nolint:gosec // the PV lpart just created
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(make([]byte, 4<<20)); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // Builder builds the LVM stack.
@@ -146,11 +168,11 @@ func (b *Builder) Build(ctx context.Context, set *v2.Set, layout partition.Layou
 	// 2.03.14 (el8) parses them and crashes (SIGSEGV) in every pvcreate,
 	// pvs and vgchange -- the node retried for ever. LVM looks for its label
 	// in the first sectors only; 4 MiB also clears the old metadata area.
-	if _, err := b.o.Runner.Run(ctx, executor.CommandSpec{
-		Path: "dd", Args: []string{"if=/dev/zero", "of=" + pvDevice, "bs=1M", "count=4", "conv=fsync"},
-		CaptureStdout: true, CaptureStderr: true,
-	}); err != nil && b.o.Logger != nil {
-		b.o.Logger.Warn(fmt.Sprintf("zeroing the start of %s before pvcreate failed: %v", pvDevice, err))
+	// Written from Go: the Ubuntu ramdisk's klibc dd rejects conv=fsync.
+	if b.o.ZeroDevice != nil {
+		if err := b.o.ZeroDevice(pvDevice); err != nil && b.o.Logger != nil {
+			b.o.Logger.Warn(fmt.Sprintf("zeroing the start of %s before pvcreate failed: %v", pvDevice, err))
+		}
 	}
 
 	if _, err := b.o.Runner.Run(ctx, executor.CommandSpec{

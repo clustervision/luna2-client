@@ -302,6 +302,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	// The PV zeroing writes the device directly, past the dry-run runner.
+	var zeroPV func(string) error
+	if !f.DryRun {
+		zeroPV = lvm.ZeroStart
+	}
 	// Build the per-set processor with every Phase 1–6 module hooked in.
 	sp := &setProcessor{
 		runner:   runner,
@@ -311,7 +316,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		cleaner:  cleanup.New(cleanup.Options{Runner: runner, Logger: logger}),
 		part:     partition.New(partition.Options{Runner: runner, Logger: logger, DryRun: f.DryRun}),
 		raid:     raid.New(raid.Options{Runner: runner, Logger: logger}),
-		lvm:      lvm.New(lvm.Options{Runner: runner, Logger: logger}),
+		lvm:      lvm.New(lvm.Options{Runner: runner, Logger: logger, ZeroDevice: zeroPV}),
 		fs:       fsmod.New(fsmod.Options{Runner: runner, Logger: logger, MkfsFatName: tools.MkfsFat}),
 		mount:    mounter,
 		checker:  fscheck.New(fscheck.Options{Runner: runner, Logger: logger, FsckVfatCmd: tools.FsckVfat}),
