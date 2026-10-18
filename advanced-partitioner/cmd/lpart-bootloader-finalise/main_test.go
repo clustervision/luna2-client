@@ -652,6 +652,18 @@ func TestDeterministicFailuresExit3(t *testing.T) {
 	}
 }
 
+// A dry run on a fresh disk previews the install: it writes nothing, so it
+// must not then fail validating the boot files it did not write.
+func TestDryRunOnFreshDiskSucceeds(t *testing.T) {
+	files := append([]string{"lib/modules/5.14.0-1.el9.x86_64/vmlinuz"}, rhelTools...)
+	sysroot, resPath := classSysroot(t, "ID=rocky\n", files, nil)
+	stageESPLoaders(t, sysroot)
+	stderr, rc := runEnv(t, "--result", resPath, "--dry-run")
+	if rc != 0 {
+		t.Fatalf("dry run on a fresh disk: rc=%d stderr=%s", rc, stderr)
+	}
+}
+
 // Two os sets cannot both be booted: the result is invalid (exit 3), not
 // silently reduced to the last one.
 func TestTwoOSSetsInStorageResultExit3(t *testing.T) {

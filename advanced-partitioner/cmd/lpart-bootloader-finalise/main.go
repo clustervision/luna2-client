@@ -298,6 +298,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		{"bootloader_install", adapter.Install},
 		{"bootloader_validate", adapter.Validate},
 	} {
+		if f.DryRun && step.name == "bootloader_validate" {
+			// nothing was written, so there is nothing on the disk to validate
+			logger.UserInfo("Dry run: nothing written; validation and verification skipped")
+			return 0
+		}
 		logger.SetStage(step.name)
 		if err := step.fn(context.Background()); err != nil {
 			return fail(stderr, "", err)
