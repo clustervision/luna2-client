@@ -610,7 +610,7 @@ A non-zero exit from any field script aborts the install, and the ramdisk retrie
 
 | Binary | Phase | What it does |
 |--------|-------|--------------|
-| **`lpart-node-installer`** | all | The **orchestrator**. `--phase pre\|part\|post` runs the whole pipeline in-process and drives the live TUI dashboard (or plain output with `--no-tui`). It invokes everything below. |
+| **`lpart-node-installer`** | all | The **orchestrator**. `--phase pre\|part\|post` runs the whole pipeline in-process and drives the live TUI dashboard (or plain output with `--no-tui`). It invokes everything below. `--phase finish` only flushes the installed system to disk, as `luna_finish`'s last step. |
 | **`lpart-phase`** | all | The **shim** the pre/part/post fields exec → `exec lpart-node-installer --phase <phase>`. Keeps the node's script fields one line. |
 | **`lpart-storage-prepare`** | part | The **storage decision + execution**: discover disks (tags/size), resolve the layout, then partition / build RAID / create LVM / mkfs and **mount the tree at the sysroot** — dispatching on `install_mode` and enforcing the data fence. `sanitize` securely erases here and stops; `memboot` makes a tmpfs root. Ends by showing `blkid`/`pvs`/`vgs`/`lvs`/`mdadm` evidence. |
 | **`lpart-storage-check`** | part | The **health probe** for an *existing* layout, used by `auto`/`sync`: OS set present and healthy → reuse-and-mount, broken → recreate. It is the whole job for `local` (verify only, no image). |

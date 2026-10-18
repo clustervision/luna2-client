@@ -39,6 +39,30 @@ func TestRefusesOutsideInstallerEnv(t *testing.T) {
 	}
 }
 
+// TestFinishPhaseFlushesWithoutPipeline pins --phase finish: luna_finish calls
+// it after the network is down, so it must succeed without starting a pipeline
+// or TUI, and also on a node the daemon routes as legacy.
+func TestFinishPhaseFlushesWithoutPipeline(t *testing.T) {
+	tmp := t.TempDir()
+	cmdline := filepath.Join(tmp, "cmdline")
+	if err := os.WriteFile(cmdline, []byte("root=luna rw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctxFile := filepath.Join(tmp, "install-context.json")
+	if err := os.WriteFile(ctxFile, []byte(`{"install_mode":"legacy"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldArgs, oldFlags := os.Args, flag.CommandLine
+	defer func() { os.Args, flag.CommandLine = oldArgs, oldFlags }()
+	flag.CommandLine = flag.NewFlagSet("lpart-node-installer", flag.ContinueOnError)
+	os.Args = []string{"lpart-node-installer", "--phase", "finish", "--cmdline-path", cmdline,
+		"--runtime", tmp, "--bin-dir", filepath.Join(tmp, "no-such-bin")}
+
+	if err := run(); err != nil {
+		t.Fatalf("--phase finish: %v", err)
+	}
+}
+
 // TestLegacyRefusal locks in "legacy means legacy: no TUI": when the
 // daemon-written install-context.json says install_mode=legacy, the orchestrator
 // must refuse up-front (non-empty message -> exit exitFatalConfig, no TUI). Any

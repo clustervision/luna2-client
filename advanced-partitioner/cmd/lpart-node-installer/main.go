@@ -2,7 +2,8 @@
 // in-process, driving the lpart-* binaries via the engine, and renders a
 // single-screen Bubble Tea dashboard (or plain scrolling output under
 // `lpart.notui`). The Luna pre/part/post hook scripts are one-line execs of
-// this command with the matching --phase.
+// this command with the matching --phase. --phase finish only flushes the
+// installed system to disk, as the installer's last step.
 //
 // Usage:
 //
@@ -16,6 +17,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/engine"
@@ -36,6 +38,10 @@ const exitFatalConfig = 3
 // 2 with a safety_refusal= verdict): the wrapper parks on it like on 3, and the
 // install template reports it as install.refused rather than install.fatal.
 const exitSafetyRefusal = 2
+
+// phaseFinish is not a pipeline phase: luna_finish runs it after the network is
+// down, so it starts no TUI and forwards no log.
+const phaseFinish = "finish"
 
 // failureExit is the exit code and console line for a phase that failed. Say
 // what the code means, not just what it is: the wrapper's retry-vs-park
@@ -60,7 +66,7 @@ func main() {
 
 func run() error {
 	var (
-		phase        = flag.String("phase", "", "install phase to run in-process: pre|part|post")
+		phase        = flag.String("phase", "", "install phase to run in-process: pre|part|post|finish")
 		runtimeDir   = flag.String("runtime", "/tmp/install_files/runtime", "runtime dir for tx_* JSON + results")
 		logDir       = flag.String("log-dir", "/tmp/install_files/logs", "per-binary log dir passed to the lpart-* tools")
 		binDir       = flag.String("bin-dir", "/usr/bin", "directory holding the lpart-* binaries")
@@ -76,13 +82,13 @@ func run() error {
 	flag.Parse()
 
 	if *phase == "" {
-		return fmt.Errorf("--phase pre|part|post is required")
+		return fmt.Errorf("--phase pre|part|post|finish is required")
 	}
 	ph := pipeline.Phase(*phase)
 	switch ph {
-	case pipeline.PhasePre, pipeline.PhasePart, pipeline.PhasePost:
+	case pipeline.PhasePre, pipeline.PhasePart, pipeline.PhasePost, phaseFinish:
 	default:
-		return fmt.Errorf("invalid --phase %q (want pre|part|post)", *phase)
+		return fmt.Errorf("invalid --phase %q (want pre|part|post|finish)", *phase)
 	}
 
 	// Refuse to run outside the Luna installer environment. lpart-node-installer
@@ -93,6 +99,12 @@ func run() error {
 		AllowNonInstaller: *allowNonInst,
 	}); err != nil {
 		return err
+	}
+
+	// Before the legacy refusal: a legacy install is handed over unflushed too.
+	if ph == phaseFinish {
+		finish()
+		return nil
 	}
 
 	// Legacy is daemon-only: the node runs its old bash pre/part/post and must
@@ -227,4 +239,12 @@ func legacyRefusal(runtimeDir string) string {
 	return "install_mode=legacy is daemon-only; the lpart client must not run (no TUI). " +
 		"This is a daemon routing misconfiguration: legacy must render the bash install " +
 		"template and run the node's legacy pre/part/post scripts, not the lpart shims. Refusing to start."
+}
+
+// finish flushes everything the install wrote. dracut pivots straight into the
+// installed disk, so without it a power cut in the next seconds loses the last
+// install steps' writes, and no later boot writes them again.
+func finish() {
+	syscall.Sync()
+	fmt.Fprintln(os.Stderr, "lpart-node-installer: installed system flushed to disk")
 }

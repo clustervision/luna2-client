@@ -296,6 +296,10 @@ function luna_finish () {
     sed -i 's/\x1b\[[0-9:;<=>?]*[a-zA-Z]//g; s/\r$//' /sysroot/var/log/luna_install.log 2>/dev/null \
         || echo "Luna2: could not strip terminal escapes from luna_install.log"
 
+    # dracut pivots straight into the installed disk and nothing flushes it
+    # after this: a power cut in the next seconds loses the last writes.
+    lpart-phase finish || echo "Luna2: could not flush the installed system to disk"
+
     # The pre-pivot guard (luna-pivot-guard.sh) boots /sysroot only when this
     # exists: the installer reached its end, the root is complete.
     : > /run/luna-install-finished
