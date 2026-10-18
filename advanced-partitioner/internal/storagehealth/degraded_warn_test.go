@@ -10,6 +10,7 @@ import (
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fscheck"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
 )
 
@@ -71,5 +72,38 @@ func TestARunningDegradedArrayIsUsedWithAllowDegraded(t *testing.T) {
 	}
 	if act, log := activateWith(t, mdDetailClean, false); len(act.Degraded) != 0 || strings.Contains(log, "DEGRADED") {
 		t.Fatalf("clean array reported degraded: %v\n%s", act.Degraded, log)
+	}
+}
+
+// A degraded refusal leaves the disks as it found them: the probe takes down
+// the volume group it activated, or the operator repairing the parked node
+// finds the array held by it ("Cannot get exclusive access").
+func TestDegradedProbeReleasesTheVGItActivated(t *testing.T) {
+	withAllDevices(t)
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--detail", "/dev/md/os-boot"},
+		Response: executor.FakeResponse{Stdout: []byte(mdDetailDegraded)}})
+	addVG(f, "  OSUUID os /dev/md127\n", map[string]string{"/dev/sda": "sda\nsda4\nmd127\n", "/dev/sdb": "sdb\nsdb4\nmd127\n"})
+	set := &v2.Set{Name: "os", Role: "os", Selection: "manual", Raid: "1", Devices: []string{"/dev/sda", "/dev/sdb"},
+		Volumes: []v2.Volume{{Name: "root", Mountpoint: "/", FS: "xfs", Provider: "lvm", Size: "100%"}}}
+	checker := fscheck.New(fscheck.Options{Runner: f})
+
+	fails := VerifyDiskSet(context.Background(), f, checker, set, resolved("/dev/sda", "/dev/sdb"), nil)
+	if len(fails) != 1 || !fails[0].Degraded {
+		t.Fatalf("want one degraded verdict, got %+v", fails)
+	}
+	var up, down string
+	for _, c := range f.Calls() {
+		if c.Path == "vgchange" && len(c.Args) == 3 {
+			switch c.Args[0] {
+			case "-ay":
+				up = c.Args[2]
+			case "-an":
+				down = c.Args[2]
+			}
+		}
+	}
+	if up == "" || down != up {
+		t.Fatalf("probe activated VG %q but deactivated %q", up, down)
 	}
 }

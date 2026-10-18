@@ -110,6 +110,7 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 		}
 		run("vgchange", "-ay", "--select", vg.Select())
 		run("udevadm", "settle")
+		act.VGSelect = vg.Select()
 	}
 	return act
 }
@@ -118,6 +119,7 @@ func ActivateExisting(ctx context.Context, runner executor.Runner, set *v2.Set, 
 type Activation struct {
 	Assembled []string // arrays this call assembled (not ones already running)
 	Degraded  []string // arrays left inactive because a member is missing
+	VGSelect  string   // the volume group this call activated
 }
 
 // Release stops what a health probe brought up -- the volume group (when
@@ -131,6 +133,10 @@ func Release(ctx context.Context, runner executor.Runner, act Activation, vgSele
 		}); err != nil && logger != nil {
 			logger.Info("release (best-effort) " + path + " " + strings.Join(args, " ") + ": " + err.Error())
 		}
+	}
+	if vgSelect == "" {
+		// a probe that returns early never recorded the VG it brought up
+		vgSelect = act.VGSelect
 	}
 	if vgSelect != "" {
 		run("vgchange", "-an", "--select", vgSelect)
