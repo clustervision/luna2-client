@@ -8,7 +8,7 @@ GOVULNCHECK ?= govulncheck
 BIN_DIR := bin
 CMDS := lpart-storage-prepare lpart-storage-check lpart-osimage-install lpart-bootloader-finalise lpart-node-installer lpart-emit lpart-tui
 
-.PHONY: all fmt vet test test-race lint vuln 95luna-sync check build build-linux clean
+.PHONY: all fmt vet test test-race lint vuln 95luna-sync handover-flush check build build-linux clean
 
 all: check build-linux
 
@@ -35,12 +35,16 @@ vuln:
 95luna-sync:
 	bash scripts/dev/check-95luna-sync.sh
 
+# every installer hand-over flushes the installed disk first. See scripts/dev/check-handover-flush.sh.
+handover-flush:
+	bash scripts/dev/check-handover-flush.sh
+
 # No version-gated external-tool flags in production code (FTA BE-P1/CCF-9:
 # lsblk PATH needs util-linux >= 2.33, el8 ships 2.32 -- bit twice).
 tool-portability:
 	bash scripts/dev/check-version-gated-tools.sh
 
-check: fmt vet test lint vuln 95luna-sync tool-portability
+check: fmt vet test lint vuln 95luna-sync handover-flush tool-portability
 
 build:
 	$(GO) build ./...
