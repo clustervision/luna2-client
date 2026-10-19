@@ -220,6 +220,10 @@ luna_finish() {
     # the new root at $rootmnt (/root), not /sysroot.
     cp /tmp/luna_install.log "${rootmnt:-/root}/var/log/"
 
+    # init hands over to the installed disk next and nothing flushes it after
+    # this: a power cut in the next seconds loses the last writes.
+    lpart-phase finish || echo "Luna2: could not flush the installed system to disk"
+
     # The installer reached its end, the root is complete (as the dracut hook).
     : > /run/luna-install-finished
 }
