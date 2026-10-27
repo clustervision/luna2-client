@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
@@ -170,6 +171,11 @@ func ProvisionOrder(method, fallback string) []string {
 			out = append(out, v)
 		}
 	}
+	// http is always the last resort: torrent alone (and no aria2c in the
+	// initramfs) is a permanent download failure otherwise.
+	if !slices.Contains(out, "http") && !slices.Contains(out, "https") {
+		out = append(out, "http")
+	}
 	return out
 }
 
@@ -183,7 +189,7 @@ func downloadTorrent(ctx context.Context, opts DownloadOptions, cachePath string
 	opts.info("fetching torrent metadata: " + torrentURL)
 	curlArgs := append(curlBaseArgs(opts),
 		"-H", "x-access-tokens: "+opts.LunaToken,
-		"-s", "-o", torrentPath, torrentURL,
+		"-f", "-s", "-o", torrentPath, torrentURL, // -f: a 401/404 body is not a torrent
 	)
 	if _, err := opts.Runner.Run(ctx, executor.CommandSpec{
 		Path: "curl", Args: curlArgs,

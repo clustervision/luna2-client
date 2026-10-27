@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fsops"
 )
 
 // rhelAdapter ports lib/bootloader_rhel.sh. The family covers RHEL,
@@ -26,42 +27,32 @@ func (a *rhelAdapter) Family() Family { return FamilyRHEL }
 func (a *rhelAdapter) Prepare(_ context.Context) error {
 	sysroot := a.deps.BootContext.Sysroot
 	if !anyExist(sysroot, "usr/bin/dracut", "usr/sbin/dracut") {
-		return fmt.Errorf("missing required command: dracut")
+		return imageErrorf("image-missing-tool", "missing required command: dracut")
 	}
 	if !anyExist(sysroot, "usr/sbin/grub2-mkconfig", "usr/bin/grub2-mkconfig") {
-		return fmt.Errorf("missing required command: grub2-mkconfig")
+		return imageErrorf("image-missing-tool", "missing required command: grub2-mkconfig")
 	}
 	if len(a.deps.BootContext.StorageResult.BootDevices) == 0 {
-		return fmt.Errorf("storage-result boot_devices must contain at least one disk")
+		return configErrorf("no-boot-devices", "storage-result boot_devices must contain at least one disk")
 	}
 	if a.deps.BootContext.FirmwareMode == "uefi" {
 		if _, err := os.Stat(filepath.Join(sysroot, "boot", "efi")); err != nil {
-			return fmt.Errorf("missing EFI mount directory: %s/boot/efi", sysroot)
+			return configErrorf("missing-esp-mount", "missing EFI mount directory: %s/boot/efi", sysroot)
 		}
 	}
-	return nil
+	return requireBIOSGRUB(a.deps.BootContext, "grub2-install", "grub2-tools", "grub2-pc-modules", "usr/lib/grub/i386-pc")
 }
 
-// RegenerateInitramfs finds the kernel version under /sysroot/lib/modules
-// and runs `dracut -f --omit luna --kver <version>` via chroot.
-// Mirrors bootloader_rhel_regenerate_initramfs.
+// RegenerateInitramfs runs dracut (dracutArgs) via chroot
+// for every bootable kernel in the image (see dracutAllKernels), after removing
+// the image's LVM devices file (removeImageLVMDevicesFile). Successor of
+// bootloader_rhel_regenerate_initramfs, which rebuilt one kernel only.
 func (a *rhelAdapter) RegenerateInitramfs(ctx context.Context) error {
-	sysroot := a.deps.BootContext.Sysroot
-	kver, err := detectKernelVersion(sysroot)
-	if err != nil {
+	if err := removeImageLVMDevicesFile(a.deps); err != nil {
 		return err
 	}
-	if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
-		Path: "/usr/bin/env", Chroot: sysroot,
-		Args:          []string{"dracut", "-f", "--omit", "luna", "--kver", kver},
-		CaptureStdout: true, CaptureStderr: true,
-	}); err != nil {
-		return fmt.Errorf("dracut -f --omit luna --kver %s: %w", kver, err)
-	}
-	if msg := kernelNotNewestWarning(sysroot, kver); msg != "" && a.deps.Logger != nil {
-		a.deps.Logger.Warn(msg)
-	}
-	return nil
+	_, err := dracutAllKernels(ctx, a.deps, true)
+	return err
 }
 
 // detectKernelVersion walks /sysroot/lib/modules/* and returns the version
@@ -105,7 +96,9 @@ func detectKernelVersion(sysroot string) (string, error) {
 		if !e.IsDir() {
 			continue
 		}
-		all = append(all, e.Name())
+		if looksLikeKernelRelease(e.Name()) {
+			all = append(all, e.Name())
+		}
 		if hasKernelImage(sysroot, e.Name()) {
 			installed = append(installed, e.Name())
 		}
@@ -121,6 +114,16 @@ func detectKernelVersion(sysroot string) (string, error) {
 		return picked, nil
 	}
 	return "", fmt.Errorf("unable to determine target kernel version in %s/lib/modules", sysroot)
+}
+
+// looksLikeKernelRelease reports whether a /lib/modules entry can be a kernel
+// release (uname -r form: it starts with a digit). kernel-abi-stablelists
+// installs kabi-rhel90 ... kabi-rhelNN and a kabi-current link there, and
+// vendor kmod packages add similar trees; none is a kernel. Without a kernel
+// image to go by, the fallback used to rank those names with the real ones,
+// and dracut --kver kabi-rhel97 failed the UEFI finalisation.
+func looksLikeKernelRelease(name string) bool {
+	return name != "" && name[0] >= '0' && name[0] <= '9'
 }
 
 // runningKernelVersion is the version the installer itself is running. Package var
@@ -170,67 +173,40 @@ func newestKernel(names []string, debug bool) string {
 	return best
 }
 
-// compareKernelVersions orders two kernel version strings the way a human reads
-// them: each run of digits compares as a number, so 553.123.1 is newer than
-// 553.97.1 where a byte comparison puts 97 last. Identical digit sequences fall back
-// to a byte comparison so the ordering stays total.
+// compareKernelVersions orders two kernel release strings (the names of the
+// /lib/modules directories, `uname -r` form) the way the package manager
+// does: the part before the first "-" is the version, the rest the release
+// (with arch and flavour, e.g. "553.5.1.el8_10.x86_64" or "91-generic"), and
+// each is compared with rpm's rpmvercmp -- version first, release only on a
+// tie. So 553.123.1 is newer than 553.97.1 (numeric runs compare by value),
+// and 553.5.1.el8_10 is newer than 553.el8_10 (a numeric run beats an
+// alphabetic one), which a digits-only comparison gets backwards.
+//
+// rpmvercmp calls two strings that differ only in separators or leading zeros
+// equal; those fall back to a byte comparison so the ordering stays total and
+// the choice never depends on readdir order.
 func compareKernelVersions(a, b string) int {
-	na, nb := versionNumbers(a), versionNumbers(b)
-	for i := 0; i < len(na) && i < len(nb); i++ {
-		// Longer means larger once leading zeros are gone, so no conversion to int
-		// is needed and no run length can overflow.
-		if len(na[i]) != len(nb[i]) {
-			if len(na[i]) < len(nb[i]) {
-				return -1
-			}
-			return 1
-		}
-		if c := strings.Compare(na[i], nb[i]); c != 0 {
-			return c
-		}
+	verA, relA, _ := strings.Cut(a, "-")
+	verB, relB, _ := strings.Cut(b, "-")
+	if c := rpmvercmp(verA, verB); c != 0 {
+		return c
 	}
-	if len(na) != len(nb) {
-		if len(na) < len(nb) {
-			return -1
-		}
-		return 1
+	if c := rpmvercmp(relA, relB); c != 0 {
+		return c
 	}
 	return strings.Compare(a, b)
 }
 
-// versionNumbers returns every run of digits in order, each stripped of leading
-// zeros so that two runs can be compared by length and then bytewise.
-func versionNumbers(s string) []string {
-	var out []string
-	for i := 0; i < len(s); {
-		if s[i] < '0' || s[i] > '9' {
-			i++
-			continue
-		}
-		j := i
-		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
-			j++
-		}
-		run := strings.TrimLeft(s[i:j], "0")
-		if run == "" {
-			run = "0"
-		}
-		out = append(out, run)
-		i = j
-	}
-	return out
-}
-
-// kernelNotNewestWarning returns the text to warn with when the initramfs was built
-// for a kernel that is not the newest installed one, or "" when there is nothing to
-// say. Pure so it can be tested without a logger.
+// kernelNotNewestWarning returns the text to warn with when the default kernel
+// is not the newest installed one, or "" when there is nothing to say. Pure so
+// it can be tested without a logger.
 //
-// The boot loader orders its entries by version, so when these differ it may start a
-// different kernel from the one just rebuilt -- and that one's initramfs still carries
-// the luna module, which is how a node ends up back in the installer. Pinning an older
-// kernel on the osimage is a legitimate thing to do, so this reports rather than
-// refuses. Comparison is within the same debug flavour, matching how the target was
-// chosen, so an el10 debug tree does not make every install warn.
+// The default is the kernel the osimage boots (see defaultKernel), so this
+// fires when the osimage pins an older kernelversion -- a legitimate choice,
+// hence a report and not a refusal. Every bootable kernel's initramfs is
+// rebuilt, so the newer one is safe to pick at the menu; the warning is there
+// so nobody is surprised which kernel the node runs. Comparison is within the
+// same debug flavour, so an el10 debug tree does not make every install warn.
 func kernelNotNewestWarning(sysroot, kver string) string {
 	entries, err := os.ReadDir(filepath.Join(sysroot, "lib", "modules"))
 	if err != nil {
@@ -247,10 +223,9 @@ func kernelNotNewestWarning(sysroot, kver string) string {
 		return ""
 	}
 	return fmt.Sprintf(
-		"the initramfs was built for kernel %s, but %s is also installed and is newer. "+
-			"The boot loader orders entries by version, so this node may start %s instead, "+
-			"whose initramfs was not rebuilt and still contains the luna module",
-		kver, newest, newest)
+		"the default boot entry starts kernel %s (the kernel the osimage boots), but %s is also installed and is newer; "+
+			"both initramfs images were rebuilt, so either boots -- set the osimage kernelversion to change the default",
+		kver, newest)
 }
 
 // isDebugKernelDir reports whether a /lib/modules entry is a debug kernel variant.
@@ -270,7 +245,7 @@ func (a *rhelAdapter) Install(ctx context.Context) error {
 	}
 	if a.deps.BootContext.FirmwareMode != "uefi" {
 		if !a.deps.BootContext.BIOSGRUBRequested() {
-			return fmt.Errorf("unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
+			return configErrorf("firmware-not-uefi", "unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
 		}
 		return a.installBIOS(ctx)
 	}
@@ -299,25 +274,11 @@ func (a *rhelAdapter) installBIOS(ctx context.Context) error {
 	return a.generateGrubConfig(ctx)
 }
 
-// writeGrubDefault writes /etc/default/grub. Mirrors
-// bootloader_rhel_write_grub_default.
+// writeGrubDefault writes /etc/default/grub (see grubdefault.go) with
+// GRUB_DEFAULT=saved: generateGrubConfig points saved_entry at the default
+// kernel.
 func (a *rhelAdapter) writeGrubDefault() error {
-	path := filepath.Join(a.deps.BootContext.Sysroot, "etc", "default", "grub")
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil { //nolint:gosec // sysroot defaults
-		return fmt.Errorf("mkdir parent of %s: %w", path, err)
-	}
-	lines := []string{
-		"GRUB_TIMEOUT=5",
-		"GRUB_DEFAULT=saved",
-		"GRUB_DISABLE_SUBMENU=true",
-		"GRUB_DISABLE_OS_PROBER=true",
-		"GRUB_DISABLE_RECOVERY=true",
-		`GRUB_TERMINAL_OUTPUT="console"`,
-		GrubCmdlineValue(a.deps.BootContext.KernelArgs),
-	}
-	body := strings.Join(lines, "\n") + "\n"
-	//nolint:gosec // /etc/default/grub default perms
-	return os.WriteFile(path, []byte(body), 0o644)
+	return writeGrubDefault(a.deps.FS, a.deps.BootContext, "saved")
 }
 
 func (a *rhelAdapter) installUEFI(ctx context.Context) error {
@@ -358,8 +319,14 @@ func (a *rhelAdapter) installUEFI(ctx context.Context) error {
 // generateGrubConfig repairs the image's BLS entries and regenerates
 // grub.cfg. Shared by the UEFI and BIOS installs: what firmware loads differs,
 // what GRUB then reads does not.
+//
+// It then points saved_entry at the default kernel (the one dracutAllKernels
+// chose), because GRUB_DEFAULT=saved would otherwise follow whatever the image
+// host last booted.
 func (a *rhelAdapter) generateGrubConfig(ctx context.Context) error {
-	a.normalizeBLSEntries()
+	if err := a.normalizeBLSEntries(); err != nil {
+		return err
+	}
 	if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
 		Path: "/usr/bin/env", Chroot: a.deps.BootContext.Sysroot,
 		Args:          []string{"grub2-mkconfig", "-o", "/boot/grub2/grub.cfg"},
@@ -367,8 +334,11 @@ func (a *rhelAdapter) generateGrubConfig(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("grub2-mkconfig: %w", err)
 	}
-	a.makeGrubCfgDegradedSafe()
-	return nil
+	if err := a.makeGrubCfgDegradedSafe(); err != nil {
+		return err
+	}
+	def := defaultKernel(bootableKernels(a.deps.BootContext.Sysroot), true)
+	return setDefaultBootEntry(ctx, a.deps, def)
 }
 
 // normalizeBLSEntries repairs the BLS entry files
@@ -399,12 +369,12 @@ func (a *rhelAdapter) generateGrubConfig(ctx context.Context) error {
 //
 // Generalises bootloader_rhel_normalize_bls_for_separate_boot, which only
 // rewrote a clean `/boot/` prefix and only when /boot was separate.
-func (a *rhelAdapter) normalizeBLSEntries() {
+func (a *rhelAdapter) normalizeBLSEntries() error {
 	sysroot := a.deps.BootContext.Sysroot
 	dir := filepath.Join(sysroot, "boot", "loader", "entries")
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return nil
 	}
 	prefix := "/boot/"
 	if a.hasBootMount() {
@@ -430,9 +400,12 @@ func (a *rhelAdapter) normalizeBLSEntries() {
 				out = append(out, line)
 			}
 		}
-		//nolint:gosec // sysroot file, default perms
-		_ = os.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644)
+		// the unrepaired entry drops the node to the GRUB rescue prompt
+		if err := a.deps.FS.WriteFile(path, []byte(strings.Join(out, "\n")), 0o644); err != nil {
+			return fmt.Errorf("repair BLS entry: %w", err)
+		}
 	}
+	return nil
 }
 
 // rewriteBLSPathLine normalises the path token of a BLS `linux`/`initrd`
@@ -545,19 +518,20 @@ func anyExist(sysroot string, rel ...string) bool {
 // mirror leg sometimes would not boot. Dropping the mduuid hints + the
 // `set root/boot='mduuid/…'` lines forces the deterministic fs-uuid path.
 //
-// No-op on non-RAID layouts (grub2-mkconfig emits no mduuid references) and
-// best-effort: a missing/unreadable grub.cfg just leaves it untouched.
-func (a *rhelAdapter) makeGrubCfgDegradedSafe() {
-	makeGrubCfgDegradedSafeAt(
+// No-op on non-RAID layouts (grub2-mkconfig emits no mduuid references). A
+// missing/unreadable grub.cfg is left untouched; a failed write is an error.
+func (a *rhelAdapter) makeGrubCfgDegradedSafe() error {
+	return grubCfgDegradedSafeAt(a.deps.FS,
 		filepath.Join(a.deps.BootContext.Sysroot, "boot", "grub2", "grub.cfg"))
 }
 
-// makeGrubCfgDegradedSafeAt applies rewriteMduuidToFSUUID to every grub.cfg
+// grubCfgDegradedSafeAt applies rewriteMduuidToFSUUID to every grub.cfg
 // path that exists. Shared by the RHEL/SUSE and Debian adapters (BE-W5:
 // Debian used to keep the mduuid-based grub.cfg — the non-deterministic
-// degraded assembly — that the RHEL fix above removed). Best-effort: a
-// missing/unreadable path is skipped, an unchanged body is not rewritten.
-func makeGrubCfgDegradedSafeAt(paths ...string) {
+// degraded assembly — that the RHEL fix above removed). A missing/unreadable
+// path is skipped, an unchanged body is not rewritten, a failed write is an
+// error. Writes go through fs, so --dry-run leaves grub.cfg alone.
+func grubCfgDegradedSafeAt(fs fsops.FS, paths ...string) error {
 	for _, path := range paths {
 		body, err := os.ReadFile(path) //nolint:gosec // sysroot file
 		if err != nil {
@@ -567,9 +541,11 @@ func makeGrubCfgDegradedSafeAt(paths ...string) {
 		if out == string(body) {
 			continue
 		}
-		//nolint:gosec // grub.cfg default perms
-		_ = os.WriteFile(path, []byte(out), 0o644)
+		if err := fs.WriteFile(path, []byte(out), 0o644); err != nil {
+			return fmt.Errorf("make grub.cfg degraded-safe: %w", err)
+		}
 	}
+	return nil
 }
 
 var (

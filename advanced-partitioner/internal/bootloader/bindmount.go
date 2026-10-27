@@ -44,6 +44,9 @@ func BindMountSysroot(ctx context.Context, runner executor.Runner, sysroot strin
 	}
 	for _, src := range []string{"/dev", "/proc", "/sys", "/run"} {
 		target := filepath.Join(sysroot, src)
+		if executor.IsDryRun(runner) {
+			continue // the mounts are stubbed; do not create directories either
+		}
 		if err := os.MkdirAll(target, 0o755); err != nil { //nolint:gosec // sysroot defaults
 			return fmt.Errorf("mkdir %s: %w", target, err)
 		}

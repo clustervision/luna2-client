@@ -16,10 +16,12 @@ const DefaultRAIDTolerancePercent = 5
 // by the match filter, sorts the survivors smallest-first, takes count+spares
 // of them, and (when more than one disk is chosen) checks they are within
 // tolerancePct of the smallest. A tolerancePct of 0 means "use the default".
+// Disks in prefer (by Path) go before all others: the set's own disks from an
+// earlier install, so a changed order cannot move the set to other disks.
 //
-// It returns the chosen devices (smallest-first). The caller removes them
-// from the pool before resolving the next set.
-func Resolve(pool []discover.Device, m Match, count, spares, tolerancePct int) ([]discover.Device, error) {
+// It returns the chosen devices (preferred first, then smallest-first). The
+// caller removes them from the pool before resolving the next set.
+func Resolve(pool []discover.Device, m Match, count, spares, tolerancePct int, prefer map[string]bool) ([]discover.Device, error) {
 	if count < 1 {
 		return nil, fmt.Errorf("diskresolve: count must be >= 1, got %d", count)
 	}
@@ -31,7 +33,7 @@ func Resolve(pool []discover.Device, m Match, count, spares, tolerancePct int) (
 	}
 	need := count + spares
 
-	candidates := filter(pool, m)
+	candidates := filter(pool, m, prefer)
 	if len(candidates) < need {
 		return nil, notEnoughError(pool, candidates, m, need)
 	}
@@ -49,15 +51,28 @@ func Resolve(pool []discover.Device, m Match, count, spares, tolerancePct int) (
 	return selected, nil
 }
 
-// filter applies a Match to a pool and returns survivors sorted smallest-first.
-func filter(pool []discover.Device, m Match) []discover.Device {
+// filter applies a Match to a pool and returns survivors sorted smallest-first,
+// equal sizes by the disk's stable identity (WWN / serial / by-path slot), NOT
+// by kernel name: kernel names follow enumeration order, so equal disks used
+// to swap between sets whenever enumeration changed (a disk added, a slow
+// controller), and auto then saw another set's disks as "broken" and wiped
+// them.
+func filter(pool []discover.Device, m Match, prefer map[string]bool) []discover.Device {
 	out := make([]discover.Device, 0, len(pool))
 	for _, d := range pool {
 		if m.Matches(d) {
 			out = append(out, d)
 		}
 	}
-	sort.SliceStable(out, func(i, j int) bool { return out[i].Size < out[j].Size })
+	sort.SliceStable(out, func(i, j int) bool {
+		if prefer[out[i].Path] != prefer[out[j].Path] {
+			return prefer[out[i].Path]
+		}
+		if out[i].Size != out[j].Size {
+			return out[i].Size < out[j].Size
+		}
+		return out[i].IdentityKey() < out[j].IdentityKey()
+	})
 	return out
 }
 

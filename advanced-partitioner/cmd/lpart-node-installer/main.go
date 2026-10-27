@@ -2,7 +2,8 @@
 // in-process, driving the lpart-* binaries via the engine, and renders a
 // single-screen Bubble Tea dashboard (or plain scrolling output under
 // `lpart.notui`). The Luna pre/part/post hook scripts are one-line execs of
-// this command with the matching --phase.
+// this command with the matching --phase. --phase finish only flushes the
+// installed system to disk, as the installer's last step.
 //
 // Usage:
 //
@@ -13,9 +14,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/engine"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installcontext"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installerui"
@@ -23,14 +27,37 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sysenv"
 )
 
-// exitFatalConfig is the exit code for a non-retryable configuration error: one
-// that will fail identically on every retry, so the install wrapper
-// (luna2-start.sh) must stop the retry loop rather than spin forever. Distinct
-// from the generic exit 1 (a transient/operational failure that may be worth a
-// retry).
+// exitFatalConfig is the exit code for a non-retryable failure (a configuration
+// error or a sub-tool crash): one that will fail identically on every retry, so
+// the install wrapper (luna-installer.sh) must stop the retry loop rather than
+// spin forever. Distinct from the generic exit 1 (a transient/operational
+// failure that may be worth a retry).
 const exitFatalConfig = 3
 
+// exitSafetyRefusal is the exit code for a safety refusal (a sub-tool's exit
+// 2 with a safety_refusal= verdict): the wrapper parks on it like on 3, and the
+// install template reports it as install.refused rather than install.fatal.
+const exitSafetyRefusal = 2
+
+// phaseFinish is not a pipeline phase: luna_finish runs it after the network is
+// down, so it starts no TUI and forwards no log.
+const phaseFinish = "finish"
+
+// failureExit is the exit code and console line for a phase that failed. Say
+// what the code means, not just what it is: the wrapper's retry-vs-park
+// decision rides on it and the operator reads this line.
+func failureExit(class pipeline.FailureClass) (int, string) {
+	switch {
+	case class == pipeline.FailSafety:
+		return exitSafetyRefusal, fmt.Sprintf("lpart-node-installer: exit %d -- safety refusal; the node is parked for an operator, not retried", exitSafetyRefusal)
+	case class.Fatal():
+		return exitFatalConfig, fmt.Sprintf("lpart-node-installer: exit %d -- non-retryable failure (configuration error or crash); the node is parked for an operator, not retried", exitFatalConfig)
+	}
+	return 1, "lpart-node-installer: exit 1 -- retryable failure; the install wrapper retries after a countdown"
+}
+
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, "lpart-node-installer")
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "lpart-node-installer:", err)
 		os.Exit(1)
@@ -39,7 +66,7 @@ func main() {
 
 func run() error {
 	var (
-		phase        = flag.String("phase", "", "install phase to run in-process: pre|part|post")
+		phase        = flag.String("phase", "", "install phase to run in-process: pre|part|post|finish")
 		runtimeDir   = flag.String("runtime", "/tmp/install_files/runtime", "runtime dir for tx_* JSON + results")
 		logDir       = flag.String("log-dir", "/tmp/install_files/logs", "per-binary log dir passed to the lpart-* tools")
 		binDir       = flag.String("bin-dir", "/usr/bin", "directory holding the lpart-* binaries")
@@ -55,13 +82,13 @@ func run() error {
 	flag.Parse()
 
 	if *phase == "" {
-		return fmt.Errorf("--phase pre|part|post is required")
+		return fmt.Errorf("--phase pre|part|post|finish is required")
 	}
 	ph := pipeline.Phase(*phase)
 	switch ph {
-	case pipeline.PhasePre, pipeline.PhasePart, pipeline.PhasePost:
+	case pipeline.PhasePre, pipeline.PhasePart, pipeline.PhasePost, phaseFinish:
 	default:
-		return fmt.Errorf("invalid --phase %q (want pre|part|post)", *phase)
+		return fmt.Errorf("invalid --phase %q (want pre|part|post|finish)", *phase)
 	}
 
 	// Refuse to run outside the Luna installer environment. lpart-node-installer
@@ -72,6 +99,12 @@ func run() error {
 		AllowNonInstaller: *allowNonInst,
 	}); err != nil {
 		return err
+	}
+
+	// Before the legacy refusal: a legacy install is handed over unflushed too.
+	if ph == phaseFinish {
+		finish()
+		return nil
 	}
 
 	// Legacy is daemon-only: the node runs its old bash pre/part/post and must
@@ -121,38 +154,75 @@ func run() error {
 		QuietConsole: *quietConsole,
 		StrictExit:   true,
 	})
-	if err != nil {
-		return err
-	}
+	// The renderer can return while the phase is still mid-step: a render
+	// error, the operator quitting (q / Ctrl+C), a signal. Exiting then left
+	// the running step's children (mkfs, tar, sgdisk, blkdiscard) writing to
+	// the disks into the next install attempt. Stop the phase and wait for it.
+	stopPipeline(cancel, pl, os.Stderr)
 
-	// The AUTHORITATIVE outcome is pipeline.Result(), recorded out-of-band
-	// of the lossy display bus (FTA Cluster B): a dropped terminal event or
-	// an operator quitting the TUI mid-install can never turn a failed or
-	// unfinished install into exit 0, and a fatal/safety-refusal class maps
-	// to exit 3 so luna2-start.sh parks instead of retrying forever.
-	res := pl.Result()
+	code, line := phaseExit(pl.Result(), renderExit, err)
+	if line != "" {
+		fmt.Fprintln(os.Stderr, line)
+	}
+	if code != 0 {
+		os.Exit(code)
+	}
+	return nil
+}
+
+// phaseExit is the exit code and console line once the renderer has returned
+// and the phase has stopped.
+//
+// The AUTHORITATIVE outcome is pipeline.Result(), recorded out-of-band
+// of the lossy display bus (FTA Cluster B): a dropped terminal event or
+// an operator quitting the TUI mid-install can never turn a failed or
+// unfinished install into exit 0, and a safety refusal maps to exit 2 and
+// a fatal class to exit 3 so luna-installer.sh parks instead of retrying forever.
+// A render error is read after the verdict of a failed phase, so it cannot
+// turn a park into a retry.
+func phaseExit(res pipeline.Result, renderExit int, renderErr error) (int, string) {
 	switch {
-	case res.Done && !res.Failed:
+	case res.Done && res.Failed:
+		code, line := failureExit(res.Class)
+		if renderErr != nil {
+			line = fmt.Sprintf("lpart-node-installer: %v\n%s", renderErr, line)
+		}
+		return code, line
+	case renderErr != nil:
+		return 1, fmt.Sprintf("lpart-node-installer: %v", renderErr)
+	case res.Done:
 		// Success per the pipeline; keep any non-zero renderer verdict
 		// (e.g. UI crash) visible rather than masking it.
-		if renderExit != 0 {
-			os.Exit(renderExit)
-		}
-	case res.Done && res.Class.Fatal():
-		// Say what the code means, not just what it is: the wrapper's
-		// retry-vs-park decision rides on it and the operator reads this line.
-		fmt.Fprintf(os.Stderr, "lpart-node-installer: exit %d -- non-retryable configuration or safety error; the node is parked for an operator, not retried\n", exitFatalConfig)
-		os.Exit(exitFatalConfig)
-	case res.Done:
-		fmt.Fprintln(os.Stderr, "lpart-node-installer: exit 1 -- retryable failure; the install wrapper retries after a countdown")
-		os.Exit(1)
+		return renderExit, ""
 	default:
 		// No terminal state: the pipeline was interrupted (quit/SIGINT/
 		// render exit while steps were still running). Never success.
-		fmt.Fprintln(os.Stderr, "lpart-node-installer: install interrupted before completion")
-		os.Exit(1)
+		return 1, "lpart-node-installer: install interrupted before completion"
 	}
-	return nil
+}
+
+// phase is the part of *pipeline.Pipeline that stopPipeline needs.
+type phase interface {
+	Result() pipeline.Result
+	Events() <-chan engine.InstallerEvent
+	Wait()
+}
+
+// stopPipeline makes sure the phase goroutine has returned before the process
+// exits. An unfinished phase is cancelled: its running step is killed with
+// its whole process group (engine.RunCommand). The events are drained
+// meanwhile, since the step output forward blocks on them once the renderer
+// has stopped reading.
+func stopPipeline(cancel context.CancelFunc, pl phase, stderr io.Writer) {
+	if !pl.Result().Done {
+		_, _ = fmt.Fprintln(stderr, "lpart-node-installer: stopping the unfinished phase and its child processes")
+		cancel()
+	}
+	go func() {
+		for range pl.Events() {
+		}
+	}()
+	pl.Wait()
 }
 
 // legacyRefusal returns a fatal message if install_mode=legacy reached the
@@ -169,4 +239,12 @@ func legacyRefusal(runtimeDir string) string {
 	return "install_mode=legacy is daemon-only; the lpart client must not run (no TUI). " +
 		"This is a daemon routing misconfiguration: legacy must render the bash install " +
 		"template and run the node's legacy pre/part/post scripts, not the lpart shims. Refusing to start."
+}
+
+// finish flushes everything the install wrote. dracut pivots straight into the
+// installed disk, so without it a power cut in the next seconds loses the last
+// install steps' writes, and no later boot writes them again.
+func finish() {
+	syscall.Sync()
+	fmt.Fprintln(os.Stderr, "lpart-node-installer: installed system flushed to disk")
 }

@@ -1,5 +1,5 @@
-// Package bootloader is the Go port of /root/NEWTREE/lib/bootloader_*.sh
-// and the orchestrator at /root/NEWTREE/bin/lpart-bootloader-finalise.
+// Package bootloader is the Go port of the bash lib/bootloader_*.sh and of
+// its lpart-bootloader-finalise orchestrator.
 //
 // The package is split for diff-ability:
 //
@@ -17,7 +17,7 @@
 //	                 the broken `grub*-install --target=x86_64-efi`
 //	                 rebuild that produced rescue-prompt-only binaries
 //	debian.go       Debian/Ubuntu path (update-initramfs + grub-install + update-grub)
-//	suse.go         SUSE stub — fails with a clear "not implemented" error
+//	suse.go         SUSE/openSUSE path (the RHEL flow: dracut + grub2-*)
 //
 // Cross-distribution / architecture notes:
 //   - The Adapter interface fans out by detected family. Adding a new
@@ -38,7 +38,6 @@
 package bootloader
 
 import (
-	"fmt"
 	"os"
 	"strings"
 
@@ -70,6 +69,14 @@ type BootContext struct {
 	RegisterNVRAM  string               `json:"register_nvram"`
 	ClearUEFINVRAM bool                 `json:"clear_uefi_nvram"`
 	StorageResult  result.StorageResult `json:"storage_result"`
+
+	// ReusesRoot is set when the install keeps the root already on disk
+	// (install_mode local) instead of writing a new one.
+	ReusesRoot bool `json:"reuses_root"`
+
+	// LunaKernelOptions are the osimage kernel options from the installer's
+	// command line (see LunaKernelOptions), added to GRUB_CMDLINE_LINUX.
+	LunaKernelOptions string `json:"luna_kernel_options"`
 }
 
 // BIOSGRUBRequested reports whether this node asked for a BIOS GRUB install:
@@ -143,7 +150,7 @@ func BuildBootContext(in result.StorageResult, arch, osReleasePath string) (Boot
 func DetectFamily(osReleasePath string) (Family, error) {
 	body, err := os.ReadFile(osReleasePath) //nolint:gosec // operator-controlled path
 	if err != nil {
-		return "", fmt.Errorf("missing %s: %w", osReleasePath, err)
+		return "", imageErrorf("image-missing-os-release", "missing %s: %v", osReleasePath, err)
 	}
 	id, idLike := "", ""
 	for _, line := range strings.Split(string(body), "\n") {
@@ -163,7 +170,7 @@ func DetectFamily(osReleasePath string) (Family, error) {
 	case containsAny(combined, "sles", "opensuse", "suse"):
 		return FamilySUSE, nil
 	default:
-		return "", fmt.Errorf(
+		return "", imageErrorf("unsupported-os-family",
 			"unsupported target OS family from os-release: id=%q id_like=%q",
 			id, idLike)
 	}
@@ -179,7 +186,7 @@ func ArchToUEFITarget(arch string) (string, error) {
 	case "aarch64", "arm64":
 		return "arm64-efi", nil
 	default:
-		return "", fmt.Errorf("unsupported UEFI architecture target: %s", arch)
+		return "", configErrorf("unsupported-architecture", "unsupported UEFI architecture target: %s", arch)
 	}
 }
 
@@ -194,7 +201,7 @@ func ArchToUEFIFallbackLoader(arch string) (string, error) {
 	case "aarch64", "arm64":
 		return `\EFI\BOOT\BOOTAA64.EFI`, nil
 	default:
-		return "", fmt.Errorf("unsupported UEFI fallback loader architecture: %s", arch)
+		return "", configErrorf("unsupported-architecture", "unsupported UEFI fallback loader architecture: %s", arch)
 	}
 }
 

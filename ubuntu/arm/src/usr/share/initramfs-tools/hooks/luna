@@ -23,6 +23,8 @@ copy_exec /usr/bin/curl /usr/bin
 copy_exec /usr/bin/awk /usr/bin
 copy_exec /usr/bin/tar /usr/bin
 copy_exec /usr/sbin/sshd /usr/sbin
+# dropbear is the installer's ssh server; without it luna-start falls back to sshd
+if [ -x /usr/sbin/dropbear ]; then copy_exec /usr/sbin/dropbear /usr/sbin; fi
 copy_exec /usr/bin/file /usr/bin
 copy_exec /usr/bin/bash /bin
 copy_exec /usr/bin/bash /usr/bin
@@ -46,6 +48,10 @@ copy_exec /usr/sbin/mkdosfs /usr/sbin
 copy_exec /usr/sbin/dosfslabel /usr/sbin
 copy_exec /usr/sbin/fatlabel /usr/sbin
 copy_exec /usr/sbin/mdadm /usr/sbin
+# lpart's lvm builder makes LV nodes itself (--noudevsync): vgmknodes, then dmsetup mknodes
+for _d in /usr/sbin /sbin; do
+    if [ -e "$_d/vgmknodes" ]; then copy_exec "$_d/vgmknodes" /usr/sbin; break; fi
+done
 copy_exec /usr/bin/top /usr/bin
 copy_exec /usr/sbin/fdisk /usr/sbin
 copy_exec /usr/bin/lspci /usr/bin
@@ -117,6 +123,7 @@ copy_file config /etc/ssh/ssh_host_rsa_key
 copy_file config /etc/ssh/ssh_host_ecdsa_key
 copy_file config /etc/ssh/ssh_host_ed25519_key
 copy_file config /etc/pki/tls/certs/ca-bundle.crt
+copy_file config /etc/ssl/certs/ca-certificates.crt
 copy_file config /etc/resolv.conf
 copy_file config /trinity/local/luna/node/config/luna.ini
 copy_file library /usr/lib/aarch64-linux-gnu/libtss2-tcti-device.so.0
@@ -127,6 +134,36 @@ else
    echo "Error: grepicdr must be installed!"
    exit 1
 fi
+
+# Filesystem checkers for lpart's health probe (lpart-storage-check requires
+# e2fsck, xfs_repair and fsck.vfat or fsck.fat) and blkdiscard for
+# install_mode=sanitize. /usr/sbin on a merged-/usr image, /sbin before that.
+for _tool in e2fsck fsck.ext4 xfs_repair fsck.fat fsck.vfat blkdiscard; do
+    _found=""
+    for _dir in /usr/sbin /sbin; do
+        if [ -x "$_dir/$_tool" ]; then
+            copy_exec "$_dir/$_tool" /usr/sbin
+            _found=1
+            break
+        fi
+    done
+    [ -n "$_found" ] || echo "W: luna hook: $_tool not found; not in the install initramfs"
+done
+
+# glibc gconv modules for fsck.fat/fsck.vfat: dosfstools converts FAT short
+# names through iconv (codepage 437; IBM850 for mkfs.vfat labels). Without
+# them every ESP check fails "CP437: Invalid argument" and lpart judges every
+# healthy UEFI os set broken. Debian multiarch paths; gconv-modules.d holds
+# the IBM437/IBM850 entries on newer glibc.
+for _gconv in /usr/lib/x86_64-linux-gnu/gconv /usr/lib/aarch64-linux-gnu/gconv; do
+    [ -d "$_gconv" ] || continue
+    for _f in "$_gconv/gconv-modules" "$_gconv/gconv-modules.cache" \
+              "$_gconv/IBM437.so" "$_gconv/IBM850.so" "$_gconv"/gconv-modules.d/*.conf; do
+        if [ -e "$_f" ]; then
+            copy_file gconv "$_f"
+        fi
+    done
+done
 
 # Advanced partitioner (lpart). Copied in here the same way every other tool is:
 # whichever builder packs this image, the lpart binaries reach the initramfs through

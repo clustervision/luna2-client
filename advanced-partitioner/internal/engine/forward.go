@@ -12,7 +12,7 @@ import (
 // ForwardSyslog streams installer content to a remote rsyslog target live, one
 // RFC3164 UDP datagram per forwarded event, while passing every event through
 // unchanged (so it chains after TeeToFile: events -> TeeToFile -> ForwardSyslog
-// -> TUI). It is the live replacement for luna2-start.sh's end-of-run batch
+// -> TUI). It is the live replacement for luna-installer.sh's end-of-run batch
 // `logger -n` forward.
 //
 //   - addr is the controller target, e.g. "10.141.255.254:514" (luna.loghost).

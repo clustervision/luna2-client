@@ -19,6 +19,7 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fscheck"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lvm/vgselect"
 )
 
 // Verdict classifies a non-persistent set's on-disk state.
@@ -35,13 +36,40 @@ const (
 	// healthy nor cleanly blank. The data fence halts (sync) or recreates
 	// only the OS set (auto) on this verdict; it never wipes a data set.
 	VerdictBroken Verdict = "broken"
+	// VerdictUnknown means the probe could not decide: a filesystem checker
+	// did not run (missing tool, exec failure). It is neither healthy nor
+	// broken, so the data fence must neither mount nor wipe on it -- auto
+	// used to read a missing e2fsck as "broken" and recreate the os set.
+	VerdictUnknown Verdict = "unknown"
+	// VerdictDegraded means an array of the set misses a member and was not
+	// started (the set does not allow running degraded), or a member is stale:
+	// the install parks.
+	VerdictDegraded Verdict = "degraded"
 )
+
+// DegradedRefusal is the reason a VerdictDegraded set parks. allow_degraded is
+// advised only when the set lacks it: with it set, the verdict means a stale
+// member, which allow_degraded never accepts.
+func DegradedRefusal(set *v2.Set) string {
+	msg := fmt.Sprintf("set %q is degraded: an array of the set misses a member; replace the disk and reinstall with install_mode full", set.Name)
+	if !set.AllowDegraded {
+		msg += ", or set allow_degraded on the set to install on it degraded"
+	}
+	return msg
+}
 
 // Unhealthy is one volume-level verification failure.
 type Unhealthy struct {
 	SetName    string
 	VolumeName string
 	Reason     string
+	// Unknown marks a failure that is not evidence of damage: the probe
+	// itself could not run (fscheck Result.Unavailable). Classify turns any
+	// Unknown failure into VerdictUnknown, never VerdictBroken.
+	Unknown bool
+	// Degraded marks an array left inactive for a missing member; Classify
+	// turns it into VerdictDegraded.
+	Degraded bool
 }
 
 // VerifyDiskSet runs the per-volume verification for one disk-backed set and
@@ -55,38 +83,82 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 			logger.Warn("UNHEALTHY set=" + set.Name + " vol=" + volName + ": " + reason)
 		}
 	}
+	markUnknown := func(volName, reason string) {
+		failures = append(failures, Unhealthy{SetName: set.Name, VolumeName: volName, Reason: reason, Unknown: true})
+		if logger != nil {
+			logger.Warn("UNKNOWN set=" + set.Name + " vol=" + volName + ": " + reason)
+		}
+	}
 
 	if len(resolved) == 0 {
 		mark("(devices)", "set has no resolved devices")
 		return failures
 	}
 
-	if set.StorageType() == v2.StorageLVM {
-		vgName := set.VGName()
-		if _, err := runner.Run(ctx, executor.CommandSpec{
-			Path: "vgchange", Args: []string{"-ay", vgName},
-			CaptureStdout: true, CaptureStderr: true,
-		}); err != nil {
-			mark("(lvm)", fmt.Sprintf("vgchange -ay %s failed: %v", vgName, err))
+	// Assemble the set's md arrays from their explicit members first: md
+	// auto-assembly is off in the installer (rd.md=0, no ARRAY lines), so on a
+	// raid set the PV and the mirrored ESP and /boot arrays do not exist yet and
+	// the vgchange below failed on every healthy raid1 os set, which made sync
+	// park and auto re-create a healthy mirror on every boot.
+	disks := make([]string, 0, len(resolved))
+	for _, r := range resolved {
+		disks = append(disks, r.ResolvedPath)
+	}
+	// Nothing is started degraded unless the set allows it. On a raid set
+	// what the probe brought up (arrays, VG) is released after it; a
+	// raid=none set's VG stays active (mount and create handle it).
+	vgSelect := ""
+	if rm := set.RAIDMode(); rm != "" && rm != "none" {
+		act := ActivateExisting(ctx, runner, set, disks, logger)
+		defer func() { Release(ctx, runner, act, vgSelect, logger) }()
+		if len(act.Degraded) > 0 {
+			failures = append(failures, Unhealthy{SetName: set.Name, VolumeName: "(raid)", Degraded: true,
+				Reason: fmt.Sprintf("array(s) %s miss a member and were not started", strings.Join(act.Degraded, ", "))})
+			if logger != nil {
+				logger.Warn("DEGRADED set=" + set.Name + ": array(s) " + strings.Join(act.Degraded, ", ") + " miss a member")
+			}
 			return failures
 		}
 	}
 
+	if set.StorageType() == v2.StorageLVM {
+		// Activate THIS set's VG by UUID: the one whose PVs are on the set's
+		// disks. `vgchange -ay <name>` is ambiguous (and refuses) when a disk
+		// outside the set -- an old OS disk still attached -- carries a VG of
+		// the same name; the healthy set was then judged broken and auto
+		// recreated it.
+		vgName := set.VGName()
+		vg, problem, unknown := OwnVG(ctx, runner, vgName, disks, logger)
+		switch {
+		case unknown:
+			markUnknown("(lvm)", problem)
+			return failures
+		case problem != "":
+			mark("(lvm)", problem)
+			return failures
+		}
+		if _, err := runner.Run(ctx, executor.CommandSpec{
+			Path: "vgchange", Args: []string{"-ay", "--select", vg.Select()},
+			CaptureStdout: true, CaptureStderr: true,
+		}); err != nil {
+			mark("(lvm)", fmt.Sprintf("vgchange -ay --select %s (VG %s) failed: %v", vg.Select(), vgName, err))
+			return failures
+		}
+		vgSelect = vg.Select()
+	}
+
 	diskPath := resolved[0].ResolvedPath
-	partCounter := 0
+	biosBoot := set.Role == "os" && HasBIOSBootPartition(ctx, runner, diskPath)
 	for _, vol := range set.Volumes {
 		if vol.Provider == "memory" {
 			continue
 		}
-		if vol.Provider == "partition" {
-			partCounter++
-		}
-		device := volumeDevice(set, vol, diskPath, partCounter)
+		device := volumeDevice(set, vol, diskPath, set.PartitionNumber(vol, biosBoot))
 		if device == "" {
 			continue
 		}
 
-		if !blockDeviceExists(device) {
+		if !blockDeviceExistsFn(device) {
 			mark(vol.Name, "block device not found: "+device)
 			continue
 		}
@@ -106,12 +178,43 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 			}
 		}
 		if vol.FS != "" {
-			if res := checker.CheckFS(ctx, device, vol.FS); !res.OK {
+			// every set gets the filesystem's own crash recovery (ADR 0010): a
+			// power cut must not park a node carrying a data set
+			res := checker.CheckFS(ctx, device, vol.FS)
+			switch {
+			case res.Unavailable:
+				markUnknown(vol.Name, res.Reason)
+			case !res.OK:
 				mark(vol.Name, res.Reason)
 			}
 		}
 	}
 	return failures
+}
+
+// OwnVG finds the set's volume group: the VG named vgName with PVs on the
+// set's disks. A same-named VG elsewhere is logged and ignored. problem is a
+// verification failure ("" when exactly one own VG exists); unknown is set
+// when the probe itself failed (pvs/lsblk error), which says nothing about the
+// set's health.
+func OwnVG(ctx context.Context, runner executor.Runner, vgName string, disks []string, logger *txlog.Logger) (vg vgselect.VG, problem string, unknown bool) {
+	loc, err := vgselect.Locate(ctx, runner, vgName, disks)
+	if err != nil {
+		return vgselect.VG{}, fmt.Sprintf("cannot list volume groups: %v", err), true
+	}
+	for _, f := range loc.Foreign {
+		if logger != nil {
+			logger.Warn(fmt.Sprintf("VG %q (uuid %s, PVs %v) is on a disk outside set %q -- ignored, never activated", f.Name, f.UUID, f.PVs, vgName))
+		}
+	}
+	switch len(loc.Own) {
+	case 1:
+		return loc.Own[0], "", false
+	case 0:
+		return vgselect.VG{}, fmt.Sprintf("no volume group %q on the set's disks", vgName), false
+	default:
+		return vgselect.VG{}, fmt.Sprintf("%d volume groups named %q on the set's disks", len(loc.Own), vgName), false
+	}
 }
 
 // volumeDevice returns the block device a volume's filesystem lives on, given
@@ -120,13 +223,16 @@ func VerifyDiskSet(ctx context.Context, runner executor.Runner, checker *fscheck
 // arrays (the raw partition shows as linux_raid_member, not the real fs), so
 // the health probe must look there or it falsely reports a fresh mirror broken
 // and re-runs reformat instead of mounting. partIdx is the 1-based partition
-// counter for raw partition volumes. Returns "" for providers with no device
-// (e.g. memory).
+// number the builder gave the volume (set.PartitionNumber). Returns "" for
+// providers with no device (e.g. memory) and for partIdx 0.
 func volumeDevice(set *v2.Set, vol v2.Volume, diskPath string, partIdx int) string {
 	switch vol.Provider {
 	case "partition":
 		if md := set.BootMirrorDevice(vol); md != "" {
 			return md
+		}
+		if partIdx <= 0 {
+			return ""
 		}
 		return devices.PartitionPath(diskPath, partIdx)
 	case "lvm":
@@ -136,14 +242,25 @@ func volumeDevice(set *v2.Set, vol v2.Volume, diskPath string, partIdx int) stri
 	}
 }
 
-// Classify returns the tri-state verdict for a non-persistent disk-backed
-// set. A clean verification is healthy; otherwise the selected disks are
-// probed for any existing layout — entirely empty disks are blank (safe to
-// create), anything partial or mismatched is broken.
+// Classify returns the verdict for a non-persistent disk-backed set. A clean
+// verification is healthy; a probe that could not run (a checker missing from
+// the ramdisk) is unknown, whatever else was found; otherwise the selected
+// disks are probed for any existing layout — entirely empty disks are blank
+// (safe to create), anything partial or mismatched is broken.
 func Classify(ctx context.Context, runner executor.Runner, checker *fscheck.Checker, set *v2.Set, resolved []selector.Resolved, logger *txlog.Logger) (Verdict, []Unhealthy) {
 	failures := VerifyDiskSet(ctx, runner, checker, set, resolved, logger)
 	if len(failures) == 0 {
 		return VerdictHealthy, nil
+	}
+	for _, f := range failures {
+		if f.Degraded {
+			return VerdictDegraded, failures
+		}
+	}
+	for _, f := range failures {
+		if f.Unknown {
+			return VerdictUnknown, failures
+		}
 	}
 	if DisksBlank(ctx, runner, resolved) {
 		return VerdictBlank, failures
@@ -214,6 +331,9 @@ func rcOf(res executor.CommandResult, err error) int {
 	}
 	return -1
 }
+
+// blockDeviceExistsFn is a test seam; it defaults to stat'ing the real device.
+var blockDeviceExistsFn = blockDeviceExists
 
 func blockDeviceExists(path string) bool {
 	info, err := os.Stat(path)

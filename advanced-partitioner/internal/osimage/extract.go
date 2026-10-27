@@ -331,6 +331,13 @@ func PrepareSysroot(ctx context.Context, opts PrepareOptions) error {
 			}
 			continue
 		}
+		if _, isMount := mountSet[dir]; isMount && dir != opts.Sysroot {
+			// The directory is itself a mounted filesystem (a data set on /home,
+			// /scratch, /data): its contents belong to that set, not to the os
+			// image. Wiping it deleted every file of a healthy data set.
+			opts.detail("  keeping preserve-empty dir (a mounted filesystem, not part of the os set): %s", p.Base)
+			continue
+		}
 		children, err := os.ReadDir(dir)
 		if err != nil {
 			continue
@@ -401,6 +408,11 @@ type ExtractOptions struct {
 	RemoveAfter bool
 }
 
+// CapabilityXattrArgs restores file capabilities from the image. Only
+// security.capability: SELinux labels come from the template's restorecon, and
+// the el8 kernel's tmpfs (the memboot root) does not take user.* xattrs.
+var CapabilityXattrArgs = []string{"--xattrs", "--xattrs-include=security.capability"}
+
 // Extract runs tar -I lbzip2 --acls/--no-acls --numeric-owner with the
 // pre-built --exclude list. After a successful extract it verifies
 // that /sysroot/etc/os-release exists (the bash predecessor's
@@ -425,21 +437,20 @@ func Extract(ctx context.Context, opts ExtractOptions) error {
 		args = append(args, "--no-acls")
 	}
 	args = append(args, "--numeric-owner")
+	args = append(args, CapabilityXattrArgs...)
 	args = append(args, opts.TarExcludes...)
 	args = append(args, "-xf", opts.TarballPath, "-C", opts.Sysroot)
 
 	opts.info("extracting osimage into " + opts.Sysroot)
-	if _, err := opts.Runner.Run(ctx, executor.CommandSpec{
+	if res, err := opts.Runner.Run(ctx, executor.CommandSpec{
 		Path: "tar", Args: args,
 		CaptureStdout: true, CaptureStderr: true,
 	}); err != nil {
-		return fmt.Errorf("tar extract: %w", err)
+		return fmt.Errorf("tar extract: %w", withStderr(err, res.Stderr))
 	}
 
-	osRelease := filepath.Join(opts.Sysroot, "etc", "os-release")
-	if _, err := os.Stat(osRelease); err != nil {
-		return fmt.Errorf("osimage extract did not produce %s: %w", osRelease, err)
-	}
+	// No os-release check here: VerifyExtract makes it, and refuses (exit 3)
+	// an image without one, which fails the same way on every retry.
 	opts.info("osimage extracted into " + opts.Sysroot + " successfully")
 
 	if opts.RemoveAfter {
@@ -456,7 +467,6 @@ func buildMountSet(targets []string) map[string]struct{} {
 	out := make(map[string]struct{}, len(targets))
 	sort.Strings(targets)
 	for _, t := range targets {
-		t = strings.TrimSpace(t)
 		if t == "" {
 			continue
 		}
@@ -490,4 +500,13 @@ func (o ExtractOptions) warn(msg string) {
 	if o.Logger != nil {
 		o.Logger.Warn(msg)
 	}
+}
+
+// withStderr adds a failed command's stderr to its error: the cause (a full
+// filesystem) is only there, and the caller classifies on the error text.
+func withStderr(err error, stderr []byte) error {
+	if s := executor.StderrExcerpt(stderr); s != "" {
+		return fmt.Errorf("%w: %s", err, s)
+	}
+	return err
 }

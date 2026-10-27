@@ -2,6 +2,7 @@ package bootloader
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -92,7 +93,7 @@ func TestDebianRegenerateInitramfsDracutFallback(t *testing.T) {
 		t.Fatalf("call shape wrong: %+v", calls)
 	}
 	args := strings.Join(calls[0].Args, " ")
-	if args != "dracut -f --omit luna --kver 6.8.0-31-generic" {
+	if args != strings.Join(dracutArgs("6.8.0-31-generic"), " ") {
 		t.Fatalf("args = %q", args)
 	}
 }
@@ -160,9 +161,9 @@ func TestDebianInstallUEFI(t *testing.T) {
 			t.Fatalf("/etc/default/grub missing %q:\n%s", want, body)
 		}
 	}
-	// GRUB_DISABLE_SUBMENU is RHEL-only.
-	if strings.Contains(string(body), "GRUB_DISABLE_SUBMENU") {
-		t.Fatalf("Debian grub default should NOT include GRUB_DISABLE_SUBMENU:\n%s", body)
+	// The submenu is off on every family.
+	if !strings.Contains(string(body), "GRUB_DISABLE_SUBMENU=true") {
+		t.Fatalf("Debian grub default must disable the submenu:\n%s", body)
 	}
 
 	// Stub grub.cfg landed under /EFI/debian/ pointing at /boot/grub/
@@ -383,8 +384,8 @@ func TestEnsureSignedPairStagedDebianFromUsrLib(t *testing.T) {
 			t.Fatalf("%s = %q, want %q", name, b, want)
 		}
 	}
-	if _, _, _, err := findSignedShimDir(filepath.Join(sysroot, "boot", "efi"), "x86_64"); err != nil {
-		t.Fatalf("findSignedShimDir after staging: %v", err)
+	if _, err := findSignedShim(sysroot, "x86_64"); err != nil {
+		t.Fatalf("findSignedShim after staging: %v", err)
 	}
 }
 
@@ -434,7 +435,7 @@ func TestEnsureSignedPairStagedSkipsWhenAlreadyStaged(t *testing.T) {
 
 // Missing sources -> a clear error naming the needed packages (families
 // with a source row); RHEL has no row so the miss is reported later by
-// findSignedShimDir instead.
+// findSignedShim instead.
 func TestEnsureSignedPairStagedMissingSources(t *testing.T) {
 	for _, fam := range []Family{FamilyDebian, FamilySUSE} {
 		sysroot := stageDebianSysroot(t, true)
@@ -450,5 +451,82 @@ func TestEnsureSignedPairStagedMissingSources(t *testing.T) {
 		Sysroot: sysroot, Arch: "x86_64", Family: FamilyRHEL,
 	}); err != nil {
 		t.Fatalf("rhel: pre-stage must not error (empty source row): %v", err)
+	}
+}
+
+// Ubuntu 26.04: dracut is the generator; initramfs-tools-core (hook-functions)
+// stays installed, but update-initramfs is the dracut package's wrapper, which
+// builds without --omit luna, so the installed system's initramfs carried the
+// Luna install module. lpart now calls dracut itself, with --omit luna.
+func TestDebianRegenerateInitramfsDracutWrapper(t *testing.T) {
+	sysroot := stageDebianSysroot(t, false)
+	mustWriteFile(t, filepath.Join(sysroot, "usr/sbin/update-initramfs"),
+		"#!/bin/sh\n# Taken from initramfs-tools and adapted for dracut by Benjamin Drung.\ndracut ${OPTS} --force \"${initramfs}\" \"${version}\"\n")
+	mustWriteFile(t, filepath.Join(sysroot, "usr/bin/dracut"), "")
+	mustWriteFile(t, filepath.Join(sysroot, "usr/share/initramfs-tools/hook-functions"), "")
+	if err := os.MkdirAll(filepath.Join(sysroot, "lib/modules/7.0.0-14-generic"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	a := &debianAdapter{deps: AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot}}}
+	if err := a.RegenerateInitramfs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.Calls()
+	if len(calls) != 1 || strings.Join(calls[0].Args, " ") != strings.Join(dracutArgs("7.0.0-14-generic"), " ") {
+		t.Fatalf("calls = %+v", calls)
+	}
+}
+
+// initramfs-tools' own update-initramfs keeps being used, also when dracut
+// (or only dracut-install, as on the 24.04 lab image) is present too.
+func TestDebianRegenerateInitramfsPrefersInitramfsTools(t *testing.T) {
+	sysroot := stageDebianSysroot(t, false)
+	mustWriteFile(t, filepath.Join(sysroot, "usr/sbin/update-initramfs"),
+		"#!/bin/sh\n# Copyright (C) 2005-2011 maximilian attems\nmkinitramfs -o \"${initramfs}\" \"${version}\"\n")
+	mustWriteFile(t, filepath.Join(sysroot, "usr/bin/dracut"), "")
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	a := &debianAdapter{deps: AdapterDeps{Runner: f, BootContext: BootContext{Sysroot: sysroot}}}
+	if err := a.RegenerateInitramfs(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	calls := f.Calls()
+	if len(calls) != 1 || strings.Join(calls[0].Args, " ") != "update-initramfs -u -k all" {
+		t.Fatalf("calls = %+v", calls)
+	}
+}
+
+// A grub.cfg repair that cannot be written fails finalise, as on RHEL: the
+// unrepaired file leaves the node unbootable or at a GRUB prompt.
+func TestDebianGenerateGrubConfigFailsOnUnwritableRepair(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only file")
+	}
+	for _, c := range []struct {
+		name, mount, cfg string
+	}{
+		{"separate /boot", "/boot", "linux /boot/vmlinuz-x root=/dev/sda2\n"},
+		{"degraded-safe", "/", "set root='mduuid/3dbc7f6c203c674664990e4cdd81136b'\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sysroot := stageDebianSysroot(t, false)
+			p := filepath.Join(sysroot, "boot", "grub", "grub.cfg")
+			if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte(c.cfg), 0o400); err != nil {
+				t.Fatal(err)
+			}
+			a := &debianAdapter{deps: AdapterDeps{
+				Runner: executor.NewFakeRunner(executor.FakeResponse{}),
+				BootContext: BootContext{
+					Sysroot:       sysroot,
+					StorageResult: result.StorageResult{Filesystems: []result.Filesystem{{Mount: c.mount}}},
+				},
+			}}
+			if err := a.generateGrubConfig(context.Background()); err == nil || !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("an unwritable grub.cfg (%s) must fail generateGrubConfig, got %v", c.name, err)
+			}
+		})
 	}
 }

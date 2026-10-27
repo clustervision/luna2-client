@@ -56,11 +56,21 @@ func resolveFromFiles(runtimeDir string) (Inputs, error) {
 	in.FilterPopulated = fileHasContent(filepath.Join(runtimeDir, "osimage-filter.json"))
 	// Preserve whatever the install template wrote (mode + provision fields),
 	// re-normalising the mode default.
-	ic := readInstallContext(filepath.Join(runtimeDir, "install-context.json"))
+	ic, err := readInstallContext(filepath.Join(runtimeDir, "install-context.json"))
+	if err != nil {
+		return in, err
+	}
 	in.InstallMode = ic.InstallMode
 	writeInstallContext(runtimeDir, ic)
 	return in, nil
 }
+
+// ErrInstallContext marks an install-context.json that exists but cannot be
+// read: deterministic, so the pipeline parks instead of retrying.
+type ErrInstallContext struct{ Err error }
+
+func (e *ErrInstallContext) Error() string { return e.Err.Error() }
+func (e *ErrInstallContext) Unwrap() error { return e.Err }
 
 // --- install-context.json -------------------------------------------------
 
@@ -71,17 +81,23 @@ type installContext struct {
 	ProvisionInterface string `json:"provision_interface,omitempty"`
 }
 
-func readInstallContext(path string) installContext {
+// readInstallContext reads the template-written install context. A missing
+// file means auto; an invalid one is an error, since guessing auto would let a
+// healthy disk be converged when local, full or sanitize was meant.
+func readInstallContext(path string) (installContext, error) {
 	ic := installContext{InstallMode: "auto"}
 	data, err := os.ReadFile(path) //nolint:gosec // G304: runtimeDir-derived path; binary runs as root
 	if err != nil {
-		return ic
+		return ic, nil
 	}
-	if json.Unmarshal(data, &ic) == nil {
-		ic.InstallMode = orDefault(ic.InstallMode, "auto")
-		return ic
+	if len(strings.TrimSpace(string(data))) == 0 {
+		return ic, nil
 	}
-	return installContext{InstallMode: "auto"}
+	if err := json.Unmarshal(data, &ic); err != nil {
+		return installContext{}, &ErrInstallContext{fmt.Errorf("install-context.json is not valid JSON (%v); refusing to guess the install mode", err)}
+	}
+	ic.InstallMode = orDefault(ic.InstallMode, "auto")
+	return ic, nil
 }
 
 func writeInstallContext(runtimeDir string, ic installContext) {

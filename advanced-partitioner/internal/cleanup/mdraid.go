@@ -3,7 +3,6 @@ package cleanup
 import (
 	"context"
 	"errors"
-	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -39,7 +38,7 @@ func (c *Cleaner) stopMDArrays(ctx context.Context, setName string, selected, pr
 					continue
 				}
 				if c.arrayTouchesSelected(ctx, arr, protected) {
-					return fmt.Errorf(
+					return protectedf(
 						"cleanup: md array %s spans a selected disk and a persistent set's disk — refusing to stop/zero it (protected-disk barrier)",
 						arr.Device)
 				}
@@ -60,7 +59,7 @@ func (c *Cleaner) stopMDArrays(ctx context.Context, setName string, selected, pr
 			protUUIDs := c.dormantArrayUUIDs(ctx, protected)
 			for uuid, part := range selUUIDs {
 				if pp, ok := protUUIDs[uuid]; ok {
-					return fmt.Errorf(
+					return protectedf(
 						"cleanup: dormant md array %s spans a selected disk (member %s) and a persistent set's disk (member %s) — refusing to zero it (protected-disk barrier)",
 						uuid, part, pp)
 				}
@@ -182,13 +181,6 @@ func (c *Cleaner) stopMDIfExists(ctx context.Context, mdDevice string) {
 	c.runBest(ctx, "udevadm", "settle")
 }
 
-// partitionsOf returns the partition device paths of a whole disk by
-// asking lsblk. KNAME, not PATH: the PATH column arrived in util-linux 2.33,
-// and el8 ships 2.32 — with PATH the lsblk call fails there, partitionsOf
-// returns nil, and the dormant protected-disk barrier silently never sees
-// the partition superblocks (found live: battery S24 + regression 3.47
-// refused=0 on rocky8). KNAME exists everywhere and for a disk's partitions
-// "/dev/"+KNAME is exactly what PATH printed.
 // dormantArrayUUIDs maps md Array UUIDs found in the superblocks on the given
 // disks (whole disk + every partition) to one carrying device path. Running
 // state is irrelevant: --examine reads the on-disk metadata.
@@ -220,6 +212,13 @@ func (c *Cleaner) mdArrayUUID(ctx context.Context, dev string) string {
 	return ""
 }
 
+// partitionsOf returns the partition device paths of a whole disk by
+// asking lsblk. KNAME, not PATH: the PATH column arrived in util-linux 2.33,
+// and el8 ships 2.32 — with PATH the lsblk call fails there, partitionsOf
+// returns nil, and the dormant protected-disk barrier silently never sees
+// the partition superblocks (found live: battery S24 + regression 3.47
+// refused=0 on rocky8). KNAME exists everywhere and for a disk's partitions
+// "/dev/"+KNAME is exactly what PATH printed.
 func (c *Cleaner) partitionsOf(ctx context.Context, disk string) []string {
 	res, ok := c.runOK(ctx, "lsblk", "-ln", "-o", "KNAME,TYPE", disk)
 	if !ok {

@@ -111,6 +111,13 @@ func New(opts Options) Runner {
 	return real
 }
 
+// IsDryRun reports whether r is the dry-run runner, for callers that also
+// mutate the filesystem directly (mkdir before a stubbed mount).
+func IsDryRun(r Runner) bool {
+	_, ok := r.(*dryRunRunner)
+	return ok
+}
+
 // Options controls Runner construction.
 type Options struct {
 	// DryRun selects the no-op runner.
@@ -263,7 +270,7 @@ func (r *realRunner) Run(ctx context.Context, spec CommandSpec) (CommandResult, 
 			slog.Duration("duration", elapsed),
 			slog.Bool("timed_out", res.TimedOut),
 			slog.String("err", runErr.Error()),
-			slog.String("stderr", stderrExcerpt(res.Stderr)),
+			slog.String("stderr", StderrExcerpt(res.Stderr)),
 		)
 		return res, fmt.Errorf("%s: %w", FormatArgv(path, redactArgs(args)...), runErr)
 	}
@@ -278,13 +285,13 @@ func (r *realRunner) Run(ctx context.Context, spec CommandSpec) (CommandResult, 
 // stderrExcerptEnd bounds each end of the excerpt kept in the log entry.
 const stderrExcerptEnd = 1000
 
-// stderrExcerpt trims the captured stderr and, when it is longer than both
+// StderrExcerpt trims the captured stderr and, when it is longer than both
 // ends together, keeps the HEAD and the TAIL with a count of what was dropped.
 // The head is what matters: a command's first error is normally the cause and
 // the tail the cascade, so a tail-only excerpt points the reader at the wrong
 // thing (a tar out of space prints hundreds of ENOSPC lines, then a handful of
 // deferred-ACL warnings).
-func stderrExcerpt(b []byte) string {
+func StderrExcerpt(b []byte) string {
 	s := strings.TrimSpace(string(b))
 	if len(s) <= 2*stderrExcerptEnd {
 		return s

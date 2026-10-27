@@ -7,6 +7,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lvm/vgselect"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/mount"
 )
 
 // EnsureNoLVMAutoActivate writes an LVM local override disabling event-based
@@ -107,13 +111,19 @@ func RemoveLVMDevicesFile(paths ...string) error {
 // discovered live. Best-effort throughout — except the protected-disk
 // barrier, which is a hard error.
 //
+// Only the VG of that name whose PVs sit on THIS set's selected disks is torn
+// down, addressed by UUID (vgselect). A same-named VG elsewhere — an old OS
+// disk still attached carries VG "os" too — is foreign: it is left alone with
+// a warning. Removing it by name destroyed a disk outside the layout, and with
+// two VGs of one name every by-name command is ambiguous anyway.
+//
 // Order matters (HW regression, node001 2026-06-08): LVM deactivation
 // (vgchange -an) MUST run before dmsetup remove. Removing a device-mapper node
 // while LVM still holds the LV open fails ("device busy"), so the node survives
 // and the next install's `lvcreate <vg>/<lv>` collides with the orphaned
 // `<vg>-<lv>` mapper name and fails (exit 5). Deactivate first → the node is
 // unheld → dmsetup remove succeeds (retried after a settle for the udev tick).
-func (c *Cleaner) teardownVG(ctx context.Context, vgName string, protected map[string]struct{}) error {
+func (c *Cleaner) teardownVG(ctx context.Context, vgName string, selected, protected map[string]struct{}) error {
 	if vgName == "" {
 		return nil
 	}
@@ -128,17 +138,30 @@ func (c *Cleaner) teardownVG(ctx context.Context, vgName string, protected map[s
 	if hasLVM && len(protected) > 0 {
 		for _, pv := range c.pvsForVG(ctx, vgName) {
 			if PartitionOnSelectedDisk(pv, protected) {
-				return fmt.Errorf(
+				return protectedf(
 					"cleanup: VG %q has physical volume %s on a persistent set's disk — refusing teardown (protected-disk barrier)",
 					vgName, pv)
 			}
 		}
 	}
 
+	var own, foreign []vgselect.VG
+	if hasLVM {
+		loc, err := vgselect.Locate(ctx, c.o.Runner, vgName, diskPaths(selected))
+		if err != nil {
+			c.warn("cleanup: cannot tell which VG %q belongs to this set (%v): no VG is removed by name; the selected-disk sweep still removes VGs on these disks", vgName, err)
+		}
+		own, foreign = loc.Own, loc.Foreign
+		for _, v := range foreign {
+			c.warn("cleanup: VG %q (uuid %s, PVs %v) is not on this set's disks -- left alone", v.Name, v.UUID, v.PVs)
+		}
+	}
+	mappers := func() []string { return c.ownMappers(ctx, vgName, foreign) }
+
 	// 1. Force-unmount anything still mounted from this VG's LV mapper paths so
 	//    the LVs can be deactivated.
 	if hasDM {
-		for _, mapper := range c.dmsetupMappersForVG(ctx, vgName) {
+		for _, mapper := range mappers() {
 			if mt := c.findmntTargetForSource(ctx, "/dev/mapper/"+mapper); mt != "" {
 				_ = c.forceUnmountTarget(ctx, mt)
 			}
@@ -147,79 +170,91 @@ func (c *Cleaner) teardownVG(ctx context.Context, vgName string, protected map[s
 
 	// 2. Deactivate + remove via LVM FIRST (see the order note above).
 	if hasLVM {
-		c.purgeVGsByName(ctx, vgName)
+		c.purgeVGs(ctx, own)
 	}
 
 	// 3. Remove leftover device-mapper nodes (now unheld), retrying after a
 	//    settle since a just-removed node can linger a udev tick.
 	if hasDM {
-		c.removeDMMappersForVG(ctx, vgName)
+		c.removeDMMappers(ctx, mappers())
 		c.runBest(ctx, "udevadm", "settle")
-		c.removeDMMappersForVG(ctx, vgName)
+		c.removeDMMappers(ctx, mappers())
 	}
 
-	c.runBest(ctx, "rm", "-rf", filepath.Join(c.o.DevDir, vgName))
+	// /dev/<vg> also holds a foreign same-named VG's links when it is active.
+	if len(foreign) == 0 {
+		c.runBest(ctx, "rm", "-rf", filepath.Join(c.o.DevDir, vgName))
+	}
 	c.runBest(ctx, "udevadm", "settle")
 	return nil
 }
 
-// purgeVGsByName deactivates and removes the volume group(s) named vgName.
-// The common single-VG case removes it by name (the simple, well-understood
-// shape). It THEN removes any duplicate-named VG by UUID — two VGs can share a
-// name (e.g. a stale "os" left on disks outside the current layout), and
+// diskPaths renders a selected-disk basename set as /dev paths.
+func diskPaths(selected map[string]struct{}) []string {
+	out := make([]string, 0, len(selected))
+	for _, k := range selectedKeys(selected, true) {
+		out = append(out, "/dev/"+k)
+	}
+	return out
+}
+
+// purgeVGs deactivates and removes each VG by UUID (a name may be shared with
+// a foreign VG, and `vgremove <name>` refuses an ambiguous name), then scrubs
+// its PVs so a later pvcreate/vgcreate is not blocked.
+//
 // All teardown LVM commands run --noudevsync: udev-cookie synchronisation
 // deadlocks FOREVER when the initramfs lacks the dm udev rules that ack the
 // cookie (ubuntu26/resolute shipped none -- `vgchange -an` hung the whole
 // battery, 2026-07-17). The CREATE path has been --noudevsync universally
 // since 92dc96e for the same disease; the teardown path was missed then.
-//
-// `vgremove <name>` refuses to act on an ambiguous name, so the stale one would
-// otherwise survive and make the next `vgcreate <name>` / `lvcreate` conflict.
-func (c *Cleaner) purgeVGsByName(ctx context.Context, vgName string) {
-	if c.vgExists(ctx, vgName) {
-		c.runBest(ctx, "vgchange", "--noudevsync", "-an", vgName)
-		for _, lv := range c.lvsPaths(ctx, vgName) {
-			c.runBest(ctx, "lvremove", "--noudevsync", "-fy", lv)
+func (c *Cleaner) purgeVGs(ctx context.Context, vgs []vgselect.VG) {
+	for _, v := range vgs {
+		c.log("cleanup: removing VG %s (uuid %s)", v.Name, v.UUID)
+		c.runBest(ctx, "vgchange", "--noudevsync", "-an", "--select", v.Select())
+		c.runBest(ctx, "vgremove", "--noudevsync", "-fy", "--select", v.Select())
+		for _, pv := range v.PVs {
+			c.runBest(ctx, "pvremove", "-ff", "-y", pv)
 		}
-		c.runBest(ctx, "vgremove", "--noudevsync", "-fy", vgName)
-	}
-	// Duplicate-named groups (same name, different UUID) survive the by-name
-	// vgremove; remove each by UUID.
-	for _, uuid := range c.vgUUIDsForName(ctx, vgName) {
-		sel := "vg_uuid=" + uuid
-		c.runBest(ctx, "vgchange", "--noudevsync", "-an", "--select", sel)
-		c.runBest(ctx, "vgremove", "--noudevsync", "-fy", "--select", sel)
-	}
-	// Scrub any PVs that still claim the name so a later vgcreate is not blocked.
-	for _, pv := range c.pvsForVG(ctx, vgName) {
-		c.runBest(ctx, "pvremove", "-ff", "-y", pv)
 	}
 }
 
-// removeDMMappersForVG force-removes every device-mapper node belonging to the
-// VG (names "<vg>-..."), with --retry so a transiently-open node is still
-// cleared rather than left to block the next lvcreate.
-func (c *Cleaner) removeDMMappersForVG(ctx context.Context, vgName string) {
-	for _, mapper := range c.dmsetupMappersForVG(ctx, vgName) {
-		c.runBest(ctx, "dmsetup", "remove", "--retry", "-f", mapper)
-	}
-}
-
-// vgUUIDsForName returns the UUIDs of every VG with the given name (usually one;
-// more than one means duplicate-named VGs that need removal by UUID).
-func (c *Cleaner) vgUUIDsForName(ctx context.Context, vgName string) []string {
-	res, ok := c.runOK(ctx, "vgs", "--noheadings", "-o", "vg_uuid,vg_name")
-	if !ok {
-		return nil
+// ownMappers returns the VG's device-mapper names, minus those of a foreign
+// same-named VG (told apart by the dm uuid, "LVM-<vg uuid>..."). A mapping
+// whose uuid cannot be read while a foreign VG exists is skipped too: when in
+// doubt, leave it.
+func (c *Cleaner) ownMappers(ctx context.Context, vgName string, foreign []vgselect.VG) []string {
+	names := c.dmsetupMappersForVG(ctx, vgName)
+	if len(foreign) == 0 {
+		return names
 	}
 	var out []string
-	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == vgName {
-			out = append(out, fields[0])
+	for _, m := range names {
+		res, ok := c.runOK(ctx, "dmsetup", "info", "-c", "--noheadings", "-o", "uuid", m)
+		if !ok {
+			continue
+		}
+		uuid := strings.TrimSpace(string(res.Stdout))
+		isForeign := false
+		for _, v := range foreign {
+			if strings.HasPrefix(uuid, v.DMUUIDPrefix()) {
+				isForeign = true
+				break
+			}
+		}
+		if !isForeign {
+			out = append(out, m)
 		}
 	}
 	return out
+}
+
+// removeDMMappers force-removes the given device-mapper nodes, with --retry so
+// a transiently-open node is still cleared rather than left to block the next
+// lvcreate.
+func (c *Cleaner) removeDMMappers(ctx context.Context, mappers []string) {
+	for _, mapper := range mappers {
+		c.runBest(ctx, "dmsetup", "remove", "--retry", "-f", mapper)
+	}
 }
 
 // teardownSameDiskVGs is _cleanup_lvm_on_selected_disks. For every PV in
@@ -236,7 +271,7 @@ func (c *Cleaner) vgUUIDsForName(ctx context.Context, vgName string) []string {
 // be removed at all — removing it would destroy the persistent data on the
 // non-selected members. That state is a config/operator conflict; refuse
 // (hard error → install halts for review).
-func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected map[string]struct{}) error {
+func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected map[string]struct{}, erasesPast func(error) bool) error {
 	if len(selected) == 0 {
 		return nil
 	}
@@ -245,7 +280,14 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 	}
 
 	toRemove := map[string]struct{}{}
-	allPVs := c.allPVs(ctx)
+	allPVs, err := c.allPVs(ctx)
+	if err != nil && erasesPast != nil && erasesPast(err) {
+		c.warn("cleanup: cannot list the physical volumes (%v); no VG is removed before the erase", err)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("cleanup: cannot list the physical volumes to tear down the selected disks' VGs; the selected disks were not wiped, but the set's own volume group (if any) was already removed: %w", err)
+	}
 	for pvPath, vg := range allPVs {
 		if vg == "" {
 			continue
@@ -283,7 +325,7 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 				continue
 			}
 			if PartitionOnSelectedDisk(pvPath, protected) {
-				return fmt.Errorf(
+				return protectedf(
 					"cleanup: VG %q spans a selected disk and persistent-set PV %s — refusing to remove it (protected-disk barrier); resolve the disk layout conflict first",
 					vg, pvPath)
 			}
@@ -295,7 +337,7 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 				}
 				for _, m := range members {
 					if PartitionOnSelectedDisk(m, protected) {
-						return fmt.Errorf(
+						return protectedf(
 							"cleanup: VG %q has md PV %s with member %s on a persistent set's disk — refusing to remove it (protected-disk barrier)",
 							vg, pvPath, m)
 					}
@@ -328,25 +370,57 @@ func (c *Cleaner) teardownSameDiskVGs(ctx context.Context, selected, protected m
 
 // --- LVM helpers ----------------------------------------------------------
 
-// dmsetupMappersForVG returns the mapper names whose names start with
-// "<vg>-" (the device-mapper naming convention LVM uses for LVs).
+// dmsetupMappersForVG returns the device-mapper names of the VG's LVs. LVM
+// names a mapping "<vg>-<lv>" with every '-' INSIDE either name doubled, so
+// the VG ends at the first single '-' (splitDMName). A prefix test on
+// vg+"-" got both directions wrong: tearing down VG "data" also matched
+// "data--2-root" (VG "data-2", possibly a persistent set's), and a VG with a
+// hyphen ("my-vg" -> "my--vg-lv") never matched its own mappers.
 func (c *Cleaner) dmsetupMappersForVG(ctx context.Context, vgName string) []string {
 	res, ok := c.runOK(ctx, "dmsetup", "ls")
 	if !ok {
 		return nil
 	}
-	prefix := vgName + "-"
 	var names []string
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) == 0 {
 			continue
 		}
-		if strings.HasPrefix(fields[0], prefix) {
+		if vg, _, ok := splitDMName(fields[0]); ok && vg == vgName {
 			names = append(names, fields[0])
 		}
 	}
 	return names
+}
+
+// splitDMName splits an LVM device-mapper name into its VG and LV names,
+// undoing the escaping: the separator is the first '-' that is not part of a
+// "--" pair, and "--" inside either part stands for one '-'.
+//
+//	"data-root"     -> "data",   "root"
+//	"data--2-root"  -> "data-2", "root"
+//	"my----vg-lv"   -> "my--vg", "lv"
+//	"os-swap--a"    -> "os",     "swap-a"
+//
+// ok is false for a name with no single '-' (not an LVM mapping, e.g.
+// "mpatha").
+func splitDMName(name string) (vg, lv string, ok bool) {
+	for i := 0; i < len(name); i++ {
+		if name[i] != '-' {
+			continue
+		}
+		if i+1 < len(name) && name[i+1] == '-' {
+			i++ // an escaped '-' inside the VG name
+			continue
+		}
+		if i == 0 || i == len(name)-1 {
+			return "", "", false
+		}
+		unesc := func(s string) string { return strings.ReplaceAll(s, "--", "-") }
+		return unesc(name[:i]), unesc(name[i+1:]), true
+	}
+	return "", "", false
 }
 
 // findmntTargetForSource returns the mount target for a given device
@@ -356,12 +430,7 @@ func (c *Cleaner) findmntTargetForSource(ctx context.Context, source string) str
 	if !ok {
 		return ""
 	}
-	return strings.TrimSpace(string(res.Stdout))
-}
-
-func (c *Cleaner) vgExists(ctx context.Context, vgName string) bool {
-	_, ok := c.runOK(ctx, "vgs", vgName)
-	return ok
+	return mount.UnescapeFindmnt(strings.TrimSpace(string(res.Stdout)))
 }
 
 // lvsPaths returns the absolute LV paths for a VG.
@@ -403,10 +472,13 @@ func (c *Cleaner) pvsForVG(ctx context.Context, vgName string) []string {
 // allPVs returns a pv_name → vg_name map for every PV the system knows.
 // Empty vg_name values are passed through so callers can distinguish
 // orphaned PVs from missing-VG entries.
-func (c *Cleaner) allPVs(ctx context.Context) map[string]string {
-	res, ok := c.runOK(ctx, "pvs", "--noheadings", "-o", "pv_name,vg_name")
-	if !ok {
-		return nil
+func (c *Cleaner) allPVs(ctx context.Context) (map[string]string, error) {
+	res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
+		Path: "pvs", Args: []string{"--noheadings", "-o", "pv_name,vg_name"},
+		CaptureStdout: true, CaptureStderr: true,
+	})
+	if err != nil {
+		return nil, err
 	}
 	out := map[string]string{}
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
@@ -421,5 +493,5 @@ func (c *Cleaner) allPVs(ctx context.Context) map[string]string {
 		}
 		out[pv] = vg
 	}
-	return out
+	return out, nil
 }

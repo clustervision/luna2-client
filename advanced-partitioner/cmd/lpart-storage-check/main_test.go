@@ -6,6 +6,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
 )
 
 // validConfig is a minimal valid v1.4 disklayout used by the guard tests.
@@ -94,8 +96,8 @@ func TestRefusesWithoutLunaMarker(t *testing.T) {
 		"--skip-command-check",
 		"--config", cfg,
 	}, &outBuf, &errBuf)
-	if rc == 0 {
-		t.Fatalf("expected refusal; stderr=%s", errBuf.String())
+	if rc != 1 { // the same exit as every lpart tool's installer-env guard
+		t.Fatalf("expected refusal with exit 1, got %d; stderr=%s", rc, errBuf.String())
 	}
 	if !strings.Contains(errBuf.String(), "root=luna") {
 		t.Fatalf("wording wrong: %s", errBuf.String())
@@ -126,7 +128,7 @@ func TestMemoryProviderInConfigRejected(t *testing.T) {
 	}
 }
 
-// storage-check refuses --dry-run outright: its probes are already read-only,
+// storage-check refuses --dry-run outright: stubbing its probes would fabricate a verdict,
 // and a dry-run would stub them all to rc 0, fabricating health verdicts from
 // evidence never gathered -- a false report an operator may act on.
 // FTA v2 BE-F7 (TE-D), barrier NB-8.
@@ -142,5 +144,126 @@ func TestDryRunRefused(t *testing.T) {
 	stderr, rc = runEnv(t, "--dry-run", "--config", "/nonexistent.json")
 	if rc == 0 || !strings.Contains(stderr, "not supported") {
 		t.Fatalf("refusal must fire before config handling: rc=%d %s", rc, stderr)
+	}
+}
+
+// discoverConfig is a v1.4 disklayout whose os set picks its disks from the
+// pool: the config names no devices, storage-prepare resolves them.
+const discoverConfig = `{
+	"version": 2,
+	"sets": [
+		{"name": "os", "role": "os", "selection": "discover", "raid": "1",
+		 "volumes": [
+		   {"name": "uefi", "mountpoint": "/boot/efi", "fs": "vfat", "provider": "partition", "size": "600M"},
+		   {"name": "root", "mountpoint": "/", "fs": "xfs", "provider": "lvm", "size": "100%"}
+		 ]}
+	]
+}`
+
+// storage-resolved.json as lpart-storage-prepare writes it (result.WriteResolved).
+const resolvedJSON = `{
+  "version": 2,
+  "sets": [
+    {"name": "os", "role": "os", "firmware_mode": "uefi", "selector_type": "device_paths",
+     "storage_type": "disk", "raid_mode": "raid1",
+     "selected_disks": [
+       {"configured_path": "/dev/vdb", "resolved_path": "/dev/vdb", "selector_type": "device_paths", "size_bytes": 1, "model": "", "serial": ""},
+       {"configured_path": "/dev/vda", "resolved_path": "/dev/vda", "selector_type": "device_paths", "size_bytes": 1, "model": "", "serial": ""}
+     ]}
+  ]
+}`
+
+func loadConfig(t *testing.T, body string) *v2.Config {
+	t.Helper()
+	cfg, raw, err := v2.LoadFile(writeConfig(t, body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cfg.ValidateRaw(raw); err != nil {
+		t.Fatalf("fixture must validate: %v", err)
+	}
+	return cfg
+}
+
+// install_mode=local on a selection=discover layout: storage-check must check
+// the disks storage-prepare selected (from storage-resolved.json), in its
+// order, instead of an empty device list ("set has no resolved devices" ->
+// exit 2 -> the node parked on every boot).
+func TestApplyResolvedFillsDiscoverSets(t *testing.T) {
+	cfg := loadConfig(t, discoverConfig)
+	resolved := writeConfig(t, resolvedJSON)
+	if err := applyResolved(cfg, resolved); err != nil {
+		t.Fatalf("applyResolved: %v", err)
+	}
+	if got := strings.Join(cfg.Sets[0].EffectiveDevices(), ","); got != "/dev/vdb,/dev/vda" {
+		t.Fatalf("devices = %q, want storage-prepare's selection in its order", got)
+	}
+	// A manual layout needs no resolved file.
+	if err := applyResolved(loadConfig(t, validConfig), ""); err != nil {
+		t.Fatalf("manual set: %v", err)
+	}
+}
+
+func TestApplyResolvedRefusesWithoutTheDisks(t *testing.T) {
+	if err := applyResolved(loadConfig(t, discoverConfig), ""); err == nil || !strings.Contains(err.Error(), "--resolved") {
+		t.Fatalf("a discover set without --resolved must be refused, got %v", err)
+	}
+	other := writeConfig(t, strings.ReplaceAll(resolvedJSON, `"name": "os"`, `"name": "data"`))
+	if err := applyResolved(loadConfig(t, discoverConfig), other); err == nil || !strings.Contains(err.Error(), "not in") {
+		t.Fatalf("a set missing from the resolved file must be refused, got %v", err)
+	}
+	if err := applyResolved(loadConfig(t, discoverConfig), "/no/such/storage-resolved.json"); err == nil {
+		t.Fatal("an unreadable resolved file must be refused")
+	}
+}
+
+// The refusal is deterministic, so it is a fatal config error (exit 3), not
+// a retry every 30 s.
+func TestDiscoverWithoutResolvedIsFatal(t *testing.T) {
+	stderr, rc := runEnv(t, "--config", writeConfig(t, discoverConfig),
+		"--install-context", writeConfig(t, `{"install_mode":"local"}`))
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=resolved-devices") {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+}
+
+// Deterministic failures exit 3 (park), not 1 (retry every 30 s for ever).
+func TestDeterministicFailuresAreFatal(t *testing.T) {
+	ic := writeConfig(t, `{"install_mode":"local"}`)
+	cases := []struct {
+		name   string
+		args   []string
+		marker string
+	}{
+		{"no config", []string{"--install-context", ic}, "fatal_config=config-missing"},
+		{"config not found", []string{"--install-context", ic, "--config", "/no/such/file.json"}, "fatal_config=config-missing"},
+		{"unparsable config", []string{"--install-context", ic, "--config", writeConfig(t, "{not json")}, "fatal_config=config-load"},
+		{"invalid config", []string{"--install-context", ic, "--config", writeConfig(t, strings.ReplaceAll(validConfig, `"raid": "none"`, `"raid": "7"`))}, "fatal_config=config-validation"},
+		{"dry-run", []string{"--dry-run"}, "fatal_config=dry-run"},
+		{"bad flag", []string{"--no-such-flag"}, ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			stderr, rc := runEnv(t, c.args...)
+			if rc != 3 || !strings.Contains(stderr, c.marker) {
+				t.Fatalf("rc=%d (want 3), stderr=%s", rc, stderr)
+			}
+		})
+	}
+}
+
+// A fsck tool missing from the install initramfs is missing on every retry.
+func TestMissingFsckToolIsFatal(t *testing.T) {
+	tmp := t.TempDir()
+	cmdline := filepath.Join(tmp, "cmdline")
+	if err := os.WriteFile(cmdline, []byte("root=luna rw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir()) // nothing to find
+	var outBuf, errBuf bytes.Buffer
+	rc := run([]string{"lpart-storage-check", "--log-dir", filepath.Join(tmp, "logs"), "--cmdline-path", cmdline,
+		"--install-context", writeConfig(t, `{"install_mode":"local"}`), "--config", writeConfig(t, validConfig)}, &outBuf, &errBuf)
+	if rc != 3 || !strings.Contains(errBuf.String(), "fatal_config=missing-command") {
+		t.Fatalf("rc=%d (want 3), stderr=%s", rc, errBuf.String())
 	}
 }

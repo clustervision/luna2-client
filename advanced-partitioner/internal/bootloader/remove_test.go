@@ -173,3 +173,175 @@ func TestRemoveExistingBootloaderSkipsNVRAMWithoutEfivars(t *testing.T) {
 		t.Errorf("the NVRAM skip must be loud:\n%s", body)
 	}
 }
+
+// mkMBRDisk writes a disk image whose first sector carries boot code with
+// GRUB's boot.img marker, a disk signature, a partition table and the 0x55AA
+// signature, and an EF02 partition image that starts like GRUB's core.img.
+// Returns both paths and the original first sector.
+func mkMBRDisk(t *testing.T) (disk, part string, sector0 []byte) {
+	t.Helper()
+	dir := t.TempDir()
+	img := make([]byte, 64<<10)
+	for i := 0; i < mbrBootCodeLen; i++ {
+		img[i] = byte(0xEB + i)
+	}
+	copy(img[0x180:], grubBootImgMark+"Hard Disk")
+	copy(img[440:446], []byte{0xDE, 0xAD, 0xBE, 0xEF, 0, 0})
+	for i := 446; i < 510; i++ {
+		img[i] = byte(i)
+	}
+	img[510], img[511] = 0x55, 0xAA
+	disk = filepath.Join(dir, "disk.img")
+	if err := os.WriteFile(disk, img, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	part = filepath.Join(dir, "disk.img-part1")
+	core := make([]byte, 1<<20)
+	copy(core[0x117:], grubCoreImgMark+"Geom\x00Read")
+	if err := os.WriteFile(part, core, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return disk, part, append([]byte(nil), img[:512]...)
+}
+
+func biosLsblk(disk, part string) *executor.FakeRunner {
+	return lsblkRunner(`NAME="`+disk+`" TYPE="disk" PARTTYPE="" PKNAME="" MOUNTPOINT=""
+NAME="`+part+`" TYPE="part" PARTTYPE="21686148-6449-6e6f-744e-656564454649" PKNAME="`+disk+`" MOUNTPOINT=""
+`, executor.FakeResponse{})
+}
+
+// Review finding 6: "none" on BIOS after an earlier "first" must take
+// GRUB out of the MBR and the BIOS boot partition, leaving the partition table
+// and disk signature exactly as they were.
+func TestRemoveBIOSBootloaderClearsMBRAndCoreImage(t *testing.T) {
+	disk, part, before := mkMBRDisk(t)
+	opts := RemoveBIOSBootloaderOptions{Runner: biosLsblk(disk, part), BootDevices: []string{disk}}
+	if err := RemoveBIOSBootloader(context.Background(), opts); err != nil {
+		t.Fatalf("RemoveBIOSBootloader: %v", err)
+	}
+	after := readFile(t, disk)
+	if !allZero([]byte(after[:mbrBootCodeLen])) {
+		t.Error("MBR boot code not cleared")
+	}
+	if after[mbrBootCodeLen:512] != string(before[mbrBootCodeLen:512]) {
+		t.Error("disk signature / partition table / 0x55AA changed")
+	}
+	if !allZero([]byte(readFile(t, part))) {
+		t.Error("BIOS boot partition not wiped")
+	}
+	// idempotent: a second run finds nothing to do
+	if err := RemoveBIOSBootloader(context.Background(), opts); err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+}
+
+func TestRemoveBIOSBootloaderDryRunWritesNothing(t *testing.T) {
+	disk, part, before := mkMBRDisk(t)
+	opts := RemoveBIOSBootloaderOptions{Runner: biosLsblk(disk, part), FS: fsops.FS{DryRun: true}, BootDevices: []string{disk}}
+	if err := RemoveBIOSBootloader(context.Background(), opts); err != nil {
+		t.Fatalf("RemoveBIOSBootloader: %v", err)
+	}
+	if got := readFile(t, disk); got[:512] != string(before) {
+		t.Error("dry-run changed the first sector")
+	}
+	if !strings.Contains(readFile(t, part), grubCoreImgMark) {
+		t.Error("dry-run wiped the BIOS boot partition")
+	}
+}
+
+// Boot code that is not GRUB's (another boot manager, a vendor tool) or a GRUB
+// without its core image where lpart puts it is not ours to remove: warned
+// about and left, MBR and BIOS boot partition alike.
+func TestRemoveBIOSBootloaderLeavesWhatIsNotGRUB(t *testing.T) {
+	cases := map[string]func(t *testing.T, disk, part string) *executor.FakeRunner{
+		"foreign MBR boot code": func(t *testing.T, disk, part string) *executor.FakeRunner {
+			b := []byte(readFile(t, disk))
+			copy(b[0x180:], "LILO boot code..")
+			mustWriteFile(t, disk, string(b))
+			return biosLsblk(disk, part)
+		},
+		"no core image in the BIOS boot partition": func(t *testing.T, disk, part string) *executor.FakeRunner {
+			mustWriteFile(t, part, strings.Repeat("x", 4096))
+			return biosLsblk(disk, part)
+		},
+		"blank MBR, foreign BIOS boot partition": func(t *testing.T, disk, part string) *executor.FakeRunner {
+			b := []byte(readFile(t, disk))
+			copy(b, make([]byte, mbrBootCodeLen))
+			mustWriteFile(t, disk, string(b))
+			mustWriteFile(t, part, strings.Repeat("x", 4096))
+			return biosLsblk(disk, part)
+		},
+		"no BIOS boot partition": func(t *testing.T, disk, part string) *executor.FakeRunner {
+			return lsblkRunner(`NAME="`+disk+`" TYPE="disk" PARTTYPE="" PKNAME="" MOUNTPOINT=""`+"\n", executor.FakeResponse{})
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			disk, part, _ := mkMBRDisk(t)
+			f := setup(t, disk, part)
+			beforeDisk, beforePart := readFile(t, disk), readFile(t, part)
+			ro, logPath := removeOpts(t, t.TempDir(), f)
+			opts := RemoveBIOSBootloaderOptions{Runner: f, Logger: ro.Logger, BootDevices: []string{disk}}
+			if err := RemoveBIOSBootloader(context.Background(), opts); err != nil {
+				t.Fatalf("RemoveBIOSBootloader: %v", err)
+			}
+			if readFile(t, disk) != beforeDisk || readFile(t, part) != beforePart {
+				t.Error("boot code that is not a GRUB install was modified")
+			}
+			if log := readFile(t, logPath); !strings.Contains(log, "level=WARN") || !strings.Contains(log, "left as it is") {
+				t.Errorf("leaving it must be a warning:\n%s", log)
+			}
+		})
+	}
+}
+
+// A first sector without the MBR signature is not an MBR (BIOS would not boot
+// it either) and must not be touched: it may be filesystem or PV data.
+func TestRemoveBIOSBootloaderLeavesNonMBRAlone(t *testing.T) {
+	disk, _, _ := mkMBRDisk(t)
+	body := []byte(readFile(t, disk))
+	body[510], body[511] = 0, 0
+	if err := os.WriteFile(disk, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f := lsblkRunner("", executor.FakeResponse{})
+	if err := RemoveBIOSBootloader(context.Background(), RemoveBIOSBootloaderOptions{Runner: f, BootDevices: []string{disk}}); err != nil {
+		t.Fatal(err)
+	}
+	if readFile(t, disk) != string(body) {
+		t.Error("a non-MBR first sector was modified")
+	}
+}
+
+// A boot device that is a partition (or md/dm device) is refused: its first
+// sector is filesystem data, e.g. the XFS superblock.
+func TestRemoveBIOSBootloaderRefusesPartitionDevice(t *testing.T) {
+	// Any block device node will do: only its stat is used, the refusal
+	// comes before the (read-only) open.
+	var dev string
+	if ents, err := os.ReadDir("/dev"); err == nil {
+		for _, e := range ents {
+			fi, err := os.Stat(filepath.Join("/dev", e.Name()))
+			if err == nil && fi.Mode()&os.ModeDevice != 0 && fi.Mode()&os.ModeCharDevice == 0 {
+				dev = filepath.Join("/dev", e.Name())
+				break
+			}
+		}
+	}
+	if dev == "" {
+		t.Skip("no block device node to stat")
+	}
+	real, err := filepath.EvalSymlinks(dev)
+	if err != nil {
+		t.Skip(err)
+	}
+	sys := t.TempDir()
+	mustWriteFile(t, filepath.Join(sys, filepath.Base(real), "partition"), "1\n")
+	prev := sysClassBlock
+	sysClassBlock = sys
+	t.Cleanup(func() { sysClassBlock = prev })
+	_, err = openRawTarget(dev, true, false)
+	if fe, ok := AsFatal(err); !ok || fe.Reason != "not-a-disk" {
+		t.Fatalf("%s: want a not-a-disk refusal, got %v", dev, err)
+	}
+}

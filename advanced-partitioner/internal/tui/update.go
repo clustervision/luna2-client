@@ -100,10 +100,9 @@ func (m Model) handleKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.ClearScreen
 
 	case keyMatch(msg, m.keys.Shell):
-		// Hand off to /bin/bash. The install keeps running in the background
-		// (the installer is a separate process); the dashboard redraws on
-		// return. Type 'exit' to come back.
-		m.appendSystemLine("shell: install continues in the background; type 'exit' to return")
+		// Hand off to /bin/bash; the dashboard redraws on return. Nothing reads
+		// the step output meanwhile, so a chatty step blocks once the buffers fill.
+		m.appendSystemLine("shell: the install may pause while the shell is open; type 'exit' to return")
 		return m, tea.Sequence(
 			tea.ExecProcess(execBash(), func(err error) tea.Msg {
 				return shellResumeMsg{}
@@ -224,8 +223,9 @@ func (m *Model) applyEvent(ev engine.InstallerEvent) {
 
 // FailureExitCode maps the failure class carried on EvInstallerFailed.Data
 // (any type exposing Fatal() bool — pipeline.FailureClass does) to the
-// process exit code: fatal/safety-refusal failures exit 3 — the code
-// luna2-start.sh PARKS on — everything else exits 1 (retry). FTA Cluster B
+// renderer's exit code: 3 for fatal and safety refusal alike, 1 otherwise.
+// It is not the process exit: lpart-node-installer's phaseExit decides that
+// from the pipeline result and keeps 2 for a safety refusal. FTA Cluster B
 // (B1): the class used to be flattened to a hardcoded 1 here.
 func FailureExitCode(data any) int {
 	type classed interface{ Fatal() bool }

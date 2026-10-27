@@ -3,6 +3,7 @@ package osimage
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -131,6 +132,110 @@ func TestPatternsBase(t *testing.T) {
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("[%d] %q != %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestNormalizeFilterPath(t *testing.T) {
+	for in, want := range map[string]string{
+		"/var/log":              "var/log",
+		"var/log":               "var/log",
+		"./var/log/":            "var/log/",
+		"//var//log/***":        "var/log/***",
+		" /etc/ssh/ssh_host_* ": "etc/ssh/ssh_host_*",
+		"/":                     "",
+		"":                      "",
+		".":                     "",
+		"/var/../etc":           "",
+		"../outside":            "",
+	} {
+		if got := NormalizeFilterPath(in); got != want {
+			t.Errorf("NormalizeFilterPath(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// An absolute preserve path must protect its data exactly like the relative
+// form (lab: preserve ["/keeptop", "/var/log/keepdir"] was deleted, the same
+// paths without "/" were kept).
+func TestAbsolutePreservePathIsNeeded(t *testing.T) {
+	paths, dropped := NormalizeFilterPaths([]string{"/keeptop", "/var/log/keepdir", "/"})
+	if len(dropped) != 1 || dropped[0] != "/" {
+		t.Fatalf("dropped = %v, want [/]", dropped)
+	}
+	pats := ParsePatterns(paths)
+	for _, rel := range []string{"keeptop", "keeptop/m", "var", "var/log", "var/log/keepdir", "var/log/keepdir/m"} {
+		if !IsNeededByPreserve(rel, pats, nil) {
+			t.Errorf("%s must be kept for preserve %v", rel, paths)
+		}
+	}
+	for _, rel := range []string{"root", "var/log/m2", "var/tmp"} {
+		if IsNeededByPreserve(rel, pats, nil) {
+			t.Errorf("%s must NOT be kept for preserve %v", rel, paths)
+		}
+	}
+	ex := BuildTarExcludes(pats, nil, nil)
+	for _, e := range ex {
+		if strings.Contains(e, ".//") {
+			t.Errorf("malformed tar exclude %q", e)
+		}
+	}
+}
+
+func TestResolveInSysroot(t *testing.T) {
+	root := t.TempDir()
+	must := func(err error) {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(os.MkdirAll(filepath.Join(root, "var/spool/mail"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "usr/lib/modules"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "data/home"), 0o755))
+	must(os.MkdirAll(filepath.Join(root, "etc/rc.d"), 0o755))
+	must(os.Symlink("spool/mail", filepath.Join(root, "var/mail")))
+	must(os.Symlink("usr/lib", filepath.Join(root, "lib")))
+	must(os.Symlink("/data/home", filepath.Join(root, "home")))
+	must(os.Symlink("rc.d/rc.local", filepath.Join(root, "etc/rc.local")))
+	for in, want := range map[string]string{
+		"var/mail":            "var/spool/mail",
+		"var/mail/***":        "var/spool/mail/***",
+		"lib/modules/*/extra": "usr/lib/modules/*/extra",
+		"home/alice":          "data/home/alice",
+		"etc/rc.local":        "etc/rc.d/rc.local",
+		"etc/ssh/ssh_host_*":  "etc/ssh/ssh_host_*",
+		"nonexistent/a/b":     "nonexistent/a/b",
+	} {
+		if got := ResolveInSysroot(root, in); got != want {
+			t.Errorf("ResolveInSysroot(%q) = %q, want %q", in, got, want)
+		}
+	}
+	got := ExpandFilterPaths(root, []string{"var/mail", "etc/hosts"})
+	if strings.Join(got, ",") != "var/mail,var/spool/mail,etc/hosts" {
+		t.Errorf("ExpandFilterPaths = %v", got)
+	}
+}
+
+func TestValidateFilterPaths(t *testing.T) {
+	ok := map[string][]string{
+		"preserve":       {"var/log", "etc/ssh/ssh_host_*", "home/*/.ssh", "var/log/***"},
+		"preserve_empty": {"scratch", "var/tmp"},
+		"image_wins":     {"etc/ssh/sshd_config", "etc/yum.repos.d/*.repo"},
+	}
+	for kind, ps := range ok {
+		if err := ValidateFilterPaths(kind, ps); err != nil {
+			t.Errorf("%s %v: unexpected %v", kind, ps, err)
+		}
+	}
+	bad := map[string][]string{
+		"preserve":       {"*", "***", "*/etc", "etc/[ab]", `etc\x`},
+		"preserve_empty": {"home/*/tmp"},
+	}
+	for kind, ps := range bad {
+		for _, p := range ps {
+			if err := ValidateFilterPaths(kind, []string{p}); err == nil {
+				t.Errorf("%s %q must be refused", kind, p)
+			}
 		}
 	}
 }

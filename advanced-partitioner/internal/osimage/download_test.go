@@ -1,6 +1,9 @@
 package osimage
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // ProvisionOrder must honour the daemon-resolved method/fallback rather than
 // freezing torrent-first. Empty => the historical torrent-then-http default.
@@ -46,6 +49,20 @@ func TestFileBaseFromLunaURL(t *testing.T) {
 	for _, c := range cases {
 		if got := FileBaseFromLunaURL(c.in); got != c.want {
 			t.Fatalf("FileBaseFromLunaURL(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestProvisionOrderAlwaysEndsWithHTTP(t *testing.T) {
+	for in, want := range map[[2]string]string{
+		{"torrent", ""}:      "torrent,http",
+		{"", ""}:             "torrent,http",
+		{"http", ""}:         "http",
+		{"torrent", "http"}:  "torrent,http",
+		{"https", "torrent"}: "https,torrent",
+	} {
+		if got := strings.Join(ProvisionOrder(in[0], in[1]), ","); got != want {
+			t.Errorf("ProvisionOrder(%q,%q) = %s, want %s", in[0], in[1], got, want)
 		}
 	}
 }

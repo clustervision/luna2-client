@@ -160,6 +160,12 @@ func Assemble(in AssembleInput) StorageResult {
 	if in.FirmwareMode != "uefi" && in.Set.Bootloader != v2.BootloaderFirst {
 		bootMethod = "none"
 	}
+	// On BIOS "none" and "last" both install nothing; finalise tells them apart
+	// here: "none" takes an earlier GRUB away, "last" keeps it behind PXE.
+	bootOrder := in.Set.BootOrderOrLast()
+	if in.Set.Bootloader == v2.BootloaderNone {
+		bootOrder = string(v2.BootloaderNone)
+	}
 	res := StorageResult{
 		Version:           v2.SchemaVersion,
 		Name:              in.Set.Name,
@@ -168,12 +174,12 @@ func Assemble(in AssembleInput) StorageResult {
 		SelectedDisks:     in.Selected,
 		StorageType:       string(in.Set.StorageType()),
 		BootMethod:        bootMethod,
-		BootOrder:         in.Set.BootOrderOrLast(),
+		BootOrder:         bootOrder,
 		BootFirmware:      "uefi",
 		RegisterNVRAM:     "auto",
 		ClearUEFINVRAM:    in.Set.ClearUEFINVRAM(),
 		RAIDMode:          in.Set.RAIDMode(),
-		MountedTargetRoot: nonEmpty(in.Mount.MountedTargetRoot, mount.DefaultSysroot),
+		MountedTargetRoot: nonEmpty(in.Mount.MountedTargetRoot, mount.EffectiveSysroot()),
 		FirstInstall:      in.FirstInstall,
 		Persistent:        in.Persistent,
 	}

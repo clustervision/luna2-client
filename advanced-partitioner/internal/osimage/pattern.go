@@ -11,7 +11,10 @@
 //	luna.go       LUNA_TOKEN + image-filename detection
 //	config.go     --config JSON shape
 //	download.go   aria2c (torrent) + curl (HTTP) download paths
-//	extract.go    PrepareSysroot + BuildTarExcludes + ExtractTarball
+//	extract.go    PrepareSysroot + BuildTarExcludes + Extract
+//	stream.go     StreamHTTPExtract: curl | tar in one pipe
+//	sync.go       SyncExtract: extract over an existing tree, then sweep
+//	verify.go     VerifyExtract: os-release and a populated tree
 //
 // Cross-platform notes:
 //   - tar -I lbzip2 --acls/--no-acls --numeric-owner is identical on
@@ -91,6 +94,15 @@ func (p Pattern) Match(rel string) bool {
 		return true
 	}
 	return false
+}
+
+// Reaches reports whether p can match dir or anything below it.
+func (p Pattern) Reaches(dir string) bool {
+	if p.Match(dir) || strings.HasPrefix(p.Base, dir+"/") {
+		return true
+	}
+	lit := literalPrefix(p.Raw)
+	return lit != "" && strings.HasPrefix(dir+"/", lit)
 }
 
 // globMatch implements bash-case style globbing. `?` matches one byte,

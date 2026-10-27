@@ -65,6 +65,24 @@ install() {
     inst_multiple -o dhclient dhclient-script-luna ipmitool nslookup dig wget \
                      mkfs.ext2 mkfs.ext3 mkdosfs top lspci lsscsi efibootmgr script
 
+    # Filesystem checkers for lpart's health probe (internal/fscheck), named
+    # here instead of relying on dracut's fsck module: without them
+    # lpart-storage-check refuses to run (sysenv.StorageCheckCommands) and the
+    # sync/auto probe in lpart-storage-prepare cannot judge a set. e2fsck and
+    # xfs_repair are required; the FAT checker is fsck.vfat or fsck.fat
+    # (either will do), fsck.ext4 is e2fsck's alias.
+    dracut_install e2fsck xfs_repair
+    inst_multiple -o fsck.ext4 fsck.fat fsck.vfat
+    # lpart's lvm builder creates LVs with --noudevsync and then makes the
+    # device nodes itself (vgmknodes, then dmsetup mknodes); dracut's lvm
+    # module does not ship vgmknodes (an lvm symlink).
+    inst_multiple -o vgmknodes
+    # the installer flushes with sync before it parks or reboots
+    dracut_install sync
+    if ! type -P fsck.fat >/dev/null 2>&1 && ! type -P fsck.vfat >/dev/null 2>&1; then
+        derror "95luna: neither fsck.fat nor fsck.vfat found (dosfstools): lpart-storage-check cannot run"
+    fi
+
     # TPM TCTI + sqlite are needed for the token; the NSS/softokn set is a
     # redhat NSS-curl concern -- pull whatever the platform actually ships.
     inst_libdir_file -o libtss2-tcti-device.so.0 libsqlite3.so \
@@ -119,9 +137,39 @@ install() {
     # Shared pre/part/post hook shim: exec /usr/bin/lpart-phase pre|part|post.
     inst_simple "$moddir/lpart-phase" /usr/bin/lpart-phase
 
+    # glibc gconv modules for fsck.fat/fsck.vfat. dosfstools converts FAT short
+    # names through iconv (codepage 437 by default); without gconv-modules and
+    # IBM437.so in the initramfs EVERY ESP check fails with "CP437: Invalid
+    # argument", so lpart judged every healthy UEFI os set broken (sync/local
+    # parked, auto wiped). The directory differs per family; install whichever
+    # exist (-o). IBM850 is mkfs.vfat's default label codepage.
+    for _gconv in /usr/lib64/gconv /usr/lib/gconv /usr/lib/x86_64-linux-gnu/gconv /usr/lib/aarch64-linux-gnu/gconv; do
+        [ -d "$_gconv" ] || continue
+        inst_multiple -o "$_gconv/gconv-modules" "$_gconv/gconv-modules.cache" \
+                         "$_gconv/IBM437.so" "$_gconv/IBM850.so"
+        for _gconf in "$_gconv"/gconv-modules.d/*.conf; do
+            [ -e "$_gconf" ] && inst_simple "$_gconf"
+        done
+    done
+
     # Shared installer body, sourced by luna2-start.sh (byte-identical across distros).
     inst_simple "$moddir/luna-installer.sh" /usr/share/luna/luna-installer.sh
 
     inst_hook cmdline 99 "$moddir/luna-parse-cmdline.sh"
     inst_hook initqueue/finished 99 "$moddir/luna2-start.sh"
+
+    # The installer runs inside dracut-initqueue.service on a systemd initramfs.
+    # systemd's default OOMPolicy=stop (v243+) stops that whole service as soon
+    # as the kernel OOM killer kills ANY of its processes -- in practice the
+    # decompressor of a memboot extract -- and the boot then goes on and
+    # switches root into the half-written /sysroot (Ubuntu 26.04 lab node, 11
+    # Oct 2026: a partly extracted RAM root booted with dbus and rsyslog
+    # failing). With continue the killed step fails like any other and the
+    # installer decides. systemd 239 (el8) ignores the unknown key.
+    mkdir -p "$initdir/etc/systemd/system/dracut-initqueue.service.d"
+    printf '[Service]\nOOMPolicy=continue\n' \
+        > "$initdir/etc/systemd/system/dracut-initqueue.service.d/luna-oom.conf"
+    # Last line of defence: never switch root into a /sysroot the installer
+    # did not finish (installer killed, or its service stopped).
+    inst_hook pre-pivot 00 "$moddir/luna-pivot-guard.sh"
 }

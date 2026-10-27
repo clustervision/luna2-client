@@ -8,6 +8,7 @@ package cleanup
 
 import (
 	"context"
+	"errors"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -39,6 +40,16 @@ func assertNoDestruction(t *testing.T, f *executor.FakeRunner) {
 	}
 }
 
+// assertProtected pins the refusal's TYPE: every barrier refusal must match
+// ErrProtected, which lpart-storage-prepare maps to the exit-2 safety refusal.
+// As a plain error it exited 1 and the node retried (re-cleaning) for ever.
+func assertProtected(t *testing.T, err error) {
+	t.Helper()
+	if !errors.Is(err, ErrProtected) {
+		t.Fatalf("barrier refusal must match cleanup.ErrProtected, got %T: %v", err, err)
+	}
+}
+
 func TestCleanupRefusesSelectedProtectedDisk(t *testing.T) {
 	f := executor.NewFakeRunner(executor.FakeResponse{})
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep})
@@ -53,6 +64,7 @@ func TestCleanupRefusesSelectedProtectedDisk(t *testing.T) {
 	if !strings.Contains(err.Error(), "protected-disk barrier") {
 		t.Fatalf("error should name the barrier: %v", err)
 	}
+	assertProtected(t, err)
 	if len(f.Calls()) != 0 {
 		t.Fatalf("refusal must run ZERO commands, ran: %v", f.Calls())
 	}
@@ -65,10 +77,11 @@ func TestTeardownVGRefusesVGOnProtectedDisk(t *testing.T) {
 	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "pv_name,vg_name"},
 		Response: executor.FakeResponse{Stdout: []byte("  /dev/sdb1 os\n")}})
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep})
-	err := c.teardownVG(context.Background(), "os", SelectedDisksSet([]string{"/dev/sdb"}))
+	err := c.teardownVG(context.Background(), "os", SelectedDisksSet([]string{"/dev/sda"}), SelectedDisksSet([]string{"/dev/sdb"}))
 	if err == nil {
 		t.Fatal("teardownVG must refuse a VG with a PV on a protected disk")
 	}
+	assertProtected(t, err)
 	assertNoDestruction(t, f)
 }
 
@@ -81,10 +94,11 @@ func TestTeardownSameDiskVGsRefusesSpanningVG(t *testing.T) {
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep})
 	err := c.teardownSameDiskVGs(context.Background(),
 		SelectedDisksSet([]string{"/dev/sda"}),
-		SelectedDisksSet([]string{"/dev/sdb"}))
+		SelectedDisksSet([]string{"/dev/sdb"}), nil)
 	if err == nil {
 		t.Fatal("spanning VG must refuse")
 	}
+	assertProtected(t, err)
 	assertNoDestruction(t, f)
 }
 
@@ -99,10 +113,11 @@ func TestTeardownSameDiskVGsRefusesSpanningMDVG(t *testing.T) {
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep, MDAdmDetail: md.detail})
 	err := c.teardownSameDiskVGs(context.Background(),
 		SelectedDisksSet([]string{"/dev/sda"}),
-		SelectedDisksSet([]string{"/dev/sdb"}))
+		SelectedDisksSet([]string{"/dev/sdb"}), nil)
 	if err == nil {
 		t.Fatal("md-backed spanning VG must refuse")
 	}
+	assertProtected(t, err)
 	assertNoDestruction(t, f)
 }
 
@@ -123,6 +138,7 @@ func TestStopMDArraysRefusesSpanningArray(t *testing.T) {
 	if err == nil {
 		t.Fatal("spanning md array must refuse")
 	}
+	assertProtected(t, err)
 	assertNoDestruction(t, f)
 }
 
@@ -156,6 +172,7 @@ func TestStopMDArraysRefusesDormantSpanningArray(t *testing.T) {
 	if !strings.Contains(err.Error(), "dormant") {
 		t.Fatalf("want the dormant-barrier error, got: %v", err)
 	}
+	assertProtected(t, err)
 	assertNoDestruction(t, f)
 }
 

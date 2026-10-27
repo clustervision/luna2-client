@@ -136,8 +136,10 @@ func (s *Set) MatchFilter() Match {
 	return *s.Match
 }
 
-// MemberCount returns the number of array members the set wants: len(devices)
-// for manual, or count (defaulted to the raid minimum) for discover.
+// MemberCount returns the number of disks the set wants: len(devices) for
+// manual (spares included), or the ACTIVE count (count, defaulted to the raid
+// minimum) for discover, whose spares the resolver takes on top. Either way the
+// array's active members are its disks minus SpareCount().
 func (s *Set) MemberCount() int {
 	if s.Selection == "manual" {
 		return len(s.Devices)
@@ -173,11 +175,85 @@ func (s *Set) MDName() string {
 }
 
 // MirrorsBoot reports whether this set mirrors its ESP and /boot onto md
-// arrays rather than placing them as raw partitions. This matches the
-// partition builder's rule (an os set under UEFI with raid1); the health
-// probe uses it to look for the ESP/boot filesystems on the md devices.
+// arrays rather than placing them as raw partitions. Single source for the
+// rule: the partition builder, the health probe and the filesystem predictor
+// all use it. Every redundant OS RAID mode mirrors the boot chain (raid1, 5, 6
+// and 10: a redundant root must still BOOT after a disk loss); raid0 and none
+// do not. It used to say raid1 only while the builder mirrored all four, so a
+// healthy raid5/6/10 os set was probed at its raw ESP/boot partitions (md
+// members), judged broken, and auto re-created it on every boot.
 func (s *Set) MirrorsBoot() bool {
-	return s.Role == "os" && s.RAIDMode() == "raid1"
+	if s.Role != "os" {
+		return false
+	}
+	switch s.RAIDMode() {
+	case "raid1", "raid5", "raid6", "raid10":
+		return true
+	}
+	return false
+}
+
+// PartitionNumber returns the 1-based GPT partition number the partition
+// builder gives a partition-provider volume of this set, or 0 for a volume
+// that has no partition of its own (lvm, memory, or a /boot or /boot/efi
+// volume of a non-os set). biosBoot tells whether the disk leads with a BIOS
+// boot partition (EF02), which the builder creates on a BIOS node for an os set
+// with a bootloader. It mirrors partition.BuildLayout exactly:
+//
+//	os set:   [EF02] -> /boot/efi -> /boot -> other partition volumes (JSON order)
+//	data set: other partition volumes (JSON order)
+//
+// The health probe and the mount-existing predictor used to count partition
+// volumes in JSON order instead, which put /boot on the ESP on every BIOS node
+// (and on any layout that lists a volume before /boot or /boot/efi).
+func (s *Set) PartitionNumber(vol Volume, biosBoot bool) int {
+	if vol.Provider != "partition" {
+		return 0
+	}
+	isBootVol := vol.Mountpoint == "/boot" || vol.Mountpoint == "/boot/efi"
+	if isBootVol && s.Role != "os" {
+		return 0
+	}
+	n := 0
+	hasEFI, hasBoot := false, false
+	for _, v := range s.Volumes {
+		if v.Provider != "partition" {
+			continue
+		}
+		switch v.Mountpoint {
+		case "/boot/efi":
+			hasEFI = true
+		case "/boot":
+			hasBoot = true
+		}
+	}
+	if s.Role == "os" {
+		if biosBoot {
+			n++
+		}
+		if hasEFI {
+			n++
+			if vol.Mountpoint == "/boot/efi" {
+				return n
+			}
+		}
+		if hasBoot {
+			n++
+			if vol.Mountpoint == "/boot" {
+				return n
+			}
+		}
+	}
+	for _, v := range s.Volumes {
+		if v.Provider != "partition" || v.Mountpoint == "/boot" || v.Mountpoint == "/boot/efi" {
+			continue
+		}
+		n++
+		if v.Name == vol.Name && v.Mountpoint == vol.Mountpoint {
+			return n
+		}
+	}
+	return 0
 }
 
 // BootMirrorDevice returns the md device that carries a boot-mirroring set's
@@ -187,6 +263,11 @@ func (s *Set) MirrorsBoot() bool {
 // these md devices; the health probe and the filesystem predictor must agree,
 // or a raid1 set's ESP/boot is checked/mounted at the raw partition (which is a
 // linux_raid_member) and fails. Single source for that rule.
+//
+// It keys on the volume it is handed, never on the raid level alone: callers
+// pass the set's own volumes, so a mirrored os set without a /boot volume
+// (its /boot lives on the root filesystem) never yields the "-boot" array,
+// which the raid builder does not create for it.
 func (s *Set) BootMirrorDevice(vol Volume) string {
 	if !s.MirrorsBoot() || vol.Provider != "partition" {
 		return ""
@@ -334,3 +415,27 @@ func (s *Set) BootFS() string {
 
 // (The hands-off "persistent" flag is the exported Set.Persistent field;
 // the decision engine, lpart-storage-check, and lpart-osimage-install key off it.)
+
+// RunsDegradedWith reports whether this redundant raid set can still run
+// with `present` of its configured devices. Only raid1/5/6/10 can run
+// degraded; for raid10 this is the necessary condition and mdadm --assemble
+// --run makes the final call (it refuses when a whole mirror pair is gone).
+// Shared by lpart-storage-prepare (mount modes) and lpart-storage-check
+// (install_mode=local), so both judge a missing member the same way.
+func (s *Set) RunsDegradedWith(present int) bool {
+	active := len(s.EffectiveDevices()) - s.SpareCount()
+	if present < 1 {
+		return false
+	}
+	switch s.RAIDMode() {
+	case "raid1":
+		return true
+	case "raid5":
+		return present >= active-1
+	case "raid6":
+		return present >= active-2
+	case "raid10":
+		return present >= (active+1)/2
+	}
+	return false
+}

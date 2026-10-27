@@ -212,6 +212,26 @@ func TestFindSysrootMountsNonOwnerLeavesOtherSetsMounts(t *testing.T) {
 // LVM
 // ----------------------------------------------------------------------
 
+// ownVG stubs the vgselect probes: VG "os" (uuid AAAA-1111) on sda2+sdb2,
+// which are the selected disks' partitions.
+func ownVG(f *executor.FakeRunner, extra string) {
+	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "vg_uuid,vg_name,pv_name"},
+		Response: executor.FakeResponse{Stdout: []byte("  AAAA-1111 os /dev/sda2\n  AAAA-1111 os /dev/sdb2\n" + extra)}})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/sda"},
+		Response: executor.FakeResponse{Stdout: []byte("sda\nsda1\nsda2\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/sdb"},
+		Response: executor.FakeResponse{Stdout: []byte("sdb\nsdb1\nsdb2\n")}})
+}
+
+func joinedCalls(f *executor.FakeRunner) []string {
+	calls := f.Calls()
+	out := make([]string, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, c.Path+" "+strings.Join(c.Args, " "))
+	}
+	return out
+}
+
 func TestTeardownVGRemovesEverythingWhenVGExists(t *testing.T) {
 	f := executor.NewFakeRunner(executor.FakeResponse{})
 	// dmsetup ls returns two mapper names for the VG.
@@ -222,36 +242,23 @@ func TestTeardownVGRemovesEverythingWhenVGExists(t *testing.T) {
 		Response: executor.FakeResponse{Stdout: []byte("")}})
 	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-S", "/dev/mapper/os-boot", "-o", "TARGET"},
 		Response: executor.FakeResponse{Stdout: []byte("")}})
-	// vgs <vg> exits 0 → VG exists.
-	f.AddMatch(executor.FakeMatch{Path: "vgs", ArgsPrefix: []string{"os"}, Response: executor.FakeResponse{}})
-	// lvs returns two LV paths.
-	f.AddMatch(executor.FakeMatch{Path: "lvs", ArgsPrefix: []string{"--noheadings", "-o", "lv_path", "os"},
-		Response: executor.FakeResponse{Stdout: []byte("  /dev/os/root\n  /dev/os/boot\n")}})
-	// pvs lists pvs belonging to os.
-	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "pv_name,vg_name"},
-		Response: executor.FakeResponse{Stdout: []byte("  /dev/sda2 os\n  /dev/sdb2 os\n")}})
+	ownVG(f, "")
 
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable})
-	_ = c.teardownVG(context.Background(), "os", nil)
+	_ = c.teardownVG(context.Background(), "os", SelectedDisksSet([]string{"/dev/sda", "/dev/sdb"}), nil)
 
 	// Collect the sequence of invocations we should have seen.
 	wanted := []string{
 		"dmsetup ls",
-		"vgchange --noudevsync -an os",
-		"lvremove --noudevsync -fy /dev/os/root",
-		"lvremove --noudevsync -fy /dev/os/boot",
-		"vgremove --noudevsync -fy os",
+		"vgchange --noudevsync -an --select vg_uuid=AAAA-1111",
+		"vgremove --noudevsync -fy --select vg_uuid=AAAA-1111",
 		"pvremove -ff -y /dev/sda2",
 		"pvremove -ff -y /dev/sdb2",
 		"dmsetup remove --retry -f os-root",
 		"dmsetup remove --retry -f os-boot",
 		"rm -rf " + filepath.Join("/dev", "os"),
 	}
-	calls := f.Calls()
-	gotJoined := make([]string, 0, len(calls))
-	for _, c := range calls {
-		gotJoined = append(gotJoined, c.Path+" "+strings.Join(c.Args, " "))
-	}
+	gotJoined := joinedCalls(f)
 	for _, w := range wanted {
 		found := false
 		for _, g := range gotJoined {
@@ -264,18 +271,23 @@ func TestTeardownVGRemovesEverythingWhenVGExists(t *testing.T) {
 			t.Fatalf("expected call %q in:\n%s", w, strings.Join(gotJoined, "\n"))
 		}
 	}
+	for _, g := range gotJoined {
+		if strings.Contains(g, "unrelated-x") && strings.HasPrefix(g, "dmsetup remove") {
+			t.Fatalf("unrelated mapping removed: %s", g)
+		}
+	}
 }
 
 func TestTeardownVGSkipsLVMWhenVGAbsent(t *testing.T) {
 	f := executor.NewFakeRunner(executor.FakeResponse{})
 	f.AddMatch(executor.FakeMatch{Path: "dmsetup", ArgsPrefix: []string{"ls"},
 		Response: executor.FakeResponse{Stdout: []byte("")}})
-	// vgs returns non-zero -> VG missing.
-	f.AddMatch(executor.FakeMatch{Path: "vgs", ArgsPrefix: []string{"os"},
-		Response: executor.FakeResponse{Err: errFail()}})
+	// pvs lists no VG named os.
+	f.AddMatch(executor.FakeMatch{Path: "pvs", ArgsPrefix: []string{"--noheadings", "-o", "vg_uuid,vg_name,pv_name"},
+		Response: executor.FakeResponse{Stdout: []byte("  CCCC-3333 data /dev/sdc1\n")}})
 
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable})
-	_ = c.teardownVG(context.Background(), "os", nil)
+	_ = c.teardownVG(context.Background(), "os", SelectedDisksSet([]string{"/dev/sda"}), nil)
 
 	// No vgchange / lvremove / vgremove calls should have happened.
 	for _, call := range f.Calls() {
@@ -323,7 +335,7 @@ func TestTeardownSameDiskVGsMDMemberIntersectionBugFix(t *testing.T) {
 		CommandAvailable: alwaysAvailable,
 		MDAdmDetail:      md.detail,
 	})
-	_ = c.teardownSameDiskVGs(context.Background(), selected, nil)
+	_ = c.teardownSameDiskVGs(context.Background(), selected, nil, nil)
 
 	calls := f.Calls()
 	var removedVGs []string
@@ -491,6 +503,9 @@ func TestCleanupSelectedSetEndToEnd(t *testing.T) {
 	}
 
 	f := executor.NewFakeRunner(executor.FakeResponse{})
+	// the array is lpart's own (homehost "any") from the previous install
+	f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine", "/dev/sda1"},
+		Response: executor.FakeResponse{Stdout: []byte("  Name : any:os\n")}})
 	// Step 1: unmount sysroot tree (one mount).
 	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET,SOURCE"},
 		Response: executor.FakeResponse{Stdout: []byte("/sysroot /dev/mapper/os-root xfs rw\n")}})
@@ -690,17 +705,15 @@ func TestTeardownVGDeactivatesBeforeRemovingDMNodes(t *testing.T) {
 		Response: executor.FakeResponse{Stdout: []byte("os-root\t(253:0)\n")}})
 	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-S", "/dev/mapper/os-root", "-o", "TARGET"},
 		Response: executor.FakeResponse{Stdout: []byte("")}})
-	f.AddMatch(executor.FakeMatch{Path: "vgs", ArgsPrefix: []string{"os"}, Response: executor.FakeResponse{}})
-	f.AddMatch(executor.FakeMatch{Path: "lvs", ArgsPrefix: []string{"--noheadings", "-o", "lv_path", "os"},
-		Response: executor.FakeResponse{Stdout: []byte("  /dev/os/root\n")}})
+	ownVG(f, "")
 
 	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable})
-	_ = c.teardownVG(context.Background(), "os", nil)
+	_ = c.teardownVG(context.Background(), "os", SelectedDisksSet([]string{"/dev/sda", "/dev/sdb"}), nil)
 
 	deactivateIdx, removeIdx := -1, -1
 	for i, call := range f.Calls() {
 		joined := call.Path + " " + strings.Join(call.Args, " ")
-		if deactivateIdx == -1 && joined == "vgchange --noudevsync -an os" {
+		if deactivateIdx == -1 && joined == "vgchange --noudevsync -an --select vg_uuid=AAAA-1111" {
 			deactivateIdx = i
 		}
 		if removeIdx == -1 && strings.HasPrefix(joined, "dmsetup remove --retry -f os-root") {
@@ -715,31 +728,44 @@ func TestTeardownVGDeactivatesBeforeRemovingDMNodes(t *testing.T) {
 	}
 }
 
-// TestPurgeVGsByNameRemovesDuplicatesByUUID: a stale same-named VG on other
-// disks is removed by UUID, while a differently-named VG is left alone.
-func TestPurgeVGsByNameRemovesDuplicatesByUUID(t *testing.T) {
+// TestTeardownVGLeavesForeignSameNameVGAlone: a VG named like the set but
+// with no PV on the set's disks (an old OS disk still attached) is foreign:
+// it is never deactivated or removed, its mappings are kept (told apart by the
+// dm uuid), and /dev/<vg> stays. Only this set's VG goes, by UUID.
+func TestTeardownVGLeavesForeignSameNameVGAlone(t *testing.T) {
 	f := executor.NewFakeRunner(executor.FakeResponse{})
-	f.AddMatch(executor.FakeMatch{Path: "vgs", ArgsPrefix: []string{"os"}, Response: executor.FakeResponse{}})
-	f.AddMatch(executor.FakeMatch{Path: "lvs", ArgsPrefix: []string{"--noheadings", "-o", "lv_path", "os"},
-		Response: executor.FakeResponse{Stdout: []byte("")}})
-	f.AddMatch(executor.FakeMatch{Path: "vgs", ArgsPrefix: []string{"--noheadings", "-o", "vg_uuid,vg_name"},
-		Response: executor.FakeResponse{Stdout: []byte("  AAAA-1111 os\n  BBBB-2222 os\n  CCCC-3333 other\n")}})
+	ownVG(f, "  BBBB-2222 os /dev/sdc3\n  CCCC-3333 other /dev/sda3\n")
+	f.AddMatch(executor.FakeMatch{Path: "dmsetup", ArgsPrefix: []string{"ls"},
+		Response: executor.FakeResponse{Stdout: []byte("os-root\t(253:0)\nos-home\t(253:1)\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "dmsetup", ArgsPrefix: []string{"info", "-c", "--noheadings", "-o", "uuid", "os-root"},
+		Response: executor.FakeResponse{Stdout: []byte("LVM-AAAA1111rootlvuuid\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "dmsetup", ArgsPrefix: []string{"info", "-c", "--noheadings", "-o", "uuid", "os-home"},
+		Response: executor.FakeResponse{Stdout: []byte("LVM-BBBB2222homelvuuid\n")}})
 
-	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable})
-	c.purgeVGsByName(context.Background(), "os")
-
+	c := New(Options{Runner: f, CommandAvailable: alwaysAvailable, Sleep: noSleep})
+	if err := c.teardownVG(context.Background(), "os", SelectedDisksSet([]string{"/dev/sda", "/dev/sdb"}), nil); err != nil {
+		t.Fatalf("teardownVG: %v", err)
+	}
 	got := map[string]bool{}
-	for _, call := range f.Calls() {
-		got[call.Path+" "+strings.Join(call.Args, " ")] = true
+	for _, g := range joinedCalls(f) {
+		got[g] = true
+		if strings.Contains(g, "BBBB-2222") || strings.Contains(g, "/dev/sdc3") || g == "dmsetup remove --retry -f os-home" {
+			t.Fatalf("foreign VG touched: %s", g)
+		}
+		if strings.HasPrefix(g, "rm -rf") {
+			t.Fatalf("/dev/os also holds the foreign VG's links: %s", g)
+		}
+		if strings.HasPrefix(g, "vgremove") && !strings.Contains(g, "--select") {
+			t.Fatalf("a VG must never be removed by its (ambiguous) name: %s", g)
+		}
 	}
 	for _, w := range []string{
 		"vgchange --noudevsync -an --select vg_uuid=AAAA-1111",
 		"vgremove --noudevsync -fy --select vg_uuid=AAAA-1111",
-		"vgchange --noudevsync -an --select vg_uuid=BBBB-2222",
-		"vgremove --noudevsync -fy --select vg_uuid=BBBB-2222",
+		"dmsetup remove --retry -f os-root",
 	} {
 		if !got[w] {
-			t.Fatalf("missing duplicate-purge call %q", w)
+			t.Fatalf("missing own-VG teardown call %q", w)
 		}
 	}
 	if got["vgremove --noudevsync -fy --select vg_uuid=CCCC-3333"] {
@@ -799,5 +825,41 @@ func TestRemoveLVMDevicesFile(t *testing.T) {
 	// Idempotent: a missing file is not an error.
 	if err := RemoveLVMDevicesFile(p); err != nil {
 		t.Fatalf("removing a missing devices file must succeed, got %v", err)
+	}
+}
+
+// findmnt -r prints a space and non-ASCII bytes as \xNN: the targets come back
+// as real paths, so the unmount and the lookups by target find them.
+func TestFindmntTargetsAreDecoded(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET,SOURCE"},
+		Response: executor.FakeResponse{Stdout: []byte("/sysroot /dev/mapper/os-root\n/sysroot/my\\x20data /dev/sdb1\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-S", "/dev/sdc1"},
+		Response: executor.FakeResponse{Stdout: []byte("/sysroot/d\\xc3\\xa4ta\n")}})
+	c := New(Options{Runner: f, Sysroot: "/sysroot", CommandAvailable: alwaysAvailable})
+	got := c.findSysrootMounts(context.Background(), "os", true, nil)
+	found := false
+	for _, g := range got {
+		found = found || g == "/sysroot/my data"
+	}
+	if !found {
+		t.Errorf("findSysrootMounts = %q, want /sysroot/my data among them", got)
+	}
+	if mt := c.findmntTargetForSource(context.Background(), "/dev/sdc1"); mt != "/sysroot/däta" {
+		t.Errorf("findmntTargetForSource = %q, want /sysroot/däta", mt)
+	}
+}
+
+// The SOURCE column is escaped the same way: a mount of a selected disk's
+// partition is only recognised as the set's own once its source is decoded.
+func TestFindmntSourcesAreDecoded(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET,SOURCE"},
+		Response: executor.FakeResponse{Stdout: []byte("/sysroot /dev/sda1\n/sysroot/data /dev/my\\x20disk1\n")}})
+	c := New(Options{Runner: f, Sysroot: "/sysroot", CommandAvailable: alwaysAvailable})
+	selected := map[string]struct{}{"/dev/my disk": {}}
+	got := c.findSysrootMounts(context.Background(), "", false, selected)
+	if len(got) != 1 || got[0] != "/sysroot/data" {
+		t.Errorf("findSysrootMounts = %q, want [/sysroot/data]", got)
 	}
 }

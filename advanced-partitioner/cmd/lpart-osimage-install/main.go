@@ -1,18 +1,22 @@
 // lpart-osimage-install downloads the Luna OS image and extracts it
-// into /sysroot. Behavioural reference: /root/NEWTREE/bin/lpart-osimage-install.
+// into /sysroot.
 //
 // Flow:
-//  1. Parse flags (or --config JSON), init logger, sysroot + LUNA_TOKEN
-//     preflight.
+//  1. Parse flags (or --config JSON), init logger, installer-env guard,
+//     install context, storage result, sysroot + LUNA_TOKEN preflight.
 //  2. Detect the image filename from /lunatmp/install.sh (or override).
-//  3. Download via aria2c (torrent) when present, otherwise curl.
-//  4. Resolve preserve / preserve_empty / no_new_files through
-//     first-component sysroot symlinks.
-//  5. PrepareSysroot: top-level wipe, sibling deletion, preserve-empty
-//     content clear.
-//  6. BuildTarExcludes from the resolved patterns.
-//  7. Extract with --acls or --no-acls based on the sysroot fs type.
-//  8. Remove the cached tarball.
+//  3. Resolve preserve / preserve_empty / no_new_files through the sysroot's
+//     symlinks (every component) and build the tar excludes, persistent
+//     mountpoints included.
+//  4. Download via aria2c (torrent) or curl, in the node's provision order.
+//     A streamed curl|tar extract (by default on a tmpfs sysroot) downloads
+//     inside the extract instead, and falls back to the download on failure.
+//  5. sync/auto on an existing install: SyncExtract converges the sysroot to
+//     the image (extract over it, then sweep what the image does not carry).
+//  6. Otherwise PrepareSysroot (top-level wipe, sibling deletion,
+//     preserve-empty content clear), then extract with --acls or --no-acls
+//     by the sysroot fs type; the tarball is removed.
+//  7. VerifyExtract: os-release present, the tree populated.
 package main
 
 import (
@@ -23,7 +27,9 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
@@ -43,6 +49,7 @@ func (s *stringList) String() string     { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, toolName)
 	cli.EnsureInstallerPath()
 	os.Exit(run(os.Args, os.Stdout, os.Stderr))
 }
@@ -63,6 +70,9 @@ type flags struct {
 	Preserve           stringList
 	PreserveEmpty      stringList
 	NoNewFiles         stringList
+	KeepExtra          []string
+	ImageWins          []string
+	Verify             string
 	// Test affordances; never set from production CLI.
 	LunaInstallScript string
 	LunaTokenOverride string
@@ -110,7 +120,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		"Streamed curl|tar extract (no tarball on disk, halves peak RAM): auto = only when the sysroot is tmpfs (memboot), always, never. Streaming falls back to the classic download+extract on failure.")
 
 	if err := fs.Parse(argv[1:]); err != nil {
-		return 2
+		// A bad command line is identical on every retry: park (exit 3).
+		return cli.ExitFatalConfig(stderr, toolName, "usage", "%v", err)
 	}
 	if f.ShowVersion {
 		_, _ = fmt.Fprintln(stdout, cli.Version())
@@ -138,13 +149,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 
 	ic, err := installcontext.LoadFile(f.InstallContextPath)
 	if err != nil {
-		errln(stderr, "install-context: %v", err)
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "install-context", "%v", err)
 	}
 	logger.KV("install_mode", string(ic.InstallMode))
 	if !f.IgnoreInstallCtx && ic.InstallMode.IsLocal() {
-		errln(stderr, "install_mode=local — lpart-osimage-install should be skipped (run lpart-storage-check instead). Pass --ignore-install-context to force.")
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "install-mode-local", "install_mode=local — lpart-osimage-install should be skipped (run lpart-storage-check instead). Pass --ignore-install-context to force.")
 	}
 
 	// Path hygiene before any path is used in a deletion decision.
@@ -180,21 +189,26 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		f.Preserve = nil
 		f.PreserveEmpty = nil
 		f.NoNewFiles = nil
+		f.KeepExtra = nil
+		f.ImageWins = nil
 	}
 	logger.KV("first_install", srSummary.FirstInstall)
 	logger.KV("persistent_mountpoints", strings.Join(srSummary.PersistentMountpoints, ","))
 
 	// --config is exclusive with the per-path flags.
 	if f.ConfigPath != "" && (len(f.Preserve) > 0 || len(f.PreserveEmpty) > 0 || len(f.NoNewFiles) > 0) {
-		errln(stderr, "--config is exclusive: do not combine with --preserve, --preserve-empty, or --no-new-files.")
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "osimage-filter", "--config is exclusive: do not combine with --preserve, --preserve-empty, or --no-new-files.")
 	}
 	if f.ConfigPath != "" {
 		cfg, err := osimage.LoadFilterConfig(f.ConfigPath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				errln(stderr, "--config file not found: %s", f.ConfigPath)
-				return 1
+				return cli.ExitFatalConfig(stderr, toolName, "osimage-filter", "--config file not found: %s", f.ConfigPath)
+			}
+			var fe *osimage.ErrFilterConfig
+			if errors.As(err, &fe) {
+				// identical on every retry: park, do not loop
+				return cli.ExitFatalConfig(stderr, toolName, "osimage-filter", "%v", err)
 			}
 			errln(stderr, "%v", err)
 			return 1
@@ -202,6 +216,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		f.Preserve = append(f.Preserve, cfg.Preserve...)
 		f.PreserveEmpty = append(f.PreserveEmpty, cfg.PreserveEmpty...)
 		f.NoNewFiles = append(f.NoNewFiles, cfg.NoNewFiles...)
+		f.KeepExtra = append(f.KeepExtra, cfg.KeepExtra...)
+		f.ImageWins = append(f.ImageWins, cfg.ImageWins...)
+		f.Verify = cfg.Verify
 	}
 
 	// Sysroot must be mounted (skip in tests).
@@ -245,20 +262,53 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		LunaInstallScript: f.LunaInstallScript,
 	})
 	if err != nil {
-		errln(stderr, "%v", err)
-		return 1
+		// no osimage assigned / no image file named: identical on every retry
+		return cli.ExitFatalConfig(stderr, toolName, "osimage", "%v", err)
 	}
 
 	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
 
-	// Resolve filter paths through first-component sysroot symlinks.
+	// Resolve filter paths through the sysroot's symlinks.
 	// Done before download so tests can drive filter logic without the
 	// 60-90s torrent fetch via --skip-download.
 	logger.SetStage("filter_resolve")
 	resolver := osimage.FirstSymlinkResolver{Sysroot: f.Sysroot}
-	preserve := osimage.ParsePatterns(resolver.ResolveAll([]string(f.Preserve)))
-	preserveEmpty := osimage.ParsePatterns(resolver.ResolveAll([]string(f.PreserveEmpty)))
-	noNew := osimage.ParsePatterns(resolver.ResolveAll([]string(f.NoNewFiles)))
+	// Normalise first: "/var/log" and "var/log" mean the same path. Without
+	// this an absolute path matched nothing and its data was deleted.
+	norm := func(kind string, raw []string) []string {
+		paths, dropped := osimage.NormalizeFilterPaths(raw)
+		for _, d := range dropped {
+			logger.Warn(fmt.Sprintf("%s entry %q ignored: empty, \"/\" or contains \"..\"", kind, d))
+		}
+		return paths
+	}
+	// Every path is protected as written AND with its symlinks resolved inside
+	// the sysroot (all components, not just the first), so a link and what it
+	// points to are both kept.
+	var filterErr error
+	expand := func(kind string, raw []string) []string {
+		n := norm(kind, raw)
+		if err := osimage.ValidateFilterPaths(kind, n); err != nil && filterErr == nil {
+			filterErr = err
+		}
+		return osimage.ExpandFilterPaths(f.Sysroot, resolver.ResolveAll(n))
+	}
+	preserve := osimage.ParsePatterns(expand("preserve", f.Preserve))
+	preserveEmpty := osimage.ParsePatterns(expand("preserve_empty", f.PreserveEmpty))
+	noNew := osimage.ParsePatterns(expand("no_new_files", f.NoNewFiles))
+	keepExtra := osimage.ParsePatterns(expand("keep_extra", f.KeepExtra))
+	imageWins := osimage.ParsePatterns(expand("image_wins", f.ImageWins))
+	if filterErr != nil {
+		return cli.ExitFatalConfig(stderr, toolName, "osimage-filter", "%v", filterErr)
+	}
+	for _, mp := range relMounts(srSummary.PersistentMountpoints) {
+		for _, w := range imageWins {
+			if w.Reaches(mp) {
+				return cli.ExitFatalConfig(stderr, toolName, "osimage-filter",
+					"image_wins entry %q reaches the persistent mountpoint /%s, which the install never writes", w.Raw, mp)
+			}
+		}
+	}
 	// Pre-compute tar excludes so the log captures them regardless of
 	// whether --skip-extract / --skip-download short-circuit later.
 	excludes := osimage.BuildTarExcludes(preserve, preserveEmpty, noNew)
@@ -268,39 +318,19 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// mountpoint becomes "./<mountpoint>" plus "./<mountpoint>/*" so
 	// both the directory entry and its contents survive the extract.
 	for _, mp := range srSummary.PersistentMountpoints {
-		clean := strings.TrimPrefix(mp, "/")
+		// tar matches members as written: "/home/" or "//home" would exclude
+		// nothing, and "[", "*" or "?" would be wildcards.
+		clean := strings.Trim(path.Clean("/"+mp), "/")
 		if clean == "" {
 			continue
 		}
 		excludes = append(excludes,
-			"--exclude=./"+clean,
-			"--exclude=./"+clean+"/*",
+			"--exclude=./"+osimage.EscapeTarPattern(clean),
+			"--exclude=./"+osimage.EscapeTarPattern(clean)+"/*",
 		)
 		logger.UserInfo("persistent-set-mountpoint excluded from extract: %s", mp)
 	}
 	logger.KV("tar_excludes", strings.Join(excludes, " "))
-
-	// Defensive check: every persistent mountpoint must appear in the
-	// tar excludes. Should never trip, but exits 2 if it does (safety
-	// refusal) rather than continue with a broken exclude set.
-	for _, mp := range srSummary.PersistentMountpoints {
-		clean := strings.TrimPrefix(mp, "/")
-		if clean == "" {
-			continue
-		}
-		want := "--exclude=./" + clean
-		found := false
-		for _, ex := range excludes {
-			if ex == want {
-				found = true
-				break
-			}
-		}
-		if !found {
-			return cli.ExitSafetyRefusal(stderr, toolName, "persistent",
-				"persistent mountpoint %s not present in tar excludes", mp)
-		}
-	}
 
 	// --skip-download halts HERE — before download, PrepareSysroot and
 	// extract. There is no tarball to extract, so running the destructive
@@ -337,6 +367,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		logger.UserInfo("%s", policyNote)
 	}
 	streamWanted := false
+	refresh := !fullExtract // sync/auto on an existing, healthy install: converge, do not wipe first
 	switch strings.ToLower(streamPolicy) {
 	case "always":
 		streamWanted = true
@@ -344,6 +375,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		streamWanted = false
 	default:
 		streamWanted = fstype == "tmpfs"
+	}
+	if refresh && streamWanted {
+		logger.UserInfo("sync refresh: using the downloaded tarball (the converge needs the payload in hand before it deletes anything)")
+		streamWanted = false
 	}
 	if streamWanted {
 		firstUsable := ""
@@ -410,15 +445,53 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		},
 	}
 
+	// The kernel's OOM-kill count before the transfer: a download or extract
+	// the OOM killer stopped is told apart from a transient failure.
+	oom0 := oomKills()
+
 	// Classic path downloads NOW — payload in hand before the sysroot wipe.
 	// Streaming defers the transfer into the extract pipe below.
 	var cachePath string
 	if !streamWanted {
 		cachePath, err = osimage.Download(context.Background(), dopts)
 		if err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			return downloadFailure(stderr, err, oom0, fstype)
 		}
+	}
+
+	if refresh && !f.SkipExtract {
+		logger.SetStage("sync")
+		res, serr := osimage.SyncExtract(context.Background(), osimage.SyncOptions{
+			Logger:      logger,
+			Sysroot:     f.Sysroot,
+			TarballPath: cachePath,
+			ACLs:        acls,
+			TarExcludes: excludes,
+			Protect: osimage.Protection{
+				Preserve: preserve, PreserveEmpty: preserveEmpty, NoNewFiles: noNew, KeepExtra: keepExtra,
+				SkipMounts: relMounts(srSummary.PersistentMountpoints, srSummary.OtherMountpoints),
+			},
+			OSMounts:    relMounts(srSummary.OSMountpoints),
+			ImageWins:   imageWins,
+			Verify:      f.Verify,
+			DryRun:      f.DryRun,
+			Details:     f.Details,
+			RemoveAfter: true,
+		})
+		if serr != nil {
+			if strings.Contains(serr.Error(), "operator review required") {
+				return cli.ExitSafetyRefusal(stderr, toolName, "sync", "%v", serr)
+			}
+			return extractFailure(stderr, serr, oom0, fstype, cachePath)
+		}
+		logger.KV("sync_members", res.Members)
+		logger.KV("sync_removed", res.Removed)
+		logger.KV("sync_verified", res.Verified)
+		logger.SetStage("extract_verify")
+		if err := osimage.VerifyExtract(logger, f.Sysroot); err != nil {
+			return cli.ExitFatalConfig(stderr, toolName, "extract-verify", "%v", err)
+		}
+		return 0
 	}
 
 	// PrepareSysroot.
@@ -456,14 +529,30 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			ACLs:        acls,
 		})
 		if serr != nil {
+			if outOfMemory(oom0) {
+				// the classic path needs more RAM than the stream that ran out
+				return oomFailure(stderr, serr, fstype, "")
+			}
 			// Fall back to the classic path: PrepareSysroot is re-entrant and
 			// tar overwrites the partial tree, so a failed stream costs one
 			// full download, never a broken install.
 			logger.Warn("streamed extract failed; falling back to classic download+extract: " + serr.Error())
+			if fstype == "tmpfs" {
+				// RAM root: clear the partly extracted tree BEFORE the tarball
+				// lands in /tmp (also RAM), or the fallback needs the double
+				// peak streaming exists to avoid.
+				if perr := osimage.PrepareSysroot(context.Background(), osimage.PrepareOptions{
+					Sysroot: f.Sysroot, Logger: logger, DryRun: f.DryRun, Resolver: resolver,
+					FindmntTargets: findmntTargets(runner), PersistentMountpoints: srSummary.PersistentMountpoints,
+					Details: f.Details,
+				}); perr != nil {
+					errln(stderr, "%v", perr)
+					return 1
+				}
+			}
 			cachePath, err = osimage.Download(context.Background(), dopts)
 			if err != nil {
-				errln(stderr, "%v", err)
-				return 1
+				return downloadFailure(stderr, err, oom0, fstype)
 			}
 			streamWanted = false
 		}
@@ -478,8 +567,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			ACLs:        acls,
 			RemoveAfter: true,
 		}); err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			return extractFailure(stderr, err, oom0, fstype, cachePath)
 		}
 	}
 
@@ -488,10 +576,97 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// failure (Ubuntu) is now caught and reported here.
 	logger.SetStage("extract_verify")
 	if err := osimage.VerifyExtract(logger, f.Sysroot); err != nil {
-		errln(stderr, "%v", err)
-		return 1
+		// the image itself is incomplete (no os-release): identical on every retry
+		return cli.ExitFatalConfig(stderr, toolName, "extract-verify", "%v", err)
 	}
 	return 0
+}
+
+// extractFailure classifies a tar/sync failure: a full os filesystem, or an
+// extract the kernel OOM killer stopped, fails the same way on every retry
+// (park, exit 3); anything else (a corrupt or truncated download, a transient
+// I/O error) may succeed on the next attempt.
+func extractFailure(stderr io.Writer, err error, oomBefore int64, fstype, cachePath string) int {
+	if strings.Contains(err.Error(), "No space left on device") {
+		return cli.ExitFatalConfig(stderr, toolName, "no-space", "%v -- the os filesystem is too small for the image (make the os set larger, or remove preserved data)", err)
+	}
+	if outOfMemory(oomBefore) {
+		return oomFailure(stderr, err, fstype, cachePath)
+	}
+	errln(stderr, "%v", err)
+	return 1
+}
+
+// downloadFailure: a download the OOM killer stopped (the tarball lands in
+// /tmp, which is RAM in the initramfs) parks; any other download failure is
+// retryable.
+func downloadFailure(stderr io.Writer, err error, oomBefore int64, fstype string) int {
+	if outOfMemory(oomBefore) {
+		return oomFailure(stderr, err, fstype, "")
+	}
+	errln(stderr, "%v", err)
+	return 1
+}
+
+// Kernel counters read by the out-of-memory classification (test seams).
+var (
+	procVmstat  = "/proc/vmstat"
+	procMeminfo = "/proc/meminfo"
+)
+
+// oomKills returns the number of processes the kernel OOM killer has killed
+// since boot (/proc/vmstat oom_kill, Linux 4.13+), or -1 when unknown.
+func oomKills() int64 {
+	return procField(procVmstat, "oom_kill")
+}
+
+// outOfMemory reports whether the OOM killer struck after before was read.
+func outOfMemory(before int64) bool {
+	return before >= 0 && oomKills() > before
+}
+
+// procField reads "<key> <number>" (vmstat) or "<key>: <number> kB"
+// (meminfo) from a /proc file; -1 when the file or the key is missing.
+func procField(path, key string) int64 {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return -1
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 || strings.TrimSuffix(f[0], ":") != key {
+			continue
+		}
+		var n int64
+		if _, err := fmt.Sscan(f[1], &n); err == nil {
+			return n
+		}
+	}
+	return -1
+}
+
+// oomFailure parks the node (exit 3): the same image on the same RAM runs out
+// of memory the same way on every attempt, so a retry loop only repeats the
+// download. On a systemd initramfs the killed step used to stop the whole
+// installer service, after which the node booted the half-written root; the
+// 95luna module now keeps the service running (OOMPolicy=continue), so the
+// failure reaches this classification.
+func oomFailure(stderr io.Writer, err error, fstype, cachePath string) int {
+	mem := ""
+	if kb := procField(procMeminfo, "MemTotal"); kb > 0 {
+		mem = fmt.Sprintf("; node RAM %d MiB", kb/1024)
+	}
+	if cachePath != "" {
+		if st, serr := os.Stat(cachePath); serr == nil {
+			mem += fmt.Sprintf(", tarball %d MiB in /tmp (RAM)", st.Size()>>20)
+		}
+	}
+	advice := "give the node more RAM, or use a smaller image"
+	if fstype == "tmpfs" {
+		advice = "memboot holds the whole extracted image in RAM, and with torrent as provision method the tarball as well until the extract ends: give the node more RAM, set provision_method http (memboot then streams the image without a copy in RAM), or use a smaller image"
+	}
+	return cli.ExitFatalConfig(stderr, toolName, "out-of-memory",
+		"%v -- the kernel ran out of memory and its OOM killer stopped the step%s; this fails the same way on every attempt: %s", err, mem, advice)
 }
 
 // findmntTargets returns a closure that runs `findmnt -rn -o TARGET`.
@@ -511,7 +686,7 @@ func findmntTargets(runner executor.Runner) func() ([]string, error) {
 		for _, line := range strings.Split(string(res.Stdout), "\n") {
 			line = strings.TrimSpace(line)
 			if line != "" {
-				out = append(out, line)
+				out = append(out, mount.UnescapeFindmnt(line))
 			}
 		}
 		return out, nil
@@ -540,6 +715,17 @@ func resolveStreamPolicy(flagVal, cmdlinePath string) (policy, note string) {
 	}
 }
 
+// relMounts turns absolute mountpoints into clean sysroot-relative ones, dropping "/".
+func relMounts(lists ...[]string) []string {
+	out := []string{}
+	for _, mp := range slices.Concat(lists...) {
+		if c := strings.Trim(path.Clean("/"+mp), "/"); c != "" {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 func nonEmpty(s, fallback string) string {
 	if s == "" {
 		return fallback
@@ -558,6 +744,12 @@ func nonEmpty(s, fallback string) string {
 type storageResultSummary struct {
 	FirstInstall          bool
 	PersistentMountpoints []string
+	// OtherMountpoints are the mountpoints of non-os, non-persistent sets
+	// (data sets): the sync sweep never enters them.
+	OtherMountpoints []string
+	// OSMountpoints are the os set's own volumes, the only mounts the sync
+	// sweep converges.
+	OSMountpoints []string
 }
 
 func readStorageResultSummary(path string) (storageResultSummary, error) {
@@ -571,8 +763,9 @@ func readStorageResultSummary(path string) (storageResultSummary, error) {
 		return out, err
 	}
 	type setProbe struct {
-		FirstInstall bool `json:"first_install"`
-		Persistent   bool `json:"persistent"`
+		FirstInstall bool   `json:"first_install"`
+		Persistent   bool   `json:"persistent"`
+		Role         string `json:"role"`
 		Filesystems  []struct {
 			Mount string `json:"mount"`
 		} `json:"filesystems"`
@@ -585,8 +778,23 @@ func readStorageResultSummary(path string) (storageResultSummary, error) {
 		return out, fmt.Errorf("parse %s: %w", path, err)
 	}
 	collect := func(s setProbe) {
-		if s.FirstInstall {
+		// Only the set that holds "/" decides first_install: a new data set next
+		// to a healthy os set must not turn the refresh into a full extract.
+		holdsRoot := false
+		for _, f := range s.Filesystems {
+			if f.Mount == "/" {
+				holdsRoot = true
+			}
+		}
+		if s.FirstInstall && (holdsRoot || len(probe.Sets) == 0) {
 			out.FirstInstall = true
+		}
+		if holdsRoot || s.Role == "os" {
+			for _, f := range s.Filesystems {
+				if f.Mount != "" && f.Mount != "swap" {
+					out.OSMountpoints = append(out.OSMountpoints, f.Mount)
+				}
+			}
 		}
 		if s.Persistent {
 			for _, f := range s.Filesystems {
@@ -594,6 +802,13 @@ func readStorageResultSummary(path string) (storageResultSummary, error) {
 					continue
 				}
 				out.PersistentMountpoints = append(out.PersistentMountpoints, f.Mount)
+			}
+		} else if s.Role != "" && s.Role != "os" {
+			for _, f := range s.Filesystems {
+				if f.Mount == "" || f.Mount == "swap" || f.Mount == "/" {
+					continue
+				}
+				out.OtherMountpoints = append(out.OtherMountpoints, f.Mount)
 			}
 		}
 	}

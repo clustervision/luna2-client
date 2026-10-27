@@ -18,7 +18,7 @@ import (
 //	            grub-install only when BIOS (UEFI uses the signed
 //	            shim+grub from /EFI/<distro>/ instead).
 //	Initramfs:  update-initramfs -u -k all
-//	Install:    write /etc/default/grub (Debian-flavoured keys);
+//	Install:    write /etc/default/grub (GRUB_DEFAULT=0);
 //	            BIOS path runs grub-install --target=i386-pc per disk
 //	            then update-grub; UEFI path calls StageSignedShim
 //	            (with GrubDirName="grub"), then RegisterUEFIEntries,
@@ -33,26 +33,26 @@ func (a *debianAdapter) Family() Family { return FamilyDebian }
 func (a *debianAdapter) Prepare(_ context.Context) error {
 	sysroot := a.deps.BootContext.Sysroot
 	// Initramfs generator: update-initramfs (initramfs-tools) OR dracut. Which
-	// one an Ubuntu image carries depends on the release: 26.04/resolute keeps
-	// initramfs-tools-core alongside dracut, but 24.04/noble's `dracut` package
-	// Conflicts initramfs-tools and removes it (dracut installed so luna can
-	// pack the 95luna netboot initramfs). Accept either — RegenerateInitramfs
-	// dispatches on whichever is present.
+	// one an Ubuntu image carries depends on the release: 22.04 and 24.04
+	// images use initramfs-tools; on 26.04/resolute dracut is the generator --
+	// initramfs-tools-core stays installed, but update-initramfs itself is the
+	// dracut package's wrapper. Accept either — RegenerateInitramfs dispatches
+	// on which generator the image really uses.
 	if !a.hasUpdateInitramfs() && !a.hasDracut() {
-		return fmt.Errorf("missing required command: update-initramfs or dracut")
+		return imageErrorf("image-missing-tool", "missing required command: update-initramfs or dracut")
 	}
 	if !anyExist(sysroot, "usr/sbin/update-grub", "usr/bin/update-grub") {
-		return fmt.Errorf("missing required command: update-grub")
+		return imageErrorf("image-missing-tool", "missing required command: update-grub")
 	}
 	if len(a.deps.BootContext.StorageResult.BootDevices) == 0 {
-		return fmt.Errorf("storage-result boot_devices must contain at least one disk")
+		return configErrorf("no-boot-devices", "storage-result boot_devices must contain at least one disk")
 	}
 	if a.deps.BootContext.FirmwareMode == "uefi" {
 		if _, err := os.Stat(filepath.Join(sysroot, "boot", "efi")); err != nil {
-			return fmt.Errorf("missing EFI mount directory: %s/boot/efi", sysroot)
+			return configErrorf("missing-esp-mount", "missing EFI mount directory: %s/boot/efi", sysroot)
 		}
 	}
-	return nil
+	return requireBIOSGRUB(a.deps.BootContext, "grub-install", "grub2-common", "grub-pc-bin", "usr/lib/grub/i386-pc")
 }
 
 func (a *debianAdapter) hasUpdateInitramfs() bool {
@@ -63,16 +63,35 @@ func (a *debianAdapter) hasDracut() bool {
 	return anyExist(a.deps.BootContext.Sysroot, "usr/bin/dracut", "usr/sbin/dracut")
 }
 
-// RegenerateInitramfs regenerates the INSTALLED system's initramfs with
-// whichever generator the image ships: `update-initramfs -u -k all`
-// (initramfs-tools, Debian-native) when present, else `dracut -f --omit luna
-// --kver <kver>` — identical to the RHEL/SUSE path — for dracut-only images
-// (e.g. Ubuntu 24.04, whose dracut package displaced initramfs-tools). Omit
-// the luna module: it is only for the netboot install initramfs, never the
-// installed system's.
+// updateInitramfsIsDracut: the image's update-initramfs is the dracut
+// package's wrapper (Ubuntu 26.04: "adapted for dracut", it runs dracut). The
+// initramfs-tools script never mentions dracut. Package ownership is no
+// signal: 26.04 keeps initramfs-tools-core (hook-functions, mkinitramfs)
+// installed next to dracut.
+func (a *debianAdapter) updateInitramfsIsDracut() bool {
+	for _, rel := range []string{"usr/sbin/update-initramfs", "usr/bin/update-initramfs"} {
+		b, err := os.ReadFile(filepath.Join(a.deps.BootContext.Sysroot, rel))
+		if err == nil {
+			return strings.Contains(string(b), "dracut")
+		}
+	}
+	return false
+}
+
+// RegenerateInitramfs regenerates the INSTALLED system's initramfs with the
+// generator the image uses: `update-initramfs -u -k all` for initramfs-tools
+// (or an image without dracut), else dracut (dracutArgs) for
+// every bootable kernel — identical to the RHEL/SUSE path. Omit the luna
+// module: it is only for the netboot install initramfs, never the installed
+// system's. On Ubuntu 26.04 update-initramfs is dracut's wrapper, which builds
+// without --omit luna: the installed system's initramfs then carried the Luna
+// install module (with the controller's ssh key and the lpart tools).
 func (a *debianAdapter) RegenerateInitramfs(ctx context.Context) error {
 	sysroot := a.deps.BootContext.Sysroot
-	if a.hasUpdateInitramfs() {
+	if err := removeImageLVMDevicesFile(a.deps); err != nil {
+		return err
+	}
+	if a.hasUpdateInitramfs() && !(a.hasDracut() && a.updateInitramfsIsDracut()) {
 		if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
 			Path: "/usr/bin/env", Chroot: sysroot,
 			Args:          []string{"update-initramfs", "-u", "-k", "all"},
@@ -82,21 +101,10 @@ func (a *debianAdapter) RegenerateInitramfs(ctx context.Context) error {
 		}
 		return nil
 	}
-	kver, err := detectKernelVersion(sysroot)
-	if err != nil {
-		return err
-	}
-	if _, err := a.deps.Runner.Run(ctx, executor.CommandSpec{
-		Path: "/usr/bin/env", Chroot: sysroot,
-		Args:          []string{"dracut", "-f", "--omit", "luna", "--kver", kver},
-		CaptureStdout: true, CaptureStderr: true,
-	}); err != nil {
-		return fmt.Errorf("dracut -f --omit luna --kver %s: %w", kver, err)
-	}
-	if msg := kernelNotNewestWarning(sysroot, kver); msg != "" && a.deps.Logger != nil {
-		a.deps.Logger.Warn(msg)
-	}
-	return nil
+	// dracut image: every bootable kernel, as on RHEL. GRUB_DEFAULT=0 is
+	// update-grub's newest entry, so the default is the newest kernel here.
+	_, err := dracutAllKernels(ctx, a.deps, false)
+	return err
 }
 
 // Install writes /etc/default/grub, then runs the UEFI install -- or the BIOS
@@ -109,7 +117,7 @@ func (a *debianAdapter) Install(ctx context.Context) error {
 	}
 	if a.deps.BootContext.FirmwareMode != "uefi" {
 		if !a.deps.BootContext.BIOSGRUBRequested() {
-			return fmt.Errorf("unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
+			return configErrorf("firmware-not-uefi", "unsupported firmware mode %q: lpart requires UEFI (BIOS/legacy boot is not supported)", a.deps.BootContext.FirmwareMode)
 		}
 		return a.installBIOS(ctx)
 	}
@@ -138,24 +146,10 @@ func (a *debianAdapter) installBIOS(ctx context.Context) error {
 	return a.generateGrubConfig(ctx)
 }
 
-// writeGrubDefault mirrors bootloader_debian_write_grub_default. The
-// Debian-style /etc/default/grub differs from RHEL's: GRUB_DEFAULT=0
-// (numeric, not "saved"), no GRUB_DISABLE_SUBMENU.
+// writeGrubDefault writes /etc/default/grub (see grubdefault.go) with
+// GRUB_DEFAULT=0: update-grub's first entry is the newest kernel.
 func (a *debianAdapter) writeGrubDefault() error {
-	path := filepath.Join(a.deps.BootContext.Sysroot, "etc", "default", "grub")
-	if err := a.deps.FS.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return fmt.Errorf("mkdir parent of %s: %w", path, err)
-	}
-	lines := []string{
-		"GRUB_TIMEOUT=5",
-		"GRUB_DEFAULT=0",
-		"GRUB_DISABLE_OS_PROBER=true",
-		"GRUB_DISABLE_RECOVERY=true",
-		`GRUB_TERMINAL_OUTPUT="console"`,
-		GrubCmdlineValue(a.deps.BootContext.KernelArgs),
-	}
-	body := strings.Join(lines, "\n") + "\n"
-	return a.deps.FS.WriteFile(path, []byte(body), 0o644)
+	return writeGrubDefault(a.deps.FS, a.deps.BootContext, "0")
 }
 
 func (a *debianAdapter) installUEFI(ctx context.Context) error {
@@ -206,25 +200,26 @@ func (a *debianAdapter) generateGrubConfig(ctx context.Context) error {
 	}); err != nil {
 		return fmt.Errorf("update-grub: %w", err)
 	}
-	a.normalizeGrubCfgForSeparateBoot()
+	if err := a.normalizeGrubCfgForSeparateBoot(); err != nil {
+		return err
+	}
 	// Same degraded-safe rewrite as RHEL (BE-W5): on a mirrored boot chain
 	// the update-grub output locates /boot and root by md-array UUID, which
 	// GRUB resolves non-deterministically when a mirror leg is missing —
 	// dropping the mduuid set/hints forces the fs-uuid scan that finds a raw
 	// metadata-1.0 member. No-op on non-RAID layouts (no mduuid references).
-	makeGrubCfgDegradedSafeAt(
+	return grubCfgDegradedSafeAt(a.deps.FS,
 		filepath.Join(sysroot, "boot", "grub", "grub.cfg"),
 		filepath.Join(sysroot, "boot", "grub2", "grub.cfg"),
 	)
-	return nil
 }
 
 // normalizeGrubCfgForSeparateBoot rewrites /boot-prefixed kernel /
 // initrd lines in grub.cfg when /boot is a separate filesystem.
 // Mirrors bootloader_debian_normalize_grub_for_separate_boot.
-func (a *debianAdapter) normalizeGrubCfgForSeparateBoot() {
+func (a *debianAdapter) normalizeGrubCfgForSeparateBoot() error {
 	if !a.hasBootMount() {
-		return
+		return nil
 	}
 	sysroot := a.deps.BootContext.Sysroot
 	for _, cfg := range []string{
@@ -246,8 +241,12 @@ func (a *debianAdapter) normalizeGrubCfgForSeparateBoot() {
 				out = append(out, line)
 			}
 		}
-		_ = a.deps.FS.WriteFile(cfg, []byte(strings.Join(out, "\n")), 0o644)
+		// the unrepaired /boot/vmlinuz paths are not found on a separate /boot
+		if err := a.deps.FS.WriteFile(cfg, []byte(strings.Join(out, "\n")), 0o644); err != nil {
+			return fmt.Errorf("repair grub.cfg for a separate /boot: %w", err)
+		}
 	}
+	return nil
 }
 
 func (a *debianAdapter) hasBootMount() bool {

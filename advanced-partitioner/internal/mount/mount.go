@@ -12,7 +12,9 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
@@ -88,6 +90,14 @@ func New(o Options) *Mounter {
 	return &Mounter{o: o}
 }
 
+// SymlinkError refuses a mount target with a symlink below the sysroot: mkdir -p
+// and mount(8) would follow it, out of the sysroot when it is absolute.
+type SymlinkError struct{ Target, Link string }
+
+func (e *SymlinkError) Error() string {
+	return fmt.Sprintf("mount target %s: %s is a symlink in the existing root, and a mount never goes through one -- set the mountpoint to the real directory, or remove the link", e.Target, e.Link)
+}
+
 // MountSysrootTree mounts every entry in filesystems under the sysroot.
 // Root (/) first, then other mountpoints in shallow-first depth order.
 // Swap entries and mountpoint=="" are skipped. Mirrors
@@ -125,6 +135,9 @@ func (m *Mounter) MountSysrootTree(ctx context.Context, filesystems fs.Filesyste
 				continue
 			}
 			target := m.o.Sysroot + mp
+			if err := m.refuseSymlinkBelowSysroot(target); err != nil {
+				return Result{}, err
+			}
 			if err := m.ensureDir(target); err != nil {
 				return Result{}, err
 			}
@@ -259,15 +272,15 @@ func (m *Mounter) ensureNotMountedElsewhere(ctx context.Context, source string) 
 	if err != nil {
 		return nil // not mounted anywhere
 	}
-	target := strings.TrimSpace(string(res.Stdout))
-	if target == "" {
-		return nil
+	for _, line := range strings.Split(string(res.Stdout), "\n") {
+		target := UnescapeFindmnt(strings.TrimSpace(line))
+		if target == "" || target == m.o.Sysroot || strings.HasPrefix(target, m.o.Sysroot+"/") {
+			continue
+		}
+		return fmt.Errorf("device already mounted outside %s: %s -> %s",
+			m.o.Sysroot, source, target)
 	}
-	if target == m.o.Sysroot || strings.HasPrefix(target, m.o.Sysroot+"/") {
-		return nil
-	}
-	return fmt.Errorf("device already mounted outside %s: %s -> %s",
-		m.o.Sysroot, source, target)
+	return nil
 }
 
 func (m *Mounter) mountedSource(ctx context.Context, target string) (string, bool) {
@@ -279,7 +292,7 @@ func (m *Mounter) mountedSource(ctx context.Context, target string) (string, boo
 	if err != nil {
 		return "", false
 	}
-	source := strings.TrimSpace(string(res.Stdout))
+	source := UnescapeFindmnt(strings.TrimSpace(string(res.Stdout)))
 	if source == "" {
 		return "", false
 	}
@@ -324,7 +337,7 @@ func (m *Mounter) liveSysrootTargets(ctx context.Context) []string {
 	}
 	out := []string{}
 	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		t := strings.TrimSpace(line)
+		t := UnescapeFindmnt(strings.TrimSpace(line))
 		if t == "" {
 			continue
 		}
@@ -333,6 +346,23 @@ func (m *Mounter) liveSysrootTargets(ctx context.Context) []string {
 		}
 	}
 	return out
+}
+
+// refuseSymlinkBelowSysroot refuses the first symlinked component of target below
+// the sysroot; a missing one is made by mkdir -p as a real directory.
+func (m *Mounter) refuseSymlinkBelowSysroot(target string) error {
+	p := filepath.Clean(m.o.Sysroot)
+	for _, c := range strings.Split(strings.TrimPrefix(filepath.Clean(target), p+"/"), "/") {
+		p = filepath.Join(p, c)
+		fi, err := os.Lstat(p)
+		if err != nil {
+			return nil
+		}
+		if fi.Mode()&os.ModeSymlink != 0 {
+			return &SymlinkError{Target: target, Link: p}
+		}
+	}
+	return nil
 }
 
 func (m *Mounter) ensureDir(path string) error {
@@ -385,4 +415,21 @@ func targetsFromFilesystems(filesystems fs.Filesystems, sysroot string) []string
 		out = append(out, sysroot+f.Mount)
 	}
 	return out
+}
+
+// UnescapeFindmnt undoes findmnt -r's \xNN escaping (a space, a backslash, any
+// non-ASCII byte), so a target compares equal to the path on disk.
+func UnescapeFindmnt(s string) string {
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+3 < len(s) && s[i+1] == 'x' {
+			if v, err := strconv.ParseUint(s[i+2:i+4], 16, 8); err == nil {
+				b.WriteByte(byte(v))
+				i += 3
+				continue
+			}
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }

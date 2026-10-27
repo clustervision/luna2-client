@@ -2,6 +2,7 @@ package bootloader
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"unicode/utf16"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/fsops"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
 )
 
@@ -367,7 +369,9 @@ func TestNormalizeBLSEntriesSeparateBoot(t *testing.T) {
 		// /boot is its own filesystem -> paths must be relative to it.
 		StorageResult: result.StorageResult{Filesystems: []result.Filesystem{{Mount: "/boot"}}},
 	}}}
-	a.normalizeBLSEntries()
+	if err := a.normalizeBLSEntries(); err != nil {
+		t.Fatal(err)
+	}
 
 	gotBad := readFile(t, bad)
 	for _, want := range []string{
@@ -415,7 +419,9 @@ func TestNormalizeBLSEntriesSharedBoot(t *testing.T) {
 		Sysroot:       sysroot,
 		StorageResult: result.StorageResult{Filesystems: []result.Filesystem{{Mount: "/"}}},
 	}}}
-	a.normalizeBLSEntries()
+	if err := a.normalizeBLSEntries(); err != nil {
+		t.Fatal(err)
+	}
 
 	got := readFile(t, bad)
 	if !strings.Contains(got, "linux /boot/vmlinuz-5.14.0-687.12.1.el9_8.x86_64") {
@@ -487,5 +493,98 @@ func TestRewriteMduuidNoop(t *testing.T) {
 	in := "menuentry x {\n\tsearch --no-floppy --fs-uuid --set=root ABCD-1234\n}\n"
 	if out := rewriteMduuidToFSUUID(in); out != in {
 		t.Errorf("non-RAID grub.cfg changed: %q", out)
+	}
+}
+
+// --dry-run must not write the target: /etc/default/grub, the BLS entries and
+// the degraded-safe grub.cfg rewrite all go through the dry-run-aware fsops.FS.
+func TestDryRunWritesNothing(t *testing.T) {
+	sysroot := stageRHELSysroot(t, true)
+	grubDefault := filepath.Join(sysroot, "etc", "default", "grub")
+	if err := os.MkdirAll(filepath.Dir(grubDefault), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	const imageDefault = "GRUB_TIMEOUT=1\nGRUB_CMDLINE_LINUX=\"console=ttyS0\"\n"
+	if err := os.WriteFile(grubDefault, []byte(imageDefault), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bls := writeBLSEntry(t, sysroot, "id-5.14.0-687.12.1.el9_8.x86_64.conf", corrupt687Entry)
+	grubCfg := filepath.Join(sysroot, "boot", "grub2", "grub.cfg")
+	if err := os.MkdirAll(filepath.Dir(grubCfg), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	const mdCfg = "set root='mduuid/3dbc7f6c203c674664990e4cdd81136b'\nlinux /vmlinuz-x\n"
+	if err := os.WriteFile(grubCfg, []byte(mdCfg), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	a := &rhelAdapter{deps: AdapterDeps{
+		FS: fsops.FS{DryRun: true},
+		BootContext: BootContext{
+			Sysroot: sysroot, KernelArgs: "rd.auto",
+			StorageResult: result.StorageResult{Filesystems: []result.Filesystem{{Mount: "/boot"}}},
+		},
+	}}
+	if err := a.writeGrubDefault(); err != nil {
+		t.Fatalf("writeGrubDefault: %v", err)
+	}
+	if err := a.normalizeBLSEntries(); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.makeGrubCfgDegradedSafe(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := readFile(t, grubDefault); got != imageDefault {
+		t.Errorf("dry-run rewrote /etc/default/grub:\n%s", got)
+	}
+	if got := readFile(t, bls); got != corrupt687Entry {
+		t.Errorf("dry-run rewrote the BLS entry:\n%s", got)
+	}
+	if got := readFile(t, grubCfg); got != mdCfg {
+		t.Errorf("dry-run rewrote grub.cfg:\n%s", got)
+	}
+}
+
+// A repair that cannot be written fails finalise: the unrepaired BLS entry or
+// mduuid grub.cfg leaves the node at a GRUB prompt.
+func TestGenerateGrubConfigFailsOnUnwritableRepair(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root writes a read-only file")
+	}
+	for _, c := range []struct {
+		name string
+		path func(sysroot string) string
+	}{
+		{"BLS entry", func(sysroot string) string {
+			return writeBLSEntry(t, sysroot, "id-5.14.0-687.12.1.el9_8.x86_64.conf", corrupt687Entry)
+		}},
+		{"grub.cfg", func(sysroot string) string {
+			p := filepath.Join(sysroot, "boot", "grub2", "grub.cfg")
+			if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(p, []byte("set root='mduuid/3dbc7f6c203c674664990e4cdd81136b'\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			return p
+		}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			sysroot := stageRHELSysroot(t, true)
+			if err := os.Chmod(c.path(sysroot), 0o400); err != nil {
+				t.Fatal(err)
+			}
+			a := &rhelAdapter{deps: AdapterDeps{
+				Runner: executor.NewFakeRunner(executor.FakeResponse{}),
+				BootContext: BootContext{
+					Sysroot:       sysroot,
+					StorageResult: result.StorageResult{Filesystems: []result.Filesystem{{Mount: "/boot"}}},
+				},
+			}}
+			if err := a.generateGrubConfig(context.Background()); err == nil || !errors.Is(err, os.ErrPermission) {
+				t.Fatalf("an unwritable %s must fail generateGrubConfig, got %v", c.name, err)
+			}
+		})
 	}
 }

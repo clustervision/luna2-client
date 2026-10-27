@@ -6,15 +6,23 @@
 //  2. Load + validate the v2 storage JSON
 //  3. Wipe + host guards
 //  4. Unmount any stale /sysroot tree (once)
-//  5. For each set in OS-first execution order:
-//     - resolve devices via selector
-//     - run safety check (if .safety is present)
-//     - cleanup the selected disks
+//  5. Plan EVERY set in OS-first execution order, touching nothing: resolve
+//     devices, health probe (sync/auto), data fence, missing-device rule,
+//     and the deterministic create preflights (raid count, disk fit,
+//     another set's signature, a foreign same-name VG). Any refusal here
+//     parks the node (exit 2/3) with every disk untouched.
+//  6. Execute: identity re-check + cleanup of every set that is
+//     (re)created, then per set either
 //     - memory: build memory filesystems, mount, assemble result
-//     - disk:   partition -> raid -> lvm -> fs -> mount ->
+//     - create: partition -> raid -> lvm -> fs -> mount ->
 //     RecordBlockUUIDs -> assemble result
-//  6. Emit storage-result.json (single object or multi-set wrapper)
+//     - mount:  activate (md --run, VG by uuid) -> mount -> assemble result
+//  7. Emit storage-result.json (single object or multi-set wrapper)
 //     and storage-resolved.json; capture final inventory state.
+//
+// Exit codes: 0 ok; 1 retryable (environmental: I/O, udev, a probe that may
+// clear); 2 safety refusal and 3 fatal config error -- both deterministic,
+// both park the node for an operator instead of retrying every 30 s.
 package main
 
 import (
@@ -23,7 +31,9 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
+	"time"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cleanup"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
@@ -41,12 +51,15 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/partition"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/raid"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sanitize"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/storagehealth"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sysenv"
 )
 
 const toolName = "lpart-storage-prepare"
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, toolName)
 	cli.EnsureInstallerPath()
 	os.Exit(run(os.Args, os.Stdout, os.Stderr))
 }
@@ -83,9 +96,7 @@ const (
 	defaultResolved   = defaultRuntimeDir + "/storage-resolved.json"
 )
 
-// matches bin/lpart-storage-prepare for easy diffing.
-//
-//nolint:gocyclo // command-flow function intentionally linear; structure
+//nolint:gocyclo // command-flow function intentionally linear; structure matches bin/lpart-storage-prepare for easy diffing.
 func run(argv []string, stdout, stderr io.Writer) int {
 	if len(argv) == 0 {
 		argv = []string{toolName}
@@ -96,7 +107,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	f.Bind(fs)
 	fs.StringVar(&f.ConfigPath, "config", "", "Path to v2 storage JSON")
 	fs.BoolVar(&f.Wipe, "wipe", false, "Required to actually touch disks; --dry-run is the alternative")
-	fs.StringVar(&f.ExpectHost, "expect-host", "", "Refuse to run unless `hostname -s` matches this value")
+	fs.StringVar(&f.ExpectHost, "expect-host", "", "Refuse to run unless the hostname matches this value (in full when both carry a domain, else the short names)")
 	fs.StringVar(&f.ResultOut, "result-out", defaultResultOut, "Where to write storage-result.json")
 	fs.StringVar(&f.ResolvedOut, "resolved-out", defaultResolved, "Where to write storage-resolved.json")
 	fs.BoolVar(&f.Details, "details", true, "Verbose: extended device inventory at startup + the final blkid/pvs/vgs/lvs/mdadm evidence (default on; --details=false to quieten)")
@@ -110,7 +121,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	fs.BoolVar(&f.SkipFinalInventory, "skip-final-inventory", false, "(test) skip the blkid/pvs/vgs/lvs/mdadm capture")
 
 	if err := fs.Parse(argv[1:]); err != nil {
-		return 2
+		// A bad command line is identical on every retry: park (exit 3).
+		return cli.ExitFatalConfig(stderr, toolName, "usage", "%v", err)
 	}
 	if f.ShowVersion {
 		_, _ = fmt.Fprintln(stdout, cli.Version())
@@ -126,15 +138,18 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.SetStage("startup")
 	logger.StageBanner("Starting lpart-storage-prepare")
 
+	// A missing install-context reads as the defaults; one that exists but
+	// does not parse fails identically on every retry: park (exit 3).
 	ic, err := installcontext.LoadFile(f.InstallContextPath)
 	if err != nil {
-		errln(stderr, "install-context: %v", err)
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "install-context", "%v", err)
 	}
 	logger.KV("install_mode", string(ic.InstallMode))
 
 	// Installer-env guard.
 	logger.SetStage("installer_check")
+	// Outside the Luna installer this tool must never touch a disk. Exit 1, as
+	// in every lpart tool: the installer's cmdline always passes the guard.
 	if err := sysenv.RequireInstallerEnv(sysenv.Options{
 		CmdlinePath:       f.CmdlinePath,
 		AllowNonInstaller: f.AllowNonInstaller,
@@ -143,16 +158,19 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	// Command preflight (the FAT tool name comes out of this).
+	// Command preflight (the FAT tool names come out of this). A tool missing
+	// from the install ramdisk is missing on every retry: park (exit 3) instead
+	// of looping -- and the fs checkers are part of it, so the health probe can
+	// never read "checker not installed" as "set broken".
 	logger.SetStage("command_checks")
-	fatTool := "mkfs.fat"
+	tools := sysenv.StoragePrepareTools{MkfsFat: "mkfs.fat", FsckVfat: "fsck.vfat"}
 	if !f.SkipCommandCheck {
 		chosen, err := sysenv.RequireStoragePrepareCommands()
 		if err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			return cli.ExitFatalConfig(stderr, toolName, "missing-commands",
+				"%v -- the install ramdisk lacks required storage tools; rebuild it with them", err)
 		}
-		fatTool = chosen
+		tools = chosen
 	}
 
 	// Load + validate config. The disklayout is optional: sanitize needs no
@@ -166,12 +184,16 @@ func run(argv []string, stdout, stderr io.Writer) int {
 				errln(stderr, "config not found: %s", f.ConfigPath)
 				return 1
 			}
-			errln(stderr, "%v", lerr)
-			return 1
+			// Unparsable layout: identical on every retry -> park, do not loop.
+			return cli.ExitFatalConfig(stderr, toolName, "config-load", "%v", lerr)
 		}
 		if verr := loaded.ValidateRaw(raw); verr != nil {
-			errln(stderr, "%v", verr)
-			return 1
+			// An invalid disklayout fails identically on every retry: park for
+			// an operator (exit 3) instead of retrying every 30 s for ever.
+			return cli.ExitFatalConfig(stderr, toolName, "config-validation", "%v", verr)
+		}
+		for _, w := range loaded.Warnings {
+			logger.Warn(w)
 		}
 		cfg = loaded
 	}
@@ -181,14 +203,17 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.KV("details", f.Details)
 
 	if !f.DryRun && !f.Wipe {
-		errln(stderr, "--wipe is required for destructive execution")
-		return 1
+		return cli.ExitFatalConfig(stderr, toolName, "usage", "--wipe is required for destructive execution")
 	}
 	if !f.DryRun {
 		logger.SetStage("expected_host_check")
 		if err := sysenv.RequireExpectedHost(f.ExpectHost, sysenv.Options{
 			Hostname: f.HostnameFunc,
 		}); err != nil {
+			// Wrong node: never touch its disks, and do not retry for ever.
+			if errors.Is(err, sysenv.ErrHostMismatch) {
+				return cli.ExitSafetyRefusal(stderr, toolName, "host-mismatch", "%v", err)
+			}
 			errln(stderr, "%v", err)
 			return 1
 		}
@@ -281,38 +306,41 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	sp := &setProcessor{
 		runner:   runner,
 		logger:   logger,
+		lateWait: selector.LateDeviceWait,
 		selector: selector.New(selector.Options{Runner: runner, Logger: logger, CandidatesOut: stderr}),
 		cleaner:  cleanup.New(cleanup.Options{Runner: runner, Logger: logger}),
 		part:     partition.New(partition.Options{Runner: runner, Logger: logger, DryRun: f.DryRun}),
 		raid:     raid.New(raid.Options{Runner: runner, Logger: logger}),
-		lvm:      lvm.New(lvm.Options{Runner: runner, Logger: logger}),
-		fs:       fsmod.New(fsmod.Options{Runner: runner, Logger: logger, MkfsFatName: fatTool}),
+		lvm:      lvm.New(lvmOptions(runner, logger, f.DryRun)),
+		fs:       fsmod.New(fsmod.Options{Runner: runner, Logger: logger, MkfsFatName: tools.MkfsFat}),
 		mount:    mounter,
-		checker:  fscheck.New(fscheck.Options{Runner: runner, Logger: logger}),
+		checker:  fscheck.New(fscheck.Options{Runner: runner, Logger: logger, FsckVfatCmd: tools.FsckVfat}),
+
+		sanitizeProgress: filepath.Join(filepath.Dir(f.ResultOut), sanitize.ProgressFile),
 	}
 
 	// Discover the disk pool once: selection=discover resolution and sanitize
 	// both draw from it. No size fences — the per-set match does sizing.
-	if pool, derr := discover.ListDevices(context.Background(), discover.Options{
+	mode := ic.InstallMode
+	if pool, derr := listDevices(context.Background(), discover.Options{
 		Runner: runner, Names: discover.NamesKernel,
 	}); derr != nil {
+		// Sanitize erases exactly the pool: an unlisted pool would "succeed"
+		// having erased nothing, and the node would power off as if erased.
+		// That is an error (it may be transient: exit 1), never a success.
+		if mode.IsSanitize() {
+			errln(stderr, "sanitize: device discovery failed, nothing was erased: %v", derr)
+			return 1
+		}
 		logger.Warn("device discovery failed", "err", derr.Error())
+		sp.poolErr = derr
 	} else {
 		sp.pool = pool
 	}
 
-	mode := ic.InstallMode
 	results, resolvedSets, err := sp.runDecision(context.Background(), mode, cfg, detectedFirmware, f.DryRun, f.Wipe && !f.DryRun)
 	if err != nil {
-		// Safety halts (data fence, persistent protection, device overlap)
-		// use the repo's exit-code-2 safety_refusal contract so the wrapper
-		// parks for operator review instead of retrying a permanent refusal.
-		var se *safetyError
-		if errors.As(err, &se) {
-			return cli.ExitSafetyRefusal(stderr, toolName, se.reason, "%s", se.msg)
-		}
-		errln(stderr, "%v", err)
-		return 1
+		return exitForError(stderr, err)
 	}
 
 	logger.SetStage("final_output")
@@ -324,7 +352,11 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	// (FTA v2 BE-Z1 / MCS-18, barrier NB-1). Other modes keep the fail-closed
 	// behaviour: for them an empty result set means something went wrong.
 	if mode.IsSanitize() && len(results) == 0 {
-		logger.UserInfo("sanitize completed: all discovered disks erased; no storage results by design")
+		if sp.sanitized > 0 {
+			logger.UserInfo("sanitize completed: %d local disk(s) erased; no storage results by design", sp.sanitized)
+		} else {
+			logger.UserInfo("sanitize completed: no local disks found -- nothing was erased; no storage results by design")
+		}
 		return 0
 	}
 	if err := result.WriteResolved(f.ResolvedOut, resolvedSets); err != nil {
@@ -368,6 +400,57 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// listDevices enumerates the discover pool; a test seam (the real one runs
+// lsblk against the host the suite runs on).
+var listDevices = discover.ListDevices
+
+// lvmOptions is the LVM wiring of run(). The PV zeroing writes the device
+// directly, past the dry-run runner, so a dry run gets none.
+func lvmOptions(runner executor.Runner, logger *txlog.Logger, dryRun bool) lvm.Options {
+	var zeroPV func(string) error
+	if !dryRun {
+		zeroPV = lvm.ZeroStart
+	}
+	return lvm.Options{Runner: runner, Logger: logger, ZeroDevice: zeroPV}
+}
+
+// exitForError maps a runDecision failure onto the exit contract: safety halts
+// (data fence, persistent protection, device overlap, ...) exit 2 and
+// deterministic configuration errors exit 3 -- both park the node for an
+// operator -- and only what may clear on retry exits 1.
+func exitForError(stderr io.Writer, err error) int {
+	var se *safetyError
+	if errors.As(err, &se) {
+		return cli.ExitSafetyRefusal(stderr, toolName, se.reason, "%s", se.msg)
+	}
+	var fe *fatalConfigError
+	if errors.As(err, &fe) {
+		return cli.ExitFatalConfig(stderr, toolName, fe.reason, "%s", fe.msg)
+	}
+	if tool := lvmCrashed(err); tool != "" {
+		return cli.ExitSafetyRefusal(stderr, toolName, "lvm-crashed",
+			"%s was killed by a signal (%v): lvm2 itself crashed while reading the disks, which usually means damaged LVM metadata remnants on one of them (an lvm2 bug); it crashes the same way on every attempt -- find the device with `pvs -vvvv`, wipe its first MiBs, then retry; no further disk was touched", tool, err)
+	}
+	errln(stderr, "%v", err)
+	return 1
+}
+
+// lvmCrashed returns the lvm tool named in err when that tool was killed by a
+// signal (SIGSEGV, SIGABRT), or "". A crashing lvm2 crashes again on the next
+// attempt with the same disks, so retrying for ever helps nobody.
+func lvmCrashed(err error) string {
+	msg := err.Error()
+	if !strings.Contains(msg, "signal: ") {
+		return ""
+	}
+	for _, tool := range []string{"pvcreate", "vgcreate", "lvcreate", "vgchange", "vgremove", "pvremove", "lvremove", "pvs", "vgs", "lvs"} {
+		if strings.Contains(msg, tool+" ") || strings.Contains(msg, tool+":") {
+			return tool
+		}
+	}
+	return ""
+}
+
 // setProcessor bundles the per-set module instances so process() reads
 // like a checklist instead of a long stack of constructors.
 type setProcessor struct {
@@ -382,14 +465,31 @@ type setProcessor struct {
 	mount    *mount.Mounter
 	checker  *fscheck.Checker  // health probe for the data fence
 	pool     []discover.Device // discovered disks for selection=discover + sanitize
+	// sanitizeReadBack overrides the sanitize read-back verification (tests).
+	sanitizeReadBack func(disk string) (bool, error)
+	// sanitizeProgress records the disks a sanitize erased, for a retry.
+	sanitizeProgress string
 	// protected holds the canonical kernel paths of every PERSISTENT set's
 	// disks (filled by reserveManualSets). It is handed to cleanup as an
 	// independent barrier: no destructive cleanup step may touch these
 	// disks, whatever the selection logic decided.
 	protected map[string]struct{}
-	// resolveFn overrides selector.ResolveAll for reservation; tests inject
-	// it (the real selector needs /dev nodes). nil = use sp.selector.
+	// resolveFn overrides selector.ResolveAll for device resolution; tests
+	// inject it (the real selector needs /dev nodes). nil = use sp.selector.
 	resolveFn func(ctx context.Context, devs []string) ([]selector.Resolved, error)
+	// manualDisks / missing are filled by reserveManualSets: each manual
+	// set's PRESENT devices, and the configured devices absent from the node.
+	manualDisks map[string][]selector.Resolved
+	missing     map[string][]string
+	// lateWait bounds the wait for a manual set's device that is not there
+	// yet (selector.LateDeviceWait; zero in tests).
+	lateWait time.Duration
+	// classifyFn overrides the storagehealth.Classify health probe (tests).
+	classifyFn func(ctx context.Context, set *v2.Set, disks []selector.Resolved) storagehealth.Verdict
+	// poolErr is the device-discovery failure, when listing the pool failed.
+	poolErr error
+	// sanitized counts the disks sanitize erased.
+	sanitized int
 }
 
 // resolveForReservation resolves a manual set's configured devices to
@@ -410,40 +510,61 @@ const (
 	actMount                   // mount an existing layout, no cleanup/create
 )
 
-// process runs the per-set cascade for the decided action and returns the
-// StorageResult + ResolvedSet that go into the two output JSONs. Device
-// resolution for selection=discover sets is done by the caller (applySet), which
-// fills set.Devices before calling process.
-func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmware string, act setAction, dryRun, firstInstall bool) (result.StorageResult, result.ResolvedSet, error) {
+// prepareCreate is the destructive first half of a create: the pre-write
+// identity re-check and the cleanup of the set's disks. executePlans runs it
+// for every create set before any set is built.
+func (sp *setProcessor) prepareCreate(ctx context.Context, p plannedSet, dryRun bool) error {
+	set := p.set
+	// Identity re-verification first (FTA BR-9/MCS-6, TOCTOU): the serial
+	// captured at resolve time is re-read immediately before the first
+	// destructive step. A udev rescan / hotplug between resolve and here can
+	// re-point a kernel name at a DIFFERENT physical disk; a mismatch is a
+	// halt, not a guess. Disks that report no serial (common on virtio)
+	// verify vacuously — the mount/cleanup guards remain for those.
+	sp.logger.SetStage("identity_check")
+	if !dryRun {
+		for _, d := range p.disks {
+			if err := sp.verifyDiskIdentity(ctx, d); err != nil {
+				return err
+			}
+		}
+	}
+
+	sp.logger.SetStage("cleanup")
+	if _, err := sp.cleaner.CleanupSelectedSet(ctx, cleanup.Set{
+		Name:          set.VGName(),
+		SelectedDisks: diskPaths(p.disks),
+		OwnsSysroot:   set.HasRootVolume(),
+		Persistent:    set.Persistent,
+		Protected:     cleanup.SelectedDisksSet(protectedPaths(sp.protected)),
+	}); err != nil {
+		return cleanupError(set.Name, err)
+	}
+	return nil
+}
+
+// process runs the per-set cascade for the planned action and returns the
+// StorageResult + ResolvedSet that go into the two output JSONs. The plan
+// carries the set's resolved disks (planSet); a create's identity check and
+// cleanup already ran (prepareCreate).
+func (sp *setProcessor) process(ctx context.Context, p plannedSet, detectedFirmware string, dryRun bool) (result.StorageResult, result.ResolvedSet, error) {
+	set := p.set
 	storageType := string(set.StorageType())
 	rmode := set.RAIDMode()
+	selectedDisks := p.disks
 
-	var (
-		selectedDisks []selector.Resolved
-		selectorType  string
-	)
-	if storageType == "memory" {
-		selectorType = "memory"
-	} else {
+	selectorType := "memory"
+	if storageType != "memory" {
 		st, err := set.SelectorType()
 		if err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("selector: %w", err)
+			return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("selector", "set %q: selector: %v", set.Name, err)
 		}
 		selectorType = string(st)
-		sp.logger.SetStage("resolve_set")
-		resolved, err := sp.selector.ResolveAll(ctx, set.EffectiveDevices())
-		if err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, err
-		}
-		selectedDisks = resolved
 		// Serial-audit (BE-N5): an empty or duplicated serial makes the
-		// pre-write identity re-check below vacuous. Warn, never fail —
+		// pre-write identity re-check vacuous. Warn, never fail —
 		// serial-less disks are normal on plain virtio.
-		for _, w := range serialCollisionWarnings(resolved) {
+		for _, w := range serialCollisionWarnings(selectedDisks) {
 			sp.logger.Warn(w)
-		}
-		if err := partition.ValidateRAID(rmode, len(resolved)); err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, err
 		}
 	}
 
@@ -467,13 +588,17 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		fs := fsmod.MemoryFilesystems(set)
 		sp.logger.SetStage("mounts")
 		mt, err := sp.mount.MountSysrootTree(ctx, fs)
+		var symlinked *mount.SymlinkError
+		if errors.As(err, &symlinked) {
+			return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("mount-symlink", "set %q: %v", set.Name, err)
+		}
 		if err != nil {
 			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("mount: %w", err)
 		}
 		res := result.Assemble(result.AssembleInput{
 			Set: set, FirmwareMode: firmwareMode,
 			Selected: selectedDisks, Filesystems: fs, Mount: mt,
-			FirstInstall: firstInstall,
+			FirstInstall: p.firstInstall,
 		})
 		return res, resolvedRecord, nil
 	}
@@ -482,7 +607,7 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 	// (sync/auto on an existing layout) mount their volumes against the
 	// predicted device paths with no cleanup and no create. first_install
 	// stays false because the layout was not rebuilt.
-	if set.Persistent || act == actMount {
+	if set.Persistent || p.act == actMount {
 		// Activate the existing layout first (FTA D1): event-based LVM
 		// autoactivation is deliberately disabled for the whole install
 		// (EnsureNoLVMAutoActivate), and persistent/local sets skip the
@@ -493,11 +618,31 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		sp.logger.SetStage("activate_existing")
 		sp.activateExisting(ctx, set, rmode, selectedDisks)
 		sp.logger.SetStage("filesystems")
-		fs := fsmod.PredictFilesystemsForSet(set)
+		// Raw partition paths are anchored on the first PRESENT disk: a
+		// degraded raid set may be missing its first configured member.
+		var firstDisk, firstConfigured string
+		if len(selectedDisks) > 0 {
+			firstDisk = selectedDisks[0].ResolvedPath
+			firstConfigured = selectedDisks[0].ConfiguredPath
+			if firstConfigured == "" {
+				firstConfigured = firstDisk
+			}
+		}
+		biosBoot := set.Role == "os" && storagehealth.HasBIOSBootPartition(ctx, sp.runner, firstDisk)
+		fs := fsmod.PredictFilesystemsOnDisk(set, firstConfigured, biosBoot)
 		sp.logger.SetStage("mounts")
 		mt, err := sp.mount.MountSysrootTree(ctx, fs)
+		var symlinked *mount.SymlinkError
+		if errors.As(err, &symlinked) {
+			return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("mount-symlink", "set %q: %v", set.Name, err)
+		}
 		if err != nil {
-			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("mount: %w", err)
+			// The layout already exists and is not rebuilt here, so a mount
+			// that fails now fails identically on every retry (local on a
+			// damaged disk looped "retrying in 30s" for ever). Park for an
+			// operator: safety refusal, exit 2.
+			return result.StorageResult{}, result.ResolvedSet{}, safetyRefusalf("mount-existing",
+				"set %q: the existing layout cannot be mounted (%v); %s", set.Name, err, mountExistingAdvice(set))
 		}
 		res := result.Assemble(result.AssembleInput{
 			Set: set, FirmwareMode: firmwareMode,
@@ -505,6 +650,11 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 			FirstInstall: false,
 			Persistent:   set.Persistent,
 		})
+		// No Layout was built, so record the boot partition numbers the
+		// builder gave this disk: lpart-bootloader-finalise reads them (BIOS
+		// GRUB refuses without bios_boot_partition; efibootmgr --create needs
+		// the ESP number, which is 2 on a disk laid out under BIOS).
+		res.ESPPartition, res.BIOSBootPartition = existingBootPartitions(set, biosBoot)
 		if !dryRun {
 			if err := result.RecordBlockUUIDs(ctx, sp.runner, &res); err != nil {
 				return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("record uuids: %w", err)
@@ -513,42 +663,15 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		return res, resolvedRecord, nil
 	}
 
-	// Create branch (actCreate): cleanup the selected disks then build the
-	// layout from scratch.
-	//
-	// Identity re-verification first (FTA BR-9/MCS-6, TOCTOU): the serial
-	// captured at resolve time is re-read immediately before the first
-	// destructive step. A udev rescan / hotplug between resolve and here can
-	// re-point a kernel name at a DIFFERENT physical disk; a mismatch is a
-	// halt, not a guess. Disks that report no serial (common on virtio)
-	// verify vacuously — the mount/cleanup guards remain for those.
-	sp.logger.SetStage("identity_check")
-	if !dryRun {
-		for _, d := range selectedDisks {
-			if err := sp.verifyDiskIdentity(ctx, d); err != nil {
-				return result.StorageResult{}, result.ResolvedSet{}, err
-			}
-		}
-	}
-
-	sp.logger.SetStage("cleanup")
-	disks := make([]string, 0, len(selectedDisks))
-	for _, d := range selectedDisks {
-		disks = append(disks, d.ResolvedPath)
-	}
-	if _, err := sp.cleaner.CleanupSelectedSet(ctx, cleanup.Set{
-		Name:          set.VGName(),
-		SelectedDisks: disks,
-		OwnsSysroot:   set.HasRootVolume(),
-		Persistent:    set.Persistent,
-		Protected:     cleanup.SelectedDisksSet(protectedPaths(sp.protected)),
-	}); err != nil {
-		return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("cleanup: %w", err)
-	}
-
+	// Create branch (actCreate): the disks were identity-checked and cleaned
+	// by prepareCreate; build the layout from scratch.
 	sp.logger.SetStage("partitioning")
 	layout, err := sp.part.BuildLayout(ctx, set, selectedDisks, firmwareMode)
 	if err != nil {
+		var tooSmall *partition.DiskTooSmallError
+		if errors.As(err, &tooSmall) {
+			return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("disk-too-small", "set %q: %v", set.Name, err)
+		}
 		return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("partition: %w", err)
 	}
 
@@ -563,6 +686,10 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		sp.logger.SetStage("lvm")
 		lvmState, err = sp.lvm.Build(ctx, set, layout, mdState)
 		if err != nil {
+			var fe *lvm.ForeignVGError
+			if errors.As(err, &fe) {
+				return result.StorageResult{}, result.ResolvedSet{}, safetyRefusalf("foreign-vg", "set %q: %v", set.Name, err)
+			}
 			return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("lvm: %w", err)
 		}
 	}
@@ -575,6 +702,10 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 
 	sp.logger.SetStage("mounts")
 	mt, err := sp.mount.MountSysrootTree(ctx, fs)
+	var symlinked *mount.SymlinkError
+	if errors.As(err, &symlinked) {
+		return result.StorageResult{}, result.ResolvedSet{}, fatalConfigf("mount-symlink", "set %q: %v", set.Name, err)
+	}
 	if err != nil {
 		return result.StorageResult{}, result.ResolvedSet{}, fmt.Errorf("mount: %w", err)
 	}
@@ -584,7 +715,7 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		Set: set, FirmwareMode: firmwareMode,
 		Selected: selectedDisks, Layout: layout, RAID: mdState, LVM: lvmState,
 		Filesystems: fs, Mount: mt,
-		FirstInstall: firstInstall,
+		FirstInstall: p.firstInstall,
 	})
 	if !dryRun {
 		if err := result.RecordBlockUUIDs(ctx, sp.runner, &res); err != nil {
@@ -592,6 +723,48 @@ func (sp *setProcessor) process(ctx context.Context, set *v2.Set, detectedFirmwa
 		}
 	}
 	return res, resolvedRecord, nil
+}
+
+// mountExistingAdvice is the operator hint of a mount-existing refusal. A
+// persistent set is never repartitioned or formatted, in any mode: pointing
+// at install_mode full (which the node may already run) sent the operator in
+// a circle.
+func mountExistingAdvice(set *v2.Set) string {
+	if set.Persistent {
+		return "a persistent set is never repartitioned or formatted, in any install_mode -- operator review required: check its disks and that the layout names the disks that hold it, or remove \"persistent\" from the set so install_mode full recreates it (its data is then lost)"
+	}
+	return "it is not repartitioned in this mode -- operator review required (install_mode full rebuilds the set)"
+}
+
+// existingBootPartitions returns the ESP and BIOS boot partition NUMBERS of an
+// existing os-set layout, as the partition builder numbered them: the BIOS
+// boot partition (EF02) is partition 1 when the disk has one, and the ESP
+// follows it (Set.PartitionNumber). 0 = none.
+func existingBootPartitions(set *v2.Set, biosBoot bool) (esp, bios int) {
+	if set.Role != "os" {
+		return 0, 0
+	}
+	if biosBoot {
+		bios = 1
+	}
+	for _, v := range set.Volumes {
+		if v.Provider == "partition" && v.Mountpoint == "/boot/efi" {
+			esp = set.PartitionNumber(v, biosBoot)
+			break
+		}
+	}
+	return esp, bios
+}
+
+// cleanupError classifies a cleanup failure. A protected-disk barrier refusal
+// is deterministic -- the layout touches a persistent set's disk and refuses
+// identically on every retry -- so it is a safety refusal (exit 2, park for an
+// operator), not a retryable exit 1 that loops every 30 s for ever.
+func cleanupError(setName string, err error) error {
+	if errors.Is(err, cleanup.ErrProtected) {
+		return safetyRefusalf("protected-disk", "set %q: %v", setName, err)
+	}
+	return fmt.Errorf("cleanup: %w", err)
 }
 
 // serialCollisionWarnings audits the resolved disk set for identity
@@ -654,111 +827,15 @@ func (sp *setProcessor) verifyDiskIdentity(ctx context.Context, d selector.Resol
 // idempotent — already-running arrays / active VGs are no-ops — because the
 // subsequent mount is the hard gate with the meaningful error.
 func (sp *setProcessor) activateExisting(ctx context.Context, set *v2.Set, rmode string, disks []selector.Resolved) {
-	run := func(path string, args ...string) {
-		if _, err := sp.runner.Run(ctx, executor.CommandSpec{
-			Path: path, Args: args,
-			CaptureStdout: true, CaptureStderr: true,
-		}); err != nil {
-			sp.logger.Info("activate (best-effort) " + path + " " + strings.Join(args, " ") + ": " + err.Error())
-		}
-	}
-	if rmode != "" && rmode != "none" {
-		mdName := raid.MDNameForSet(set.Name)
-		// Assemble with EXPLICIT members. EnsureNoAutoAssemble writes an
-		// mdadm.conf with no ARRAY lines and auto-assembly disabled for the
-		// whole install, so the previous name-only `mdadm --assemble
-		// /dev/md/<name>` had no way to find its members and ALWAYS failed
-		// (exit 1) — the persistent-RAID mount path was dead on arrival
-		// (regression 3.51 caught it: assemble fails → VG never appears →
-		// mount /dev/<vg>/<lv> exits 32 → retry-park). Members are found by
-		// examining each partition on THIS set's resolved disks, so nothing
-		// outside the set is ever assembled — consistent with the
-		// no-auto-assemble safety posture.
-		sp.assembleExplicit(ctx, mdName, disks, run)
-		if set.Role == "os" {
-			sp.assembleExplicit(ctx, mdName+"-efi", disks, run)
-			sp.assembleExplicit(ctx, mdName+"-boot", disks, run)
-		}
-		run("udevadm", "settle")
-	}
-	if set.StorageType() == v2.StorageLVM {
-		// Manual activation is unaffected by the disabled event-based
-		// autoactivation (auto_activation_volume_list only governs udev's
-		// pvscan) — this is the sanctioned way to bring the VG up.
-		run("vgchange", "-ay", set.VGName())
-		run("udevadm", "settle")
-	}
-}
-
-// assembleExplicit assembles /dev/md/<mdName> from the member partitions it
-// finds on the given disks (mdadm --examine, superblock Name match). No
-// members found is a no-op: the array may already be running, and the
-// subsequent mount stays the hard gate.
-func (sp *setProcessor) assembleExplicit(ctx context.Context, mdName string, disks []selector.Resolved, run func(string, ...string)) {
-	var members []string
+	_ = rmode // the shared routine reads the raid mode from the set itself
+	paths := make([]string, 0, len(disks))
 	for _, d := range disks {
-		for _, p := range sp.partitionsOn(ctx, d.ResolvedPath) {
-			if sp.mdSuperblockName(ctx, p) == mdName {
-				members = append(members, p)
-			}
-		}
+		paths = append(paths, d.ResolvedPath)
 	}
-	if len(members) == 0 {
-		sp.logger.Info("activate: no member partitions with superblock name %q on the set's disks (array already running, or not raid)", mdName)
-		return
-	}
-	run("mdadm", append([]string{"--assemble", "/dev/md/" + mdName}, members...)...)
-}
-
-// partitionsOn lists the partition device paths on one disk. KNAME, not
-// PATH: the PATH column arrived in util-linux 2.33 and el8 ships 2.32 — with
-// PATH the call fails there and activateExisting saw zero partitions, so a
-// persistent md could never be assembled on el8 (regression 3.51 "did not
-// boot", second site of the same bug as cleanup.partitionsOf; discover.go's
-// lsblkDiscoverColumns comment documents the rule).
-func (sp *setProcessor) partitionsOn(ctx context.Context, disk string) []string {
-	res, err := sp.runner.Run(ctx, executor.CommandSpec{
-		Path: "lsblk", Args: []string{"-ln", "-o", "KNAME,TYPE", disk},
-		CaptureStdout: true, CaptureStderr: true,
-	})
-	if err != nil {
-		return nil
-	}
-	var parts []string
-	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 2 && fields[1] == "part" {
-			parts = append(parts, "/dev/"+fields[0])
-		}
-	}
-	return parts
-}
-
-// mdSuperblockName returns the array name from a partition's md superblock
-// ("Name : any:data (...)" → "data"), or "" when the partition has none.
-func (sp *setProcessor) mdSuperblockName(ctx context.Context, part string) string {
-	res, err := sp.runner.Run(ctx, executor.CommandSpec{
-		Path: "mdadm", Args: []string{"--examine", part},
-		CaptureStdout: true, CaptureStderr: true,
-	})
-	if err != nil {
-		return ""
-	}
-	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "Name :") {
-			continue
-		}
-		name := strings.TrimSpace(strings.TrimPrefix(trimmed, "Name :"))
-		if i := strings.IndexAny(name, " \t"); i >= 0 {
-			name = name[:i]
-		}
-		if i := strings.LastIndexByte(name, ':'); i >= 0 {
-			name = name[i+1:]
-		}
-		return name
-	}
-	return ""
+	// Assemble with EXPLICIT members (md auto-assembly is disabled for the
+	// whole install), then vgchange; shared with the health probe so both see
+	// the same devices. See storagehealth.ActivateExisting.
+	storagehealth.ActivateExisting(ctx, sp.runner, set, paths, sp.logger)
 }
 
 // protectedPaths renders the protected-disk set as a path slice for

@@ -10,11 +10,18 @@
 //  4. Write /sysroot/etc/fstab from the filesystem list
 //  5. If clear_uefi_nvram=true on UEFI: bind-mount + ClearUEFINVRAMEntries
 //  6. If boot_method=="none": stop (fstab-only path), after removing any
-//     existing bootloader when the OS set asked for none on UEFI; past that
+//     existing bootloader of a disk OS -- TrinityX NVRAM entries + ESP loaders
+//     on UEFI, MBR boot code + BIOS boot partition on BIOS; past that
 //     point a non-UEFI firmware proceeds only for an OS set that asked for a
 //     bootloader, and only with a BIOS boot partition to install into; else:
-//     bind mounts + family.Prepare → RegenerateInitramfs → Install → Validate
+//     family.Prepare + NVRAM preflight (file checks only) → bind mounts →
+//     RegenerateInitramfs → Install → Validate → VerifyAndReport
 //  7. Always cleanup bind mounts before returning
+//
+// Exit codes: 0 ok; 1 retryable (a command or I/O failed); 2 safety refusal;
+// 3 fatal configuration (a bootloader.FatalError or an invalid storage
+// result: the image lacks something or the layout cannot boot as asked, so a
+// retry -- which in full mode re-wipes the disks -- would fail identically).
 package main
 
 import (
@@ -39,6 +46,7 @@ import (
 const toolName = "lpart-bootloader-finalise"
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, toolName)
 	cli.EnsureInstallerPath()
 	os.Exit(run(os.Args, os.Stdout, os.Stderr))
 }
@@ -83,7 +91,8 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	fs.StringVar(&f.ArchOverride, "arch", "", "(test) override detected architecture")
 
 	if err := fs.Parse(argv[1:]); err != nil {
-		return 2
+		// A bad command line is identical on every retry: park (exit 3).
+		return cli.ExitFatalConfig(stderr, toolName, "usage", "%v", err)
 	}
 	if f.ShowVersion {
 		_, _ = fmt.Fprintln(stdout, cli.Version())
@@ -117,20 +126,18 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.SetStage("command_checks")
 	if !f.SkipCommandCheck {
 		if err := sysenv.RequireCommands(sysenv.BootloaderCommonCommands...); err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			// The install initramfs is the same on every attempt.
+			return cli.ExitFatalConfig(stderr, toolName, "installer-missing-command", "%v", err)
 		}
 	}
 
 	logger.SetStage("result_extraction")
 	sr, err := loadStorageResult(f.ResultPath)
 	if err != nil {
-		errln(stderr, "%v", err)
-		return 1
+		return fail(stderr, "", err)
 	}
 	if err := validateStorageResult(sr); err != nil {
-		errln(stderr, "%v", err)
-		return 1
+		return fail(stderr, "", err)
 	}
 
 	arch := f.ArchOverride
@@ -141,6 +148,10 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.SetStage("build_context")
 	bctx, err := bootloader.BuildBootContext(sr, arch, "")
 	if err != nil {
+		return fail(stderr, "", err)
+	}
+	bctx.ReusesRoot = ic.InstallMode.IsLocal()
+	if bctx.LunaKernelOptions, err = bootloader.LunaKernelOptions(f.CmdlinePath); err != nil {
 		errln(stderr, "%v", err)
 		return 1
 	}
@@ -157,14 +168,12 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	logger.UserInfo("Sysroot: %s", bctx.Sysroot)
 
 	nativeFS := fsops.FS{DryRun: f.DryRun, Logger: logger}
+	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
 
 	logger.SetStage("write_fstab")
-	if err := bootloader.WriteFstab(nativeFS, bctx.Sysroot, bctx.StorageResult); err != nil {
-		errln(stderr, "write fstab: %v", err)
-		return 1
+	if err := bootloader.WriteFstab(nativeFS, runner, bctx.Sysroot, bctx.StorageResult); err != nil {
+		return fail(stderr, "write fstab", err)
 	}
-
-	runner := executor.New(executor.Options{DryRun: f.DryRun, Logger: logger})
 
 	cleanup := func() {
 		bootloader.CleanupBindMounts(context.Background(), runner, bctx.Sysroot, nil)
@@ -177,6 +186,9 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		if bctx.FirmwareMode != "uefi" {
 			logger.UserInfo("clear_uefi_nvram requested but firmware is %q: no UEFI NVRAM to clear", bctx.FirmwareMode)
 		} else {
+			if err := bootloader.RequireEfibootmgr(bctx.Sysroot, "clear_uefi_nvram"); err != nil {
+				return fail(stderr, "", err)
+			}
 			logger.SetStage("bind_mounts")
 			if err := bootloader.BindMountSysroot(context.Background(), runner, bctx.Sysroot, nil); err != nil {
 				errln(stderr, "bind mount: %v", err)
@@ -184,22 +196,33 @@ func run(argv []string, stdout, stderr io.Writer) int {
 			}
 			logger.SetStage("clear_uefi_nvram")
 			if err := bootloader.ClearUEFINVRAMEntries(context.Background(), runner, bctx.Sysroot, bctx.FirmwareMode); err != nil {
-				errln(stderr, "%v", err)
-				return 1
+				return fail(stderr, "", err)
 			}
 		}
 	}
 
 	if bctx.BootMethod == "none" {
 		// Three ways to get here, and the operator has to be told which: a RAM
-		// root with no disk, a firmware with no UEFI boot path, or the OS set
+		// root with no disk (auto with no os set: install_mode=memboot never
+		// runs finalise), a firmware with no UEFI boot path, or the OS set
 		// asking for none. Only the last leaves a previous install behind to
 		// remove.
 		switch {
 		case bctx.StorageResult.StorageType == "memory":
 			logger.UserInfo("No bootloader installed (memory root): fstab written; the node PXE-boots every time")
+		case bctx.FirmwareMode != "uefi" && bctx.BootOrder != "none":
+			logger.UserInfo(`No bootloader installed (firmware is %q and the OS set's bootloader is "last": only "first" installs GRUB for BIOS): fstab written; a GRUB an earlier install left on the disk stays as the fallback behind PXE`, bctx.FirmwareMode)
 		case bctx.FirmwareMode != "uefi":
-			logger.UserInfo("No bootloader installed (firmware is %q: GRUB, shim and the UEFI boot order are UEFI-only): fstab written; the node PXE-boots every time", bctx.FirmwareMode)
+			// An earlier "first" left boot.img in each boot disk's MBR and
+			// core.img in the BIOS boot partition; "none" takes them away.
+			logger.UserInfo(`No bootloader installed (firmware is %q and the OS set asks for bootloader "none"): fstab written; the node PXE-boots every time`, bctx.FirmwareMode)
+			logger.SetStage("remove_bootloader")
+			if err := bootloader.RemoveBIOSBootloader(context.Background(), bootloader.RemoveBIOSBootloaderOptions{
+				Runner: runner, Logger: logger, FS: nativeFS,
+				BootDevices: bctx.StorageResult.BootDevices,
+			}); err != nil {
+				return fail(stderr, "", err)
+			}
 		default:
 			logger.UserInfo(`No bootloader installed (the OS set asks for bootloader "none"): fstab written; the node PXE-boots every time`)
 			logger.SetStage("bind_mounts")
@@ -212,8 +235,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 				Runner: runner, Logger: logger, FS: nativeFS,
 				Sysroot: bctx.Sysroot, Arch: bctx.Architecture,
 			}); err != nil {
-				errln(stderr, "%v", err)
-				return 1
+				return fail(stderr, "", err)
 			}
 		}
 		return 0
@@ -239,12 +261,6 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		}
 	}
 
-	logger.SetStage("bind_mounts")
-	if err := bootloader.BindMountSysroot(context.Background(), runner, bctx.Sysroot, nil); err != nil {
-		errln(stderr, "bind mount: %v", err)
-		return 1
-	}
-
 	adapter, err := bootloader.New(bootloader.AdapterDeps{
 		Runner:      runner,
 		Logger:      logger,
@@ -253,7 +269,24 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		SnapshotDir: defaultRuntimeDir,
 	})
 	if err != nil {
-		errln(stderr, "%v", err)
+		return fail(stderr, "", err)
+	}
+
+	// Everything that only looks at the image and the storage result runs
+	// before the bind mounts and dracut, so a missing package or an
+	// unbootable layout parks (exit 3) at once instead of failing late and
+	// being retried for ever.
+	logger.SetStage("bootloader_prepare")
+	if err := adapter.Prepare(context.Background()); err != nil {
+		return fail(stderr, "", err)
+	}
+	if err := bootloader.RequireNVRAMTooling(bctx); err != nil {
+		return fail(stderr, "", err)
+	}
+
+	logger.SetStage("bind_mounts")
+	if err := bootloader.BindMountSysroot(context.Background(), runner, bctx.Sysroot, nil); err != nil {
+		errln(stderr, "bind mount: %v", err)
 		return 1
 	}
 
@@ -261,15 +294,18 @@ func run(argv []string, stdout, stderr io.Writer) int {
 		name string
 		fn   func(context.Context) error
 	}{
-		{"bootloader_prepare", adapter.Prepare},
 		{"initramfs", adapter.RegenerateInitramfs},
 		{"bootloader_install", adapter.Install},
 		{"bootloader_validate", adapter.Validate},
 	} {
+		if f.DryRun && step.name == "bootloader_validate" {
+			// nothing was written, so there is nothing on the disk to validate
+			logger.UserInfo("Dry run: nothing written; validation and verification skipped")
+			return 0
+		}
 		logger.SetStage(step.name)
 		if err := step.fn(context.Background()); err != nil {
-			errln(stderr, "%v", err)
-			return 1
+			return fail(stderr, "", err)
 		}
 	}
 
@@ -314,6 +350,28 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+// fail reports err and returns the exit code for it: exit 3 (park,
+// fatal_config=<reason>) for a bootloader.FatalError -- the image lacks
+// something or the configuration cannot boot, so every retry fails the same
+// way -- and exit 1 (retry) for everything else: a failed command, an I/O
+// error, a mount.
+func fail(stderr io.Writer, prefix string, err error) int {
+	msg := err.Error()
+	if prefix != "" {
+		msg = prefix + ": " + msg
+	}
+	if fe, ok := bootloader.AsFatal(err); ok {
+		return cli.ExitFatalConfig(stderr, toolName, fe.Reason, "%s", msg)
+	}
+	errln(stderr, "%s", msg)
+	return 1
+}
+
+// fatalConfig is a storage-result problem that no retry can fix.
+func fatalConfig(reason, format string, args ...any) error {
+	return &bootloader.FatalError{Kind: "config", Reason: reason, Err: fmt.Errorf(format, args...)}
+}
+
 // loadStorageResult decodes a storage-result.json file. The bash
 // predecessor handles two shapes:
 //
@@ -341,13 +399,16 @@ func loadStorageResult(path string) (result.StorageResult, error) {
 		for i := range multi.Sets {
 			s := &multi.Sets[i]
 			if s.Role == "os" {
+				if osSet != nil {
+					return result.StorageResult{}, fatalConfig("storage-result-invalid", "more than one os set in storage-result sets[] (%q and %q)", osSet.Name, s.Name)
+				}
 				osSet = s
 				continue
 			}
 			dataFS = append(dataFS, s.Filesystems...)
 		}
 		if osSet == nil {
-			return result.StorageResult{}, fmt.Errorf("expected exactly one OS role set in storage-result sets[]")
+			return result.StorageResult{}, fatalConfig("storage-result-invalid", "expected exactly one OS role set in storage-result sets[]")
 		}
 		osSet.Filesystems = append(osSet.Filesystems, dataFS...)
 		return *osSet, nil
@@ -356,7 +417,7 @@ func loadStorageResult(path string) (result.StorageResult, error) {
 	// Single-set shape.
 	var single result.StorageResult
 	if err := json.Unmarshal(body, &single); err != nil {
-		return result.StorageResult{}, fmt.Errorf("decode storage-result: %w", err)
+		return result.StorageResult{}, fatalConfig("storage-result-invalid", "decode storage-result: %v", err)
 	}
 	return single, nil
 }
@@ -366,10 +427,10 @@ func loadStorageResult(path string) (result.StorageResult, error) {
 // boot_method != none; filesystems and boot_devices are populated.
 func validateStorageResult(sr result.StorageResult) error {
 	if sr.MountedTargetRoot == "" {
-		return fmt.Errorf("storage-result missing mounted_target_root")
+		return fatalConfig("storage-result-invalid", "storage-result missing mounted_target_root")
 	}
 	if sr.MountedTargetRoot[0] != '/' {
-		return fmt.Errorf("storage-result mounted_target_root must be an absolute path: %s", sr.MountedTargetRoot)
+		return fatalConfig("storage-result-invalid", "storage-result mounted_target_root must be an absolute path: %s", sr.MountedTargetRoot)
 	}
 	if info, err := os.Stat(sr.MountedTargetRoot); err != nil || !info.IsDir() {
 		return fmt.Errorf("missing sysroot directory: %s", sr.MountedTargetRoot)
@@ -380,14 +441,17 @@ func validateStorageResult(sr result.StorageResult) error {
 	}
 	if bm != "none" {
 		if _, err := os.Stat(sr.MountedTargetRoot + "/etc/os-release"); err != nil {
-			return fmt.Errorf("missing %s/etc/os-release", sr.MountedTargetRoot)
+			// The image was extracted (lpart-osimage-install succeeded) and
+			// has no os-release: the next download is the same image.
+			return &bootloader.FatalError{Kind: "image", Reason: "image-missing-os-release",
+				Err: fmt.Errorf("missing %s/etc/os-release", sr.MountedTargetRoot)}
 		}
 	}
 	if sr.Filesystems == nil {
-		return fmt.Errorf("storage-result filesystems must be an array")
+		return fatalConfig("storage-result-invalid", "storage-result filesystems must be an array")
 	}
 	if sr.BootDevices == nil && bm != "none" {
-		return fmt.Errorf("storage-result boot_devices must be an array")
+		return fatalConfig("storage-result-invalid", "storage-result boot_devices must be an array")
 	}
 	return nil
 }

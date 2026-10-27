@@ -3,9 +3,14 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"slices"
+	"strconv"
 	"strings"
 	"testing"
+
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/osimage"
 )
 
 // Per the cross-tool convention, cmd-level tests cover the orchestrator
@@ -179,8 +184,9 @@ func TestRefusesOnInstallModeLocal(t *testing.T) {
 		"--install-context", ic,
 		"--skip-sysroot-check",
 	)
-	if rc != 1 {
-		t.Fatalf("expected rc=1; got %d (stderr=%s)", rc, stderr)
+	// deterministic (wrong tool for the mode): park, never retry
+	if rc != 3 {
+		t.Fatalf("expected rc=3; got %d (stderr=%s)", rc, stderr)
 	}
 	if !strings.Contains(stderr, "install_mode=local") {
 		t.Fatalf("error should quote install_mode value:\n%s", stderr)
@@ -250,6 +256,138 @@ func TestPersistentMountpointsAddedToExcludes(t *testing.T) {
 	}
 	if !strings.Contains(logBody, "--exclude=./data") {
 		t.Fatalf("missing --exclude=./data in tar_excludes; got:\n%s", logBody)
+	}
+}
+
+// A persistent mountpoint written non-canonically still keeps the image out:
+// GNU tar, given the logged excludes, leaves the files below it alone.
+func TestPersistentMountpointExcludesAreCanonical(t *testing.T) {
+	tmp := t.TempDir()
+	ic := filepath.Join(tmp, "install-context.json")
+	if err := os.WriteFile(ic, []byte(`{"install_mode":"auto","osimage_sync":"Full"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sr := filepath.Join(tmp, "storage-result.json")
+	body := `{"version":2,"sets":[
+        {"name":"os","role":"os","persistent":false,"filesystems":[{"mount":"/","device":"tmpfs","fs":"tmpfs"}]},
+        {"name":"data","role":"data","persistent":true,"filesystems":[
+            {"mount":"/home/","device":"/dev/data/a","fs":"xfs"},
+            {"mount":"//srv","device":"/dev/data/b","fs":"xfs"},
+            {"mount":"/opt/./x","device":"/dev/data/c","fs":"xfs"}]}
+    ]}`
+	if err := os.WriteFile(sr, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := writeInstallScript(t, `LUNA_TOKEN="x"`+"\n"+`luna_url="http://controller/files/image.tar.bz2"`+"\n")
+	stderr, logBody, rc := runEnvWithLog(t, "--install-context", ic, "--storage-result", sr, "--skip-sysroot-check",
+		"--skip-download", "--allow-non-installer", "--luna-install-script", script, "--luna-token", "envtoken")
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+	_, rest, ok := strings.Cut(logBody, `tar_excludes="`)
+	if !ok {
+		t.Fatalf("no tar_excludes in the log:\n%s", logBody)
+	}
+	excludes, _, _ := strings.Cut(rest, `"`)
+
+	src, dst := filepath.Join(tmp, "image"), filepath.Join(tmp, "sysroot")
+	files := []string{"home/alice/.bashrc", "srv/www/index", "opt/x/state"}
+	for _, f := range files {
+		for root, body := range map[string]string{src: "image", dst: "USERDATA"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(root, f)), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, f), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	tarball := filepath.Join(tmp, "image.tar")
+	if out, err := exec.Command("tar", "-cf", tarball, "-C", src, ".").CombinedOutput(); err != nil { //nolint:gosec // test paths
+		t.Fatalf("build image: %v: %s", err, out)
+	}
+	args := append(strings.Fields(excludes), "-xf", tarball, "-C", dst)
+	if out, err := exec.Command("tar", args...).CombinedOutput(); err != nil { //nolint:gosec // test paths
+		t.Fatalf("extract: %v: %s", err, out)
+	}
+	for _, f := range files {
+		if got, _ := os.ReadFile(filepath.Join(dst, f)); string(got) != "USERDATA" { //nolint:gosec // test path
+			t.Errorf("%s overwritten by the image (excludes %q)", f, excludes)
+		}
+	}
+}
+
+// A persistent mountpoint is matched literally by the real tar and by
+// ExcludedByTar: "[", "*" and "?" in it are not wildcards.
+func TestPersistentMountpointExcludesAreLiteral(t *testing.T) {
+	tmp := t.TempDir()
+	ic := filepath.Join(tmp, "install-context.json")
+	if err := os.WriteFile(ic, []byte(`{"install_mode":"auto","osimage_sync":"Full"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sr := filepath.Join(tmp, "storage-result.json")
+	body := `{"version":2,"sets":[
+        {"name":"os","role":"os","persistent":false,"filesystems":[{"mount":"/","device":"tmpfs","fs":"tmpfs"}]},
+        {"name":"data","role":"data","persistent":true,"filesystems":[
+            {"mount":"/data[1]","device":"/dev/data/a","fs":"xfs"},
+            {"mount":"/st*r","device":"/dev/data/b","fs":"xfs"},
+            {"mount":"/q?x","device":"/dev/data/c","fs":"xfs"}]}
+    ]}`
+	if err := os.WriteFile(sr, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	script := writeInstallScript(t, `LUNA_TOKEN="x"`+"\n"+`luna_url="http://controller/files/image.tar.bz2"`+"\n")
+	stderr, logBody, rc := runEnvWithLog(t, "--install-context", ic, "--storage-result", sr, "--skip-sysroot-check",
+		"--skip-download", "--allow-non-installer", "--luna-install-script", script, "--luna-token", "envtoken")
+	if rc != 0 {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+	_, rest, ok := strings.Cut(logBody, `tar_excludes="`)
+	if !ok {
+		t.Fatalf("no tar_excludes in the log:\n%s", logBody)
+	}
+	quoted, _, _ := strings.Cut(rest, `"`)
+	excludes, err := strconv.Unquote(`"` + quoted + `"`)
+	if err != nil {
+		t.Fatalf("tar_excludes %q: %v", quoted, err)
+	}
+
+	src, dst := filepath.Join(tmp, "image"), filepath.Join(tmp, "sysroot")
+	kept := []string{"data[1]/state", "st*r/f", "q?x/f"}
+	written := []string{"data1/state", "stXr/f", "qyx/f"}
+	for _, f := range append(slices.Clone(kept), written...) {
+		for root, body := range map[string]string{src: "image", dst: "USERDATA"} {
+			if err := os.MkdirAll(filepath.Dir(filepath.Join(root, f)), 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(root, f), []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	tarball := filepath.Join(tmp, "image.tar")
+	if out, err := exec.Command("tar", "-cf", tarball, "-C", src, ".").CombinedOutput(); err != nil { //nolint:gosec // test paths
+		t.Fatalf("build image: %v: %s", err, out)
+	}
+	args := append(strings.Fields(excludes), "-xf", tarball, "-C", dst)
+	if out, err := exec.Command("tar", args...).CombinedOutput(); err != nil { //nolint:gosec // test paths
+		t.Fatalf("extract: %v: %s", err, out)
+	}
+	for _, f := range kept {
+		if got, _ := os.ReadFile(filepath.Join(dst, f)); string(got) != "USERDATA" { //nolint:gosec // test path
+			t.Errorf("%s overwritten by the image (excludes %q)", f, excludes)
+		}
+		if !osimage.ExcludedByTar(f, strings.Fields(excludes)) {
+			t.Errorf("ExcludedByTar disagrees with tar: %s is excluded", f)
+		}
+	}
+	for _, f := range written {
+		if got, _ := os.ReadFile(filepath.Join(dst, f)); string(got) != "image" { //nolint:gosec // test path
+			t.Errorf("%s was not extracted (excludes %q)", f, excludes)
+		}
+		if osimage.ExcludedByTar(f, strings.Fields(excludes)) {
+			t.Errorf("ExcludedByTar disagrees with tar: %s is extracted", f)
+		}
 	}
 }
 
@@ -403,5 +541,93 @@ func TestResolveStreamPolicy(t *testing.T) {
 				t.Fatalf("resolveStreamPolicy(%q, %q) = %q, want %q", tc.flagVal, tc.cmdline, got, tc.want)
 			}
 		})
+	}
+}
+
+// The sync sweep converges only the os set's volumes: the set with role "os",
+// or the one holding "/" when no role is written.
+func TestStorageResultOSMountpoints(t *testing.T) {
+	sr := filepath.Join(t.TempDir(), "storage-result.json")
+	body := `{"version":2,"sets":[
+        {"name":"os","role":"os","filesystems":[{"mount":"/"},{"mount":"/boot"},{"mount":"/boot/efi"},{"mount":"swap"}]},
+        {"name":"scratch","filesystems":[{"mount":"/scratch"}]},
+        {"name":"data","role":"data","persistent":true,"filesystems":[{"mount":"/data"}]}
+    ]}`
+	if err := os.WriteFile(sr, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	s, err := readStorageResultSummary(sr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Join(relMounts(s.OSMountpoints), ","); got != "boot,boot/efi" {
+		t.Fatalf("os mountpoints = %q, want boot,boot/efi", got)
+	}
+	if err := os.WriteFile(sr, []byte(`{"version":2,"filesystems":[{"mount":"/"},{"mount":"/var"}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if s, err = readStorageResultSummary(sr); err != nil || strings.Join(relMounts(s.OSMountpoints), ",") != "var" {
+		t.Fatalf("single set holding /: os mountpoints %v, err %v", s.OSMountpoints, err)
+	}
+}
+
+// Persistent sets are never written: an image_wins entry that reaches one is a
+// configuration error, refused before anything is extracted.
+func TestImageWinsIntoPersistentRefused(t *testing.T) {
+	tmp := t.TempDir()
+	pm := filepath.Join(tmp, "mounts")
+	cfg := filepath.Join(tmp, "filter.json")
+	sr := filepath.Join(tmp, "storage-result.json")
+	for p, body := range map[string]string{
+		pm:  "tmpfs /sysroot tmpfs rw 0 0\n",
+		cfg: `{"image_wins": ["home/alice/.bashrc"]}`,
+		sr: `{"version":2,"sets":[{"name":"os","role":"os","filesystems":[{"mount":"/"}]},
+			{"name":"home","role":"data","persistent":true,"filesystems":[{"mount":"/home"}]}]}`,
+	} {
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	stderr, rc := runEnv(t, "--proc-mounts", pm, "--sysroot", "/sysroot", "--config", cfg, "--storage-result", sr,
+		"--luna-token", "x", "--osimage-file", "img.tar.bz2", "--luna-install-script", "/nonexistent-for-test", "--skip-download")
+	if rc != 3 || !strings.Contains(stderr, "persistent mountpoint /home") {
+		t.Fatalf("want exit 3 naming the persistent mountpoint; rc=%d stderr=%s", rc, stderr)
+	}
+}
+
+// The refusal compares normalised mountpoints, as the extract excludes do, so
+// a non-canonical spelling of the persistent mountpoint is refused too.
+func TestImageWinsIntoNonCanonicalPersistentRefused(t *testing.T) {
+	for _, mp := range []string{"/home/alice", "/home/./alice", "/home//alice", "/home/alice/"} {
+		tmp := t.TempDir()
+		pm := filepath.Join(tmp, "mounts")
+		cfg := filepath.Join(tmp, "filter.json")
+		sr := filepath.Join(tmp, "storage-result.json")
+		for p, body := range map[string]string{
+			pm:  "tmpfs /sysroot tmpfs rw 0 0\n",
+			cfg: `{"image_wins": ["home/alice/.bashrc"]}`,
+			sr: `{"version":2,"sets":[{"name":"os","role":"os","filesystems":[{"mount":"/"}]},
+			{"name":"home","role":"data","persistent":true,"filesystems":[{"mount":"` + mp + `"}]}]}`,
+		} {
+			if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		stderr, rc := runEnv(t, "--proc-mounts", pm, "--sysroot", "/sysroot", "--config", cfg, "--storage-result", sr,
+			"--luna-token", "x", "--osimage-file", "img.tar.bz2", "--luna-install-script", "/nonexistent-for-test", "--skip-download")
+		if rc != 3 || !strings.Contains(stderr, "persistent mountpoint /home/alice,") {
+			t.Fatalf("%s: want exit 3 naming the persistent mountpoint; rc=%d stderr=%s", mp, rc, stderr)
+		}
+	}
+}
+
+// A bad command line is the same on every attempt: exit 3 parks with a
+// fatal_config line, as in every lpart tool; exit 2 is reserved for safety
+// refusals.
+func TestBadFlagIsFatalConfig(t *testing.T) {
+	var out, errb bytes.Buffer
+	rc := run([]string{toolName, "--no-such-flag"}, &out, &errb)
+	if rc != 3 || !strings.Contains(errb.String(), "fatal_config=usage") {
+		t.Fatalf("rc=%d (want 3), stderr=%s", rc, errb.String())
 	}
 }

@@ -118,3 +118,194 @@ func utf16ToString(u []uint16) string {
 	}
 	return b.String()
 }
+
+// espTree writes files under <sysroot>/boot/efi/EFI: map of "dir/name" -> body.
+func espTree(t *testing.T, sysroot string, files map[string]string) {
+	t.Helper()
+	for rel, body := range files {
+		p := filepath.Join(sysroot, "boot", "efi", "EFI", rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func osRelease(t *testing.T, sysroot, body string) {
+	t.Helper()
+	p := filepath.Join(sysroot, "etc", "os-release")
+	if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func espFile(t *testing.T, sysroot, rel string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(sysroot, "boot", "efi", "EFI", rel)) //nolint:gosec // test artefact
+	if err != nil {
+		t.Fatalf("EFI/%s: %v", rel, err)
+	}
+	return string(b)
+}
+
+const testBootUUID = "abcdef00-0000-0000-0000-000000000001"
+
+func stageOpts(sysroot string) StageSignedShimOpts {
+	return StageSignedShimOpts{
+		Sysroot: sysroot, Arch: "x86_64", GrubDirName: "grub2", Family: FamilyRHEL,
+		StorageResult: result.StorageResult{Filesystems: []result.Filesystem{{Mount: "/boot", UUID: testBootUUID}}},
+	}
+}
+
+// Review finding 1: a RHEL 8 image whose shim and grub sit in different
+// vendor directories used to fail with "no signed shim+grub found". The shim's
+// directory wins, grub (and MokManager) are copied beside it, and both
+// directories get the stub because the grub's baked prefix names its own.
+func TestStageSignedShimSplitPair(t *testing.T) {
+	for _, tc := range []struct {
+		name, osrel, shimDir, grubDir string
+	}{
+		{"shim in redhat, grub in rocky", "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n", "redhat", "rocky"},
+		{"shim in rocky, grub in redhat", "ID=\"rhel\"\nID_LIKE=\"fedora\"\n", "rocky", "redhat"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sysroot := t.TempDir()
+			osRelease(t, sysroot, tc.osrel)
+			espTree(t, sysroot, map[string]string{
+				tc.shimDir + "/shimx64.efi": "SHIM",
+				tc.grubDir + "/grubx64.efi": "GRUB",
+				tc.grubDir + "/mmx64.efi":   "MOK",
+			})
+			if err := StageSignedShim(stageOpts(sysroot)); err != nil {
+				t.Fatalf("StageSignedShim: %v", err)
+			}
+			for rel, want := range map[string]string{
+				tc.shimDir + "/grubx64.efi": "GRUB",
+				tc.shimDir + "/mmx64.efi":   "MOK",
+				"BOOT/BOOTX64.EFI":          "SHIM",
+				"BOOT/grubx64.efi":          "GRUB",
+			} {
+				if got := espFile(t, sysroot, rel); got != want {
+					t.Errorf("EFI/%s = %q, want %q", rel, got, want)
+				}
+			}
+			for _, d := range []string{tc.shimDir, tc.grubDir} {
+				if !strings.Contains(espFile(t, sysroot, d+"/grub.cfg"), testBootUUID) {
+					t.Errorf("EFI/%s/grub.cfg stub missing", d)
+				}
+			}
+			loader, ok := signedShimLoaderPath(sysroot, "x86_64")
+			if want := `\EFI\` + tc.shimDir + `\shimx64.efi`; !ok || loader != want {
+				t.Errorf("NVRAM loader = %q (%v), want %q", loader, ok, want)
+			}
+		})
+	}
+}
+
+// A split pair in dry-run is reported but nothing is copied.
+func TestStageSignedShimSplitPairDryRun(t *testing.T) {
+	sysroot := t.TempDir()
+	osRelease(t, sysroot, "ID=rocky\nID_LIKE=\"rhel centos fedora\"\n")
+	espTree(t, sysroot, map[string]string{"redhat/shimx64.efi": "SHIM", "rocky/grubx64.efi": "GRUB"})
+	opts := stageOpts(sysroot)
+	opts.FS = fsops.FS{DryRun: true}
+	if err := StageSignedShim(opts); err != nil {
+		t.Fatalf("StageSignedShim: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(sysroot, "boot", "efi", "EFI", "redhat", "grubx64.efi")); err == nil {
+		t.Fatal("dry-run copied grub")
+	}
+}
+
+// Review finding 2: the image's own vendor directory beats a stale one from an
+// earlier image, whatever the alphabet says; with no usable os-release the old
+// alphabetical choice stands.
+func TestFindSignedShimPrefersImageDistro(t *testing.T) {
+	stale := map[string]string{
+		"redhat/shimx64.efi": "OLD-SHIM", "redhat/grubx64.efi": "OLD-GRUB",
+		"rocky/shimx64.efi": "NEW-SHIM", "rocky/grubx64.efi": "NEW-GRUB",
+	}
+	for _, tc := range []struct{ name, osrel, wantDir string }{
+		{"rocky image, stale redhat dir", "ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\n", "rocky"},
+		{"rhel image, stale rocky dir", "ID=\"rhel\"\nID_LIKE=\"fedora\"\n", "redhat"},
+		{"oracle linux uses EFI/redhat", "ID=\"ol\"\nID_LIKE=\"fedora\"\n", "redhat"},
+		{"no os-release: alphabetical as before", "", "redhat"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sysroot := t.TempDir()
+			if tc.osrel != "" {
+				osRelease(t, sysroot, tc.osrel)
+			}
+			espTree(t, sysroot, stale)
+			sel, err := findSignedShim(sysroot, "x86_64")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if filepath.Base(sel.dir) != tc.wantDir || sel.split() {
+				t.Fatalf("picked %s (split=%v), want %s", sel.dir, sel.split(), tc.wantDir)
+			}
+			if err := StageSignedShim(stageOpts(sysroot)); err != nil {
+				t.Fatal(err)
+			}
+			want := "NEW-SHIM"
+			if tc.wantDir == "redhat" {
+				want = "OLD-SHIM"
+			}
+			if got := espFile(t, sysroot, "BOOT/BOOTX64.EFI"); got != want {
+				t.Errorf("removable fallback = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+// Review finding 2, staging side: an Ubuntu image on an ESP that still holds
+// an earlier Rocky install's pair must stage its own pair, not call the Rocky
+// one "already staged" -- and the staged pair is the one used.
+func TestEnsureSignedPairStagedIgnoresOtherDistroPair(t *testing.T) {
+	sysroot := t.TempDir()
+	osRelease(t, sysroot, "ID=ubuntu\nID_LIKE=debian\n")
+	espTree(t, sysroot, map[string]string{"rocky/shimx64.efi": "ROCKY-SHIM", "rocky/grubx64.efi": "ROCKY-GRUB"})
+	mustWriteFile(t, filepath.Join(sysroot, "usr/lib/shim/shimx64.efi.signed"), "UBUNTU-SHIM")
+	mustWriteFile(t, filepath.Join(sysroot, "usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed"), "UBUNTU-GRUB")
+	opts := stageOpts(sysroot)
+	opts.Family, opts.GrubDirName = FamilyDebian, "grub"
+	if err := StageSignedShim(opts); err != nil {
+		t.Fatalf("StageSignedShim: %v", err)
+	}
+	if got := espFile(t, sysroot, "ubuntu/shimx64.efi"); got != "UBUNTU-SHIM" {
+		t.Fatalf("image pair not staged: %q", got)
+	}
+	if got := espFile(t, sysroot, "BOOT/BOOTX64.EFI"); got != "UBUNTU-SHIM" {
+		t.Fatalf("removable fallback = %q, want the image's own shim", got)
+	}
+	if loader, _ := signedShimLoaderPath(sysroot, "x86_64"); loader != `\EFI\ubuntu\shimx64.efi` {
+		t.Fatalf("NVRAM loader = %q", loader)
+	}
+}
+
+// ...but an image with no package copy to stage from keeps working with the
+// pair the ESP has, as it did before.
+func TestEnsureSignedPairStagedFallsBackToESPPair(t *testing.T) {
+	sysroot := t.TempDir()
+	osRelease(t, sysroot, "ID=ubuntu\nID_LIKE=debian\n")
+	espTree(t, sysroot, map[string]string{"rocky/shimx64.efi": "S", "rocky/grubx64.efi": "G"})
+	if err := ensureSignedPairStaged(StageSignedShimOpts{Sysroot: sysroot, Arch: "x86_64", Family: FamilyDebian}); err != nil {
+		t.Fatalf("must fall back to the ESP pair, got %v", err)
+	}
+}
+
+// No shim anywhere is an image problem: typed, so finalise parks with exit 3.
+func TestFindSignedShimMissingIsImageError(t *testing.T) {
+	sysroot := t.TempDir()
+	espTree(t, sysroot, map[string]string{"rocky/grubx64.efi": "G"})
+	err := StageSignedShim(stageOpts(sysroot))
+	fe, ok := AsFatal(err)
+	if !ok || fe.Kind != "image" || fe.Reason != "image-no-signed-shim" {
+		t.Fatalf("want an image FatalError, got %v", err)
+	}
+}

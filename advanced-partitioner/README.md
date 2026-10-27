@@ -104,7 +104,10 @@ luna node change node001 -qosimage-filter  /path/to/osimage-filter.json
 For the default (non-legacy) path the Luna `install.sh` template
 (`templ_install_lpart.cfg`) inlines these into
 `/tmp/install_files/runtime/*.json` before the partscript runs, then the
-`lpart-phase` shim drives `lpart-node-installer --phase pre|part|post`.
+`lpart-phase` shim drives `lpart-node-installer --phase pre|part|post`;
+`luna_finish` (dracut's `luna-installer.sh` and initramfs-tools' `luna-start`) runs
+`lpart-phase finish` last, which flushes the installed system to disk before the
+hand-over to it.
 
 ## Status
 

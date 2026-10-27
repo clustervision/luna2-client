@@ -3,15 +3,13 @@ package main
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/discover"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/disk/selector"
-	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
-	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
 )
 
 // runWithEnv drives main.run with the given args and an empty default
@@ -39,9 +37,14 @@ func runWithBootEnv(t *testing.T, firmware string, pivots bool, args ...string) 
 	detectFirmware = func() string { return firmware }
 	prevPivots := detectRamdiskPivots
 	detectRamdiskPivots = func() bool { return pivots }
+	// Hermetic pool: never enumerate (or dry-run-sanitize) the disks of the
+	// host the suite runs on.
+	prevList := listDevices
+	listDevices = func(context.Context, discover.Options) ([]discover.Device, error) { return nil, nil }
 	t.Cleanup(func() {
 		detectFirmware = prevDetect
 		detectRamdiskPivots = prevPivots
+		listDevices = prevList
 	})
 	tmp := t.TempDir()
 
@@ -76,12 +79,14 @@ func writeConfig(t *testing.T, body string) string {
 }
 
 // validConfig is a minimal valid v1.4 disklayout (single-disk manual LVM OS
-// set) used by the guard tests, which return before any disk work.
+// set) used by the guard tests, which return before any disk work. The device
+// does not exist on any host, so no test ever probes the disks of the machine
+// the suite runs on (a real, mounted /dev/sda used to be resolved here).
 const validConfig = `{
 	"version": 2,
 	"sets": [
 		{"name": "os", "role": "os", "selection": "manual", "raid": "none",
-		 "devices": ["/dev/sda"],
+		 "devices": ["/dev/disk/by-id/lpart-test-no-such-disk"],
 		 "volumes": [
 		   {"name": "uefi", "mountpoint": "/boot/efi", "fs": "vfat", "provider": "partition", "size": "600M"},
 		   {"name": "root", "mountpoint": "/", "fs": "xfs", "provider": "lvm", "size": "100%"}
@@ -106,8 +111,8 @@ func TestNoConfigAutoFallsBackToMemboot(t *testing.T) {
 func TestRequiresWipeWhenNotDryRun(t *testing.T) {
 	cfg := writeConfig(t, validConfig)
 	_, stderr, rc := runWithEnv(t, "--config", cfg)
-	if rc == 0 {
-		t.Fatalf("expected --wipe required; stderr=%s", stderr)
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=usage") {
+		t.Fatalf("a missing --wipe is a deterministic usage error (exit 3); rc=%d stderr=%s", rc, stderr)
 	}
 	if !strings.Contains(stderr, "--wipe is required") {
 		t.Fatalf("wording wrong: %s", stderr)
@@ -116,9 +121,10 @@ func TestRequiresWipeWhenNotDryRun(t *testing.T) {
 
 // A BIOS/legacy-CSM node partitions and installs like a UEFI node: GRUB, shim
 // and the UEFI boot order are the only parts that are skipped, and the node
-// PXE-boots every time. The run is warned about, never refused. Disk
-// resolution fails in the test sandbox (no real /dev/sda), so the assertion is
-// that the boot preflight let the run through and logged the warning.
+// PXE-boots every time. The run is warned about, never refused. The layout's
+// disk does not exist (fatal config, exit 3, after the boot preflight), so the
+// assertion is that the boot preflight let the run through and logged the
+// warning.
 func TestBIOSDiskOSProceedsWithWarning(t *testing.T) {
 	prev := detectFirmware
 	detectFirmware = func() string { return "bios" }
@@ -155,6 +161,36 @@ func TestBIOSDiskOSProceedsWithWarning(t *testing.T) {
 	for _, want := range []string{"level=WARN", "GRUB, shim and the UEFI boot order are skipped", "PXE-boots every time"} {
 		if !strings.Contains(logText, want) {
 			t.Fatalf("expected the BIOS warning to say %q; log=%s", want, logText)
+		}
+	}
+}
+
+// A layout the validator accepts with a warning installs, and the warning
+// reaches the tool log at WARN level so the operator sees what was read.
+func TestConfigWarningsAreLogged(t *testing.T) {
+	tmp := t.TempDir()
+	cmdline := filepath.Join(tmp, "cmdline")
+	if err := os.WriteFile(cmdline, []byte("root=luna rw\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	logDir := filepath.Join(tmp, "logs")
+	cfg := writeConfig(t, strings.Replace(validConfig, `"raid": "none",`, `"raid": "none", "spares": 1,`, 1))
+	var outBuf, errBuf bytes.Buffer
+	rc := run([]string{
+		"lpart-storage-prepare",
+		"--log-dir", logDir,
+		"--cmdline-path", cmdline,
+		"--skip-command-check",
+		"--skip-final-inventory",
+		"--config", cfg, "--dry-run",
+	}, &outBuf, &errBuf)
+	if strings.Contains(errBuf.String(), "fatal_config=config-validation") {
+		t.Fatalf("a warning must not refuse the layout; rc=%d stderr=%s", rc, errBuf.String())
+	}
+	logText := readToolLog(t, logDir)
+	for _, want := range []string{"level=WARN", `raid=none takes no spares, so spares=1 is ignored`} {
+		if !strings.Contains(logText, want) {
+			t.Fatalf("expected the validation warning to be logged with %q; log=%s", want, logText)
 		}
 	}
 }
@@ -223,13 +259,14 @@ func TestBIOSAutoNoLayoutAllowed(t *testing.T) {
 // the ramdisk rule must not fire on BIOS either. Asserted on that reason
 // specifically: a data set with no reachable devices is classified broken, and
 // the data fence then refuses on its own account, which says nothing about the
-// boot policy this test is pinning.
+// boot policy this test is pinning. (The data disk does not exist: the run
+// ends in fatal_config=device-missing, after the boot preflight.)
 func TestBIOSDataOnlyAllowed(t *testing.T) {
 	cfg := writeConfig(t, `{
 	"version": 2,
 	"sets": [
 		{"name": "data", "role": "data", "selection": "manual", "raid": "none",
-		 "devices": ["/dev/sdb"],
+		 "devices": ["/dev/disk/by-id/lpart-test-no-such-data-disk"],
 		 "volumes": [
 		   {"name": "d", "mountpoint": "/data", "fs": "xfs", "provider": "lvm", "size": "100%"}
 		 ]}
@@ -265,8 +302,8 @@ func TestSanitizeWithNoResultsExitsZero(t *testing.T) {
 	if err := os.WriteFile(icPath, []byte(`{"install_mode":"sanitize"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	// In the test sandbox device discovery fails -> empty pool -> sanitize
-	// erases nothing and returns zero results: exactly the empty-result shape.
+	// The hermetic pool is empty -> sanitize erases nothing and returns zero
+	// results: exactly the empty-result shape (a diskless node, exit 0).
 	_, stderr, rc := runWithEnv(t,
 		"--install-context", icPath,
 		"--dry-run",
@@ -324,8 +361,8 @@ func TestRefusesWithoutLunaMarker(t *testing.T) {
 		"--skip-final-inventory",
 		"--config", cfg, "--dry-run",
 	}, &outBuf, &errBuf)
-	if rc == 0 {
-		t.Fatalf("expected refusal; stderr=%s", errBuf.String())
+	if rc != 1 { // the same exit as every lpart tool's installer-env guard
+		t.Fatalf("expected refusal with exit 1, got %d; stderr=%s", rc, errBuf.String())
 	}
 	if !strings.Contains(errBuf.String(), "root=luna") {
 		t.Fatalf("wording wrong: %s", errBuf.String())
@@ -418,67 +455,34 @@ func TestSerialCollisionWarnings(t *testing.T) {
 	}
 }
 
-func TestAssembleExplicitUsesExaminedMembers(t *testing.T) {
-	logger, err := txlog.Init(txlog.Options{LogDir: t.TempDir()})
-	if err != nil {
+// An invalid disklayout is deterministic: it must park (exit 3), not return the
+// retryable exit 1 (lab 10 October 2026: a raid1 data set with a direct
+// partition volume retried every 30 s for ever).
+func TestInvalidConfigIsFatalNotRetryable(t *testing.T) {
+	tmp := t.TempDir()
+	ic := filepath.Join(tmp, "install-context.json")
+	if err := os.WriteFile(ic, []byte(`{"install_mode":"full"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer func() { _ = logger.Close() }()
-	fake := executor.NewFakeRunner(executor.FakeResponse{})
-	// two disks, one partition each; both partitions carry the "data" array
-	fake.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME,TYPE", "/dev/vdb"},
-		Response: executor.FakeResponse{Stdout: []byte("vdb disk\nvdb1 part\n")}})
-	fake.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME,TYPE", "/dev/vdc"},
-		Response: executor.FakeResponse{Stdout: []byte("vdc disk\nvdc1 part\n")}})
-	fake.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine"},
-		Response: executor.FakeResponse{Stdout: []byte("           Name : any:data  (local to host any)\n")}})
-	sp := &setProcessor{runner: fake, logger: logger}
-	var got [][]string
-	run := func(path string, args ...string) { got = append(got, append([]string{path}, args...)) }
-	sp.assembleExplicit(context.Background(), "data",
-		[]selector.Resolved{{ResolvedPath: "/dev/vdb"}, {ResolvedPath: "/dev/vdc"}}, run)
-	if len(got) != 1 {
-		t.Fatalf("want 1 assemble call, got %v", got)
+	cfg := filepath.Join(tmp, "storage.json")
+	bad := `{"version":2,"sets":[{"name":"os","role":"os","selection":"manual","raid":"none","devices":["/dev/vda"],"volumes":[{"name":"uefi","mountpoint":"/boot/efi","fs":"vfat","provider":"partition","size":"600M"},{"name":"boot","mountpoint":"/boot","fs":"xfs","provider":"partition","size":"2G"},{"name":"root","mountpoint":"/","fs":"xfs","provider":"lvm","size":"100%"}]},` +
+		`{"name":"data","role":"data","selection":"manual","raid":"1","devices":["/dev/vde","/dev/vdf"],"volumes":[{"name":"data","mountpoint":"/data","fs":"xfs","provider":"partition","size":"100%"}]}]}`
+	if err := os.WriteFile(cfg, []byte(bad), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	want := []string{"mdadm", "--assemble", "/dev/md/data", "/dev/vdb1", "/dev/vdc1"}
-	if strings.Join(got[0], " ") != strings.Join(want, " ") {
-		t.Fatalf("assemble argv = %v, want %v", got[0], want)
+	_, stderr, rc := runWithBootEnv(t, "uefi", true, "--install-context", ic, "--config", cfg, "--dry-run")
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=config-validation") {
+		t.Fatalf("invalid config: want rc=3 with fatal_config marker, got rc=%d stderr=%s", rc, stderr)
 	}
 }
 
-func TestAssembleExplicitNoMembersIsNoop(t *testing.T) {
-	logger, err := txlog.Init(txlog.Options{LogDir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = logger.Close() }()
-	fake := executor.NewFakeRunner(executor.FakeResponse{ExitCode: 1, Err: fmt.Errorf("no superblock")})
-	sp := &setProcessor{runner: fake, logger: logger}
-	var got [][]string
-	run := func(path string, args ...string) { got = append(got, append([]string{path}, args...)) }
-	sp.assembleExplicit(context.Background(), "data",
-		[]selector.Resolved{{ResolvedPath: "/dev/vdb"}}, run)
-	if len(got) != 0 {
-		t.Fatalf("want no assemble call without members, got %v", got)
-	}
-}
-
-func TestMDSuperblockNameParsing(t *testing.T) {
-	logger, err := txlog.Init(txlog.Options{LogDir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = logger.Close() }()
-	for _, tc := range []struct{ out, want string }{
-		{"           Name : any:data  (local to host any)\n", "data"},
-		{"           Name : node002:os-boot\n", "os-boot"},
-		{"           Name : bare\n", "bare"},
-		{"no superblock here\n", ""},
-	} {
-		fake := executor.NewFakeRunner(executor.FakeResponse{Stdout: []byte(tc.out)})
-		sp := &setProcessor{runner: fake, logger: logger}
-		if got := sp.mdSuperblockName(context.Background(), "/dev/vdb1"); got != tc.want {
-			t.Fatalf("mdSuperblockName(%q) = %q, want %q", tc.out, got, tc.want)
-		}
+// A bad command line is the same on every attempt: exit 3 parks with a
+// fatal_config line, as in every lpart tool; exit 2 is reserved for safety
+// refusals.
+func TestBadFlagIsFatalConfig(t *testing.T) {
+	var out, errb bytes.Buffer
+	rc := run([]string{toolName, "--no-such-flag"}, &out, &errb)
+	if rc != 3 || !strings.Contains(errb.String(), "fatal_config=usage") {
+		t.Fatalf("rc=%d (want 3), stderr=%s", rc, errb.String())
 	}
 }

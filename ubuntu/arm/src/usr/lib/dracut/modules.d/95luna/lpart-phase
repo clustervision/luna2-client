@@ -1,11 +1,11 @@
 #!/bin/bash
-# lpart-phase <pre|part|post> -- shared Luna hook shim (node-agnostic).
+# lpart-phase <pre|part|post|finish> -- shared Luna hook shim (node-agnostic).
 #
 # Single source for the compute-group pre/part/post hook scripts: each Luna
 # hook field is just `exec /usr/bin/lpart-phase <phase>`. All install
 # orchestration lives in lpart-node-installer --phase, baked into the install
 # initramfs by the luna2-client RPM. Set LPART_BIN to override for a hand-run.
-phase="${1:?usage: lpart-phase pre|part|post}"
+phase="${1:?usage: lpart-phase pre|part|post|finish}"
 LPART_BIN="${LPART_BIN:-/usr/bin}"
 [ -x "${LPART_BIN}/lpart-node-installer" ] \
     || { echo "lpart-phase: lpart-node-installer missing in ${LPART_BIN}" >&2; exit 127; }

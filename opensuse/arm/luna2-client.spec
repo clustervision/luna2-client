@@ -68,6 +68,7 @@ Dracut module for Luna deployment tool
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-parse-cmdline.sh"                                                                                                             
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna2-start.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-installer.sh"                                                                                                                    
+%attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/luna-pivot-guard.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/module-setup.sh"
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/lpart-phase"                                                                                                                   
 %attr(0755, root, root) "/usr/lib/dracut/modules.d/95luna/profile"                                                                                                                           

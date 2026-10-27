@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,7 @@ import (
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installcontext"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lpartinputs"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/model"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/sanitize"
 )
 
 // Phase selects which built-in sequence to run.
@@ -50,13 +52,16 @@ type Options struct {
 	// (FTA D9); with the bound it becomes a normal, retryable failure.
 	// Defaults to 2h — generous enough for a slow image extract plus
 	// filesystem work, far below "operator finds the node next morning".
+	// A sanitize run's storage-prepare gets a bound derived from the disk
+	// sizes instead (sanitizeTimeout): zero-filling is bounded by the disks'
+	// write speed, not by this default.
 	StepTimeout time.Duration
 }
 
 // failureFile is the one-shot failure summary written into Options.LogDir on a
 // stage failure: the stage, the untruncated reason and the failing step's
-// stderr. The per-tool logs and the loghost keep everything, but the node
-// reboots into the next attempt ~30 s later, so the boot wrapper prints this
+// stderr. The per-tool logs and the loghost keep everything, but the boot
+// wrapper starts the next attempt after a short countdown, so it prints this
 // file on the console — there is no second look.
 const failureFile = "last-failure.txt"
 
@@ -64,24 +69,31 @@ const failureFile = "last-failure.txt"
 // cause just before it exits, so the tail is the useful end here.
 const stepStderrLines = 40
 
+// failureStderrLines is the stderr tail written to the failure file: the boot
+// wrapper prints the file's first 15 lines (stage, reason, "stderr:" and these).
+const failureStderrLines = 12
+
 // FailureClass classifies a phase failure for the retry-vs-park decision
-// in the boot wrapper (see luna2-start.sh LUNA_FATAL_RC).
+// in the boot wrapper (see luna-installer.sh LUNA_FATAL_RC).
 type FailureClass int
 
 const (
 	// FailRetryable is a transient/operational failure — worth a retry.
 	FailRetryable FailureClass = iota
-	// FailFatal will fail identically on every retry: a safety refusal
-	// (exit 2 from a sub-tool — data fence, persistent protection) or a
-	// non-retryable configuration error (exit 3). The wrapper must PARK
-	// for an operator instead of retrying forever.
+	// FailFatal will fail identically on every retry: a configuration error
+	// (exit 3) or a sub-tool crash (exit 2 without a verdict, out of memory
+	// included). The wrapper must PARK for an operator instead of retrying forever.
 	FailFatal
+	// FailSafety is a safety refusal (exit 2 from a sub-tool with a
+	// safety_refusal= verdict — data fence, persistent protection). It parks
+	// like FailFatal; kept apart so the node reports it as refused rather than fatal.
+	FailSafety
 )
 
 // Fatal reports whether the class is non-retryable. The renderers read it
 // through a small interface assertion (no package coupling) to map
-// EvInstallerFailed to exit 3 vs 1.
-func (c FailureClass) Fatal() bool { return c == FailFatal }
+// EvInstallerFailed to a park vs a retry.
+func (c FailureClass) Fatal() bool { return c != FailRetryable }
 
 // Result is the pipeline's authoritative terminal outcome. It is recorded
 // on the Pipeline itself BEFORE the event channel closes, so a dropped or
@@ -108,9 +120,14 @@ type Pipeline struct {
 	storageState model.Storage // last emitted storage, for re-emit with InUse/Method
 	methodLine   string        // config-derived Method (selection + counts), shown from resolve onward
 	stepStderr   []string      // tail of the current step's stderr, for the failure file
+	stepVerdict  string        // the step's last verdict line, which a long refusal pushes out of the tail
+	// stepLine, when set, sees every stdout/stderr line of the running step
+	// (from the mirror goroutine; read it only after the step returned).
+	stepLine func(string)
 
 	resultMu sync.Mutex
 	result   Result
+	finished chan struct{} // closed when run() has returned
 }
 
 // Result returns the terminal outcome recorded by run(). Callers decide the
@@ -134,23 +151,43 @@ type stepError struct {
 	Bin   string
 	Stage string
 	Code  int
+	// The Go runtime exits 2 too, so exit 2 is a refusal only with the verdict.
+	Refused bool // the step printed a safety_refusal= verdict
 }
 
 func (e *stepError) Error() string {
 	return fmt.Sprintf("%s exited %d", e.Bin, e.Code)
 }
 
-// classify maps a phase error to its FailureClass. Sub-tool exit 2 is the
-// repo-wide safety_refusal contract (cli.ExitSafetyRefusal: data fence,
-// persistent protection, device overlap) and exit 3 a non-retryable config
-// error — both fail identically on every retry, so both are fatal.
+// classify maps a phase error to its FailureClass. Sub-tool exit 2 with a
+// safety_refusal= verdict is the repo-wide safety_refusal contract
+// (cli.ExitSafetyRefusal: data fence, persistent protection, device overlap)
+// and exit 3 a non-retryable config error — both fail identically on every
+// retry, so both park. Any other exit 2 is a crash (out of memory included): fatal.
 func classify(err error) FailureClass {
 	var se *stepError
-	if errors.As(err, &se) && (se.Code == 2 || se.Code == 3) {
+	if errors.As(err, &se) && se.Code == 2 {
+		if se.Refused {
+			return FailSafety
+		}
+		return FailFatal
+	}
+	if errors.As(err, &se) && se.Code == 3 {
+		return FailFatal
+	}
+	var fe *fatalError
+	if errors.As(err, &fe) {
 		return FailFatal
 	}
 	return FailRetryable
 }
+
+// fatalError marks an in-process failure that repeats identically on every
+// retry (an unreadable install context, an unknown install_mode).
+type fatalError struct{ err error }
+
+func (e *fatalError) Error() string { return e.err.Error() }
+func (e *fatalError) Unwrap() error { return e.err }
 
 // New builds a Pipeline with defaults filled in.
 func New(ctx context.Context, opts Options) *Pipeline {
@@ -169,7 +206,7 @@ func New(ctx context.Context, opts Options) *Pipeline {
 	if opts.StepTimeout <= 0 {
 		opts.StepTimeout = 2 * time.Hour
 	}
-	return &Pipeline{opts: opts, ctx: ctx, events: make(chan engine.InstallerEvent, 1024)}
+	return &Pipeline{opts: opts, ctx: ctx, events: make(chan engine.InstallerEvent, 1024), finished: make(chan struct{})}
 }
 
 // Events returns the read-only event channel, closed when the phase ends.
@@ -185,8 +222,15 @@ func (p *Pipeline) Start() error {
 	return nil
 }
 
+// Wait blocks until the phase goroutine has returned: every step it started,
+// with its whole process group, is gone by then. The caller must keep
+// draining Events() meanwhile (the step output forward blocks on it).
+func (p *Pipeline) Wait() { <-p.finished }
+
 func (p *Pipeline) run() {
+	defer close(p.finished)
 	defer close(p.events)
+	defer p.recoverPanic()
 	// Clear the previous attempt's failure file: the boot wrapper prints
 	// whatever is there, so a stale one would be read as this attempt's reason.
 	if err := os.Remove(p.failurePath()); err != nil && !os.IsNotExist(err) {
@@ -215,6 +259,21 @@ func (p *Pipeline) run() {
 	p.emit(engine.InstallerEvent{Time: time.Now(), Type: engine.EvInstallerDone, Stream: engine.StreamSystem, Message: string(p.opts.Phase) + " phase complete"})
 }
 
+// recoverPanic turns a panic in the phase goroutine into a fatal failure: the
+// recover in main cannot see it, and the runtime's exit 2 is a safety refusal.
+func (p *Pipeline) recoverPanic() {
+	r := recover()
+	if r == nil {
+		return
+	}
+	msg := fmt.Sprintf("internal error: %v", r)
+	p.info(msg + "\n" + string(debug.Stack()))
+	p.stepStderr, p.stepVerdict = nil, ""
+	p.writeFailure("internal", msg)
+	p.setResult(Result{Done: true, Failed: true, Class: FailFatal, Message: msg})
+	p.emit(engine.InstallerEvent{Time: time.Now(), Type: engine.EvInstallerFailed, Stream: engine.StreamSystem, Message: msg, Data: FailFatal})
+}
+
 // --- phases ---------------------------------------------------------------
 
 func (p *Pipeline) runPre() error {
@@ -240,7 +299,31 @@ func (p *Pipeline) runPre() error {
 	return nil
 }
 
+// SanitizeDoneMarker is written to the runtime dir after a successful
+// sanitize. luna-installer.sh stops (parks) the node when it finds it,
+// whatever the rest of the install script did: sanitize promises "erase, then
+// stop", but the daemon's install template went on with the OS steps (network,
+// hostname: chroot into an empty /sysroot), failed, and the retry loop erased
+// the disks again every minute.
+const SanitizeDoneMarker = "sanitize.done"
+
+// partOutputs are the files the part phase produces. The install tmpfs
+// survives the boot wrapper's retries, so they are removed first: a previous
+// attempt's copy must never be read as this attempt's.
+var partOutputs = []string{
+	SanitizeDoneMarker,
+	DegradedMarker,
+	"storage-result.json",
+	"storage-resolved.json",
+	"storage-check-result.json",
+}
+
 func (p *Pipeline) runPart() error {
+	for _, name := range partOutputs {
+		if err := os.Remove(p.rt(name)); err != nil && !os.IsNotExist(err) {
+			p.info("could not clear " + p.rt(name) + ": " + err.Error())
+		}
+	}
 	// Populate the Node + Storage dashboard panels.
 	p.emitNode()
 	p.emitStorage()
@@ -250,6 +333,10 @@ func (p *Pipeline) runPart() error {
 	in, err := lpartinputs.Resolve(p.opts.RuntimeDir)
 	if err != nil {
 		p.stageFail("install-context", err.Error())
+		var ie *lpartinputs.ErrInstallContext
+		if errors.As(err, &ie) {
+			return &fatalError{err}
+		}
 		return err
 	}
 	// lpartinputs.Resolve already wrote the canonical install-context.json; every
@@ -257,7 +344,7 @@ func (p *Pipeline) runPart() error {
 	mode := installcontext.Mode(in.InstallMode)
 	if err := mode.Validate(); err != nil {
 		p.stageFail("install-context", err.Error())
-		return err
+		return &fatalError{err} // an unknown install_mode never becomes valid on a retry
 	}
 	p.emitLuna(in.InstallMode)
 	p.stageDone("install-context", "source="+in.Source+" mode="+in.InstallMode)
@@ -291,7 +378,21 @@ func (p *Pipeline) runPart() error {
 	if fileHasContent(p.rt("storage.json")) {
 		args = append(args, "--config", p.rt("storage.json"))
 	}
-	if err := p.runStep("storage-prepare", p.bin("lpart-storage-prepare"), args...); err != nil {
+	timeout := p.opts.StepTimeout
+	var report sanitizeReport
+	if mode.IsSanitize() {
+		// Zero-filling runs at the disks' write speed: a fixed 2 h bound
+		// killed it part-way on large HDDs.
+		timeout = sanitizeTimeout(lsblkDisks(p.ctx), p.opts.StepTimeout)
+		p.info("sanitize: storage-prepare may take up to " + timeout.String() + " (the largest local disk at 50 MB/s, written and read back)")
+		p.stepLine = report.observe
+	} else {
+		// Disks erased by an earlier sanitize may hold data again by now.
+		_ = os.Remove(p.rt(sanitize.ProgressFile))
+	}
+	err = p.runStepTimeout("storage-prepare", timeout, append([]string{p.bin("lpart-storage-prepare")}, args...))
+	p.stepLine = nil
+	if err != nil {
 		p.stageFail("storage-prepare", err.Error())
 		return err
 	}
@@ -325,7 +426,14 @@ func (p *Pipeline) runPart() error {
 	p.stageDone("storage-prepare", "")
 
 	if mode.IsSanitize() {
-		p.info("sanitize complete; no OS image or bootloader for an erase run")
+		// The marker says what storage-prepare reported, not a fixed claim:
+		// the boot wrapper prints it as the node's last word before power-off.
+		summary := report.summary()
+		p.info("sanitize: " + strings.ReplaceAll(strings.TrimSpace(summary), "\n", "; "))
+		p.info("no OS image or bootloader for an erase run -- the node will be powered off")
+		if err := os.WriteFile(p.rt(SanitizeDoneMarker), []byte(summary), 0o644); err != nil {
+			p.info("could not write " + p.rt(SanitizeDoneMarker) + ": " + err.Error())
+		}
 		return nil
 	}
 
@@ -342,8 +450,12 @@ func (p *Pipeline) runPart() error {
 func (p *Pipeline) runOSImage(mode installcontext.Mode) error {
 	switch {
 	case mode.IsLocal():
+		// --resolved: storage-check verifies the disks storage-prepare chose.
+		// A selection=discover set has no devices in storage.json; they are
+		// resolved from the disk pool and exist only in storage-resolved.json.
 		return p.runStep("osimage", p.bin("lpart-storage-check"),
 			"--config", p.rt("storage.json"),
+			"--resolved", p.rt("storage-resolved.json"),
 			"--install-context", p.rt("install-context.json"),
 			"--log-dir", p.opts.LogDir, "--details")
 	case mode.ExtractsImage():
@@ -374,11 +486,16 @@ func (p *Pipeline) runPost() error {
 	// post-phase failure -> 30 s retry loop. Found live on node001 the moment
 	// the sanitize exit-0 fix (NB-1) let the post phase run at all -- the
 	// CCF-7 class again: a contract only exercised end-to-end.
-	mode := installcontext.ModeAuto
-	if ic, err := installcontext.LoadFile(p.rt("install-context.json")); err == nil {
-		mode = ic.InstallMode
-		p.emitLuna(string(ic.InstallMode))
+	// The part phase wrote it: unreadable now, it is unreadable on every retry.
+	ic, err := installcontext.LoadFile(p.rt("install-context.json"))
+	if err != nil {
+		err = fmt.Errorf("install-context: %w", err)
+		p.stageStart("bootloader", "Bootloader finalise")
+		p.stageFail("bootloader", err.Error())
+		return &fatalError{err}
 	}
+	mode := ic.InstallMode
+	p.emitLuna(string(ic.InstallMode))
 	p.emitNode()
 	if !mode.InstallsBootloader() {
 		p.stageStart("bootloader", "Bootloader finalise")
@@ -434,19 +551,36 @@ func (p *Pipeline) runStep(stage, path string, args ...string) error {
 // non-zero exit is returned as a typed stepError so the numeric code (and
 // with it the retry-vs-park class) survives to the process exit.
 func (p *Pipeline) runStepArgv(stage string, argv []string) error {
-	ctx, cancel := context.WithTimeout(p.ctx, p.opts.StepTimeout)
+	return p.runStepTimeout(stage, p.opts.StepTimeout, argv)
+}
+
+// runStepTimeout is runStepArgv with an explicit bound; timeout <= 0 means
+// none. On a timeout or a cancelled phase the step's whole process group is
+// killed (engine.RunCommand), so no mkfs/tar/blkdiscard outlives it.
+func (p *Pipeline) runStepTimeout(stage string, timeout time.Duration, argv []string) error {
+	ctx, cancel := context.WithCancel(p.ctx)
+	if timeout > 0 {
+		cancel()
+		ctx, cancel = context.WithTimeout(p.ctx, timeout)
+	}
 	defer cancel()
 	// Mirror the step's stderr on its way to the renderers so a failure can
 	// name the cause in the failure file. The forward stays blocking, so the
 	// bus behaves exactly as it does when RunCommand writes to it directly.
-	p.stepStderr = nil
+	p.stepStderr, p.stepVerdict = nil, ""
 	mirror := make(chan engine.InstallerEvent, 64)
 	var mirrored sync.WaitGroup
 	mirrored.Add(1)
 	go func() {
 		defer mirrored.Done()
 		for ev := range mirror {
+			if p.stepLine != nil && (ev.Type == engine.EvCommandStderr || ev.Type == engine.EvCommandStdout) {
+				p.stepLine(ev.Message)
+			}
 			if ev.Type == engine.EvCommandStderr {
+				if strings.Contains(ev.Message, "safety_refusal=") || strings.Contains(ev.Message, "fatal_config=") {
+					p.stepVerdict = ev.Message
+				}
 				p.stepStderr = append(p.stepStderr, ev.Message)
 				if len(p.stepStderr) > stepStderrLines {
 					p.stepStderr = p.stepStderr[len(p.stepStderr)-stepStderrLines:]
@@ -459,18 +593,17 @@ func (p *Pipeline) runStepArgv(stage string, argv []string) error {
 	close(mirror)
 	mirrored.Wait()
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("%s: step exceeded the %s timeout and was killed", filepath.Base(argv[0]), p.opts.StepTimeout)
+		return fmt.Errorf("%s: step exceeded the %s timeout and was killed with its child processes", filepath.Base(argv[0]), timeout)
 	}
-	// A non-zero child exit is reported by RunCommand as BOTH a numeric code
-	// AND a non-nil err (the exec.ExitError echoing that code). Build the
-	// typed stepError from the CODE first, so the fatal/retry class survives.
-	// Returning the raw err before this check discarded the code, so a
-	// safety-refusal (exit 2 -> should map to fatal exit 3) was misclassified
-	// retryable and the node retry-looped forever instead of parking — the FTA
-	// Cluster B catastrophe, found by the real PXE regression (unit tests
-	// exercised stepError classification but not this RunCommand seam).
+	if p.ctx.Err() != nil {
+		return fmt.Errorf("%s: install interrupted; the step was killed with its child processes", filepath.Base(argv[0]))
+	}
+	// RunCommand reports a non-zero exit as both a code and an err. The typed
+	// stepError is built from the code first: returning the raw err dropped
+	// it, and a park (exit 2 or 3) became a retry loop.
 	if code != 0 {
-		return &stepError{Bin: filepath.Base(argv[0]), Stage: stage, Code: code}
+		return &stepError{Bin: filepath.Base(argv[0]), Stage: stage, Code: code,
+			Refused: refused([]string{p.stepVerdict})}
 	}
 	if err != nil {
 		return err // code==0 but a genuine non-exit failure
@@ -514,6 +647,23 @@ func (p *Pipeline) stageDone(id, note string) {
 func (p *Pipeline) stageFail(id, note string) {
 	p.emit(engine.InstallerEvent{Time: time.Now(), Type: engine.EvStageFailed, Stage: id, Message: note})
 	p.writeFailure(id, note)
+	p.markDegraded()
+}
+
+// DegradedMarker is written to the runtime dir when a step refused a degraded
+// raid set (safety_refusal=degraded); the install template then reports the
+// park as install.degraded instead of install.refused.
+const DegradedMarker = "degraded.done"
+
+func (p *Pipeline) markDegraded() {
+	for _, line := range append([]string{p.stepVerdict}, p.stepStderr...) {
+		if strings.Contains(line, "safety_refusal=degraded") {
+			if err := os.WriteFile(p.rt(DegradedMarker), []byte(line+"\n"), 0o600); err != nil {
+				p.info("could not write " + p.rt(DegradedMarker) + ": " + err.Error())
+			}
+			return
+		}
+	}
 }
 
 func (p *Pipeline) failurePath() string { return filepath.Join(p.opts.LogDir, failureFile) }
@@ -522,18 +672,49 @@ func (p *Pipeline) failurePath() string { return filepath.Join(p.opts.LogDir, fa
 // the boot wrapper to print. Best-effort: a failure to write is reported into
 // the install log rather than masking the failure that is being reported.
 func (p *Pipeline) writeFailure(stage, reason string) {
+	if v := verdict([]string{p.stepVerdict}); v != "" {
+		reason = v
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "stage: %s\n", stage)
 	fmt.Fprintf(&b, "reason: %s\n", reason)
-	if len(p.stepStderr) > 0 {
+	if tail := p.stepStderr[max(0, len(p.stepStderr)-failureStderrLines):]; len(tail) > 0 {
 		b.WriteString("stderr:\n")
-		for _, line := range p.stepStderr {
+		for _, line := range tail {
 			b.WriteString("  " + line + "\n")
 		}
 	}
 	if err := os.WriteFile(p.failurePath(), []byte(b.String()), 0o640); err != nil {
 		p.info("could not write " + p.failurePath() + ": " + err.Error())
 	}
+}
+
+// verdict is the lpart tool's own one-line reason for a park ("<tool>:
+// safety_refusal=<code> <message>" or fatal_config=, see internal/cli), as
+// "<code>: <message>"; "" when the step printed none.
+func verdict(stderr []string) string {
+	for i := len(stderr) - 1; i >= 0; i-- {
+		for _, marker := range []string{"safety_refusal=", "fatal_config="} {
+			if _, rest, ok := strings.Cut(stderr[i], marker); ok {
+				code, msg, _ := strings.Cut(rest, " ")
+				return code + ": " + msg
+			}
+		}
+	}
+	return ""
+}
+
+// refused reports whether the step's verdict is a safety refusal.
+func refused(stderr []string) bool {
+	for i := len(stderr) - 1; i >= 0; i-- {
+		if strings.Contains(stderr[i], "safety_refusal=") {
+			return true
+		}
+		if strings.Contains(stderr[i], "fatal_config=") {
+			return false
+		}
+	}
+	return false
 }
 
 func (p *Pipeline) bin(name string) string { return filepath.Join(p.opts.BinDir, name) }

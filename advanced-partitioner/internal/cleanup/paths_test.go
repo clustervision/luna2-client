@@ -22,6 +22,12 @@ func TestDiskBasename(t *testing.T) {
 		"/dev/loop3":        "loop3",
 		"/dev/loop3p1":      "loop3",
 		"/dev/disk/by-id/x": "x",
+		"/dev/nbd0p1":       "nbd0",
+		"/dev/pmem0p2":      "pmem0",
+		"/dev/rbd0p1":       "rbd0",
+		"/dev/md127p1":      "md127",
+		"/dev/sdp1":         "sdp",
+		"/dev/sdp":          "sdp",
 	}
 	for in, want := range cases {
 		if got := DiskBasename(in); got != want {

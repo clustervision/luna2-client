@@ -2,6 +2,7 @@ package diskresolve
 
 import (
 	"fmt"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -39,10 +40,10 @@ func (m Match) Matches(d discover.Device) bool {
 	return true
 }
 
-// sizeRE accepts both the v1.4 single-letter form ("8T", "400G", "512M",
-// "100K", "2048B") and the legacy two-letter form ("8TB", "400GB"). The
-// suffix is case-insensitive; the bare unit "B" or no unit means bytes.
-var sizeRE = regexp.MustCompile(`^([0-9]+)\s*([TGMK]?)B?$`)
+// sizeRE accepts the v1.4 single-letter form ("8T", "400G", "512M", "100K",
+// "2048B"), the two-letter forms ("8TB", "8TiB") and a fraction ("1.5T").
+// The suffix is case-insensitive; the bare unit "B" or no unit means bytes.
+var sizeRE = regexp.MustCompile(`^([0-9]+)(\.[0-9]+)?\s*([TGMK]?)(?:IB|B)?$`)
 
 // ParseSize converts a size string into a byte count using binary units
 // (1T = 1024^4 bytes). It tolerates a leading/trailing space and an
@@ -53,22 +54,25 @@ func ParseSize(raw string) (int64, error) {
 	if m == nil {
 		return 0, fmt.Errorf("cannot parse size %q; use a form like 400G, 8T, 512M", raw)
 	}
-	n, err := strconv.ParseInt(m[1], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("cannot parse size %q: %w", raw, err)
-	}
-	switch m[2] {
+	mult := int64(1) // "" -- bytes
+	switch m[3] {
 	case "T":
-		return n * 1024 * 1024 * 1024 * 1024, nil
+		mult = 1 << 40
 	case "G":
-		return n * 1024 * 1024 * 1024, nil
+		mult = 1 << 30
 	case "M":
-		return n * 1024 * 1024, nil
+		mult = 1 << 20
 	case "K":
-		return n * 1024, nil
-	default: // "" — bytes
-		return n, nil
+		mult = 1 << 10
 	}
+	// 16777216T used to wrap to 0, which reads as "no bound" -- a min_size
+	// that silently matched every disk.
+	n, err := strconv.ParseInt(m[1], 10, 64)
+	if err != nil || n > math.MaxInt64/mult {
+		return 0, fmt.Errorf("size %q is too large", raw)
+	}
+	frac, _ := strconv.ParseFloat("0"+m[2], 64) // m[2] is "" or ".<digits>"
+	return n*mult + int64(frac*float64(mult)), nil
 }
 
 // ParseMatch builds a Match from raw config strings. MinSize/MaxSize are

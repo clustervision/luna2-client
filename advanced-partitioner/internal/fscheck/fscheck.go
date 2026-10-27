@@ -31,13 +31,23 @@
 //	  the fs's own crash recovery) and re-check; still unclean → unhealthy.
 //
 //	vfat (fsck.vfat -n OR fsck.fat -n — check only):
-//	  0  clean; anything else unhealthy (no journal to replay; -a's
-//	  auto-fixes can truncate crosslinked files, so no auto-repair here)
+//	  0  clean
+//	  1  healthy ONLY when the sole finding is the FAT dirty bit (see
+//	     dirtyBitOnly): Linux sets it while the ESP is mounted, so every hard
+//	     reset, power loss, crash or fence leaves it; it is not damage.
+//	  else unhealthy (no journal to replay; -a's auto-fixes can truncate
+//	  crosslinked files, so no auto-repair here)
 //
 //	swap: no fsck. The caller is expected to check the LABEL/UUID match
 //	separately; this package returns OK unconditionally.
 //
 //	tmpfs: nothing to check — always OK.
+//
+// A checker that could not run (binary missing, exec failure, killed by a
+// signal or a timeout: no exit status) says NOTHING about the filesystem. It
+// is reported with Unavailable set, never as a plain unhealthy volume: the
+// data fence must not read "e2fsck is not in this ramdisk" as "the set is
+// broken" -- auto would then recreate (wipe) a healthy os set.
 //
 // Cross-platform notes:
 //   - e2fsck, xfs_repair, mkswap/swaplabel ship identically on every
@@ -50,7 +60,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
+	iofs "io/fs"
+	"os/exec"
+	"regexp"
+	"strings"
+	"time"
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
@@ -64,6 +78,35 @@ type Result struct {
 	// Reason is filled when OK is false. It is the operator-visible
 	// "why" string that bubbles into the unhealthy report.
 	Reason string
+	// Unavailable is set (with OK false) when the checker itself could not
+	// run -- missing binary, exec failure, no exit status. The filesystem
+	// was NOT checked, so callers must treat the volume as UNKNOWN, never as
+	// broken: a missing tool is not evidence of damage.
+	Unavailable bool
+}
+
+// unavailable builds the Result for a checker that never produced a verdict.
+func unavailable(device, fsType, tool string, err error) Result {
+	return Result{
+		Device: device, FS: fsType, OK: false, Unavailable: true,
+		Reason: fmt.Sprintf("checker unavailable: %s did not run on %s (%v) -- the filesystem was NOT checked", tool, device, err),
+	}
+}
+
+// checkerUnavailable reports whether a probe failed without a verdict: the
+// binary is missing or could not be executed, or the process ended without an
+// exit status (signal, timeout). Exit codes, even unexpected ones, are
+// verdicts and are NOT unavailable.
+func checkerUnavailable(res executor.CommandResult, err error) bool {
+	if err == nil {
+		return false
+	}
+	var execErr *exec.Error
+	if errors.As(err, &execErr) || errors.Is(err, exec.ErrNotFound) ||
+		errors.Is(err, iofs.ErrNotExist) || errors.Is(err, iofs.ErrPermission) {
+		return true
+	}
+	return exitCode(res, err) == -1
 }
 
 // Options configures a Checker.
@@ -96,7 +139,7 @@ func New(o Options) *Checker {
 
 // CheckFS runs the appropriate health probe for `fs` on `device` and
 // returns the typed Result. The Logger receives one INFO line per
-// outcome.
+// outcome. An XFS log that needs replaying is replayed (mount+umount).
 func (c *Checker) CheckFS(ctx context.Context, device, fs string) Result {
 	switch fs {
 	case "ext2", "ext3", "ext4":
@@ -130,6 +173,9 @@ func (c *Checker) checkExt(ctx context.Context, device, fs string) Result {
 		Path: "e2fsck", Args: []string{"-f", "-p", device},
 		CaptureStdout: true, CaptureStderr: true,
 	})
+	if checkerUnavailable(res, err) {
+		return unavailable(device, fs, "e2fsck", err)
+	}
 	rc := exitCode(res, err)
 	if rc == 0 || rc == 1 {
 		c.log("fsck OK (rc=%d): %s (%s)", rc, device, fs)
@@ -141,24 +187,29 @@ func (c *Checker) checkExt(ctx context.Context, device, fs string) Result {
 	}
 }
 
-// checkXFS runs xfs_repair -n (check only, no writes). A non-zero result
-// after a crash usually just means a dirty log; the SAFE recovery is the
-// filesystem's own journal replay — mount + umount — after which the check
-// is repeated. `xfs_repair -L` (zero the log) is deliberately absent: it
-// discards committed transactions and must never be a side effect of a
-// health probe (FTA BR-7 / MCS-4).
+// xfsCheckTimeout bounds xfs_repair -n: it has hung on a dirty log, and a
+// probe that never returns stalls the install.
+const xfsCheckTimeout = 300 * time.Second
+
+// checkXFS runs xfs_repair -n (check only). A dirty log, a crash or a timeout
+// means the log has to be replayed before the filesystem can be judged: that
+// is done by mount+umount (the filesystem's own recovery, which keeps every
+// committed transaction) and the check runs once more. xfs_repair -L (zero
+// the log) is never run by a health probe (FTA BR-7 / MCS-4).
 func (c *Checker) checkXFS(ctx context.Context, device string) Result {
-	res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
-		Path: "xfs_repair", Args: []string{"-n", device},
+	// a checker that cannot run is unknown, never broken: probe the binary first
+	if res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
+		Path: "xfs_repair", Args: []string{"-V"},
 		CaptureStdout: true, CaptureStderr: true,
-	})
+	}); checkerUnavailable(res, err) {
+		return unavailable(device, "xfs", "xfs_repair", err)
+	}
+	res, err := c.xfsRepairN(ctx, device)
 	rc := exitCode(res, err)
 	if rc == 0 {
 		c.log("xfs_repair -n OK: %s", device)
 		return Result{Device: device, FS: "xfs", OK: true}
 	}
-
-	// Journal replay via mount/umount, then re-check once.
 	c.warn("xfs_repair -n rc=%d on %s; attempting safe journal replay (mount+umount)", rc, device)
 	mnt, err := c.replayMountDir()
 	if err != nil {
@@ -170,34 +221,45 @@ func (c *Checker) checkXFS(ctx context.Context, device string) Result {
 		CaptureStdout: true, CaptureStderr: true,
 	}); err != nil {
 		return Result{Device: device, FS: "xfs", OK: false,
-			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s; journal-replay mount failed: %v (NOT running xfs_repair -L — operator decision)", rc, device, err)}
+			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s; journal-replay mount failed: %v (NOT running xfs_repair -L -- operator decision)", rc, device, err)}
 	}
 	_, _ = c.o.Runner.Run(ctx, executor.CommandSpec{
 		Path: "umount", Args: []string{mnt},
 		CaptureStdout: true, CaptureStderr: true,
 	})
-	res, err = c.o.Runner.Run(ctx, executor.CommandSpec{
-		Path: "xfs_repair", Args: []string{"-n", device},
-		CaptureStdout: true, CaptureStderr: true,
-	})
+	res, err = c.xfsRepairN(ctx, device)
 	if rc2 := exitCode(res, err); rc2 != 0 {
 		return Result{Device: device, FS: "xfs", OK: false,
-			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s after journal replay (NOT running xfs_repair -L — operator decision)", rc2, device)}
+			Reason: fmt.Sprintf("xfs_repair -n rc=%d on %s after journal replay (NOT running xfs_repair -L -- operator decision)", rc2, device)}
 	}
 	c.log("xfs journal replayed, xfs_repair -n OK: %s", device)
 	return Result{Device: device, FS: "xfs", OK: true}
 }
 
-// checkVfat runs the chosen FAT checker with -a. rc 0 and rc 1 are
-// healthy.
+func (c *Checker) xfsRepairN(ctx context.Context, device string) (executor.CommandResult, error) {
+	return c.o.Runner.Run(ctx, executor.CommandSpec{
+		Path: "xfs_repair", Args: []string{"-n", device},
+		CaptureStdout: true, CaptureStderr: true, Timeout: xfsCheckTimeout,
+	})
+}
+
+// checkVfat runs the chosen FAT checker with -n (check only). rc 0 is
+// healthy; rc 1 is healthy only when the dirty bit is the sole finding.
 func (c *Checker) checkVfat(ctx context.Context, device, fs string) Result {
 	res, err := c.o.Runner.Run(ctx, executor.CommandSpec{
 		Path: c.o.FsckVfatCmd, Args: []string{"-n", device},
 		CaptureStdout: true, CaptureStderr: true,
 	})
+	if checkerUnavailable(res, err) {
+		return unavailable(device, fs, c.o.FsckVfatCmd, err)
+	}
 	rc := exitCode(res, err)
 	if rc == 0 {
 		c.log("fsck.vfat -n OK: %s", device)
+		return Result{Device: device, FS: fs, OK: true}
+	}
+	if rc == 1 && dirtyBitOnly(string(res.Stdout)+"\n"+string(res.Stderr)) {
+		c.log("fsck.vfat -n: %s only has the FAT dirty bit set (not unmounted cleanly: hard reset, power loss or crash) -- healthy, left unchanged", device)
 		return Result{Device: device, FS: fs, OK: true}
 	}
 	return Result{
@@ -212,8 +274,13 @@ func (c *Checker) replayMountDir() (string, error) {
 	if c.o.MountDir != "" {
 		return c.o.MountDir, nil
 	}
+	// created through the runner like every other command (the replay now
+	// runs on every XFS check, so the fake runners of the tests must see it)
 	dir := "/run/lpart-fscheck-replay"
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if _, err := c.o.Runner.Run(context.Background(), executor.CommandSpec{
+		Path: "mkdir", Args: []string{"-p", "-m", "0700", dir},
+		CaptureStdout: true, CaptureStderr: true,
+	}); err != nil {
 		return "", err
 	}
 	return dir, nil
@@ -248,4 +315,72 @@ func (c *Checker) warn(format string, args ...any) {
 	if c.o.Logger != nil {
 		c.o.Logger.Warn(fmt.Sprintf(format, args...))
 	}
+}
+
+// FAT dirty-bit-only detection. fsck.fat -n exits 1 for ANY finding, and the
+// dirty bit -- set by Linux for as long as the filesystem is mounted -- is one.
+// Every hard reset, power loss, crash or fence of a node therefore made a
+// healthy ESP "unhealthy": sync and local parked the node and auto wiped the
+// whole os set. The output is accepted as dirty-bit-only when every line is one
+// of the lines below and the dirty-bit line is present; anything else (FATs
+// differ, lost clusters, bad directory entries, ...) stays unhealthy.
+//
+// dosfstools 4.1 (el8):  "0x41: Dirty bit is set. ..." (0x25 on FAT16)
+// dosfstools 4.2 (el9):  "Dirty bit is set. ..." and, on FAT32, the boot
+// sector/backup difference at byte 65 -- the dirty flag itself, which only the
+// primary boot sector carries ("  65:01/00").
+var (
+	vfatDirtyLine   = regexp.MustCompile(`^(0x[0-9a-fA-F]+: )?Dirty bit is set\. Fs was not properly unmounted and some data may be corrupt\.$`)
+	vfatBenignLines = []*regexp.Regexp{
+		regexp.MustCompile(`^fsck\.(fat|vfat|msdos) [0-9][^ ]* \(.*\)$`),
+		regexp.MustCompile(`^Automatically removing dirty bit\.$`),
+		regexp.MustCompile(`^Leaving filesystem unchanged\.$`),
+		regexp.MustCompile(`^\S.*: [0-9]+ files, [0-9]+/[0-9]+ clusters$`),
+	}
+	vfatBackupHeader = []string{
+		"There are differences between boot sector and its backup.",
+		"This is mostly harmless. Differences: (offset:original/backup)",
+		"Not automatically fixing this.",
+	}
+	vfatBackupDiff = regexp.MustCompile(`^([0-9]+):([0-9a-fA-F]{2})/([0-9a-fA-F]{2})$`)
+)
+
+// fat32DirtyFlagOffset is the boot-sector byte (0x41) that holds the FAT32
+// dirty flag; FAT16 keeps it at 0x25 and has no backup boot sector.
+const fat32DirtyFlagOffset = "65"
+
+func dirtyBitOnly(output string) bool {
+	sawDirty := false
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if vfatDirtyLine.MatchString(line) {
+			sawDirty = true
+			continue
+		}
+		if m := vfatBackupDiff.FindStringSubmatch(line); m != nil {
+			if m[1] != fat32DirtyFlagOffset {
+				return false
+			}
+			continue
+		}
+		benign := false
+		for _, h := range vfatBackupHeader {
+			if line == h {
+				benign = true
+				break
+			}
+		}
+		for _, re := range vfatBenignLines {
+			if !benign && re.MatchString(line) {
+				benign = true
+			}
+		}
+		if !benign {
+			return false
+		}
+	}
+	return sawDirty
 }

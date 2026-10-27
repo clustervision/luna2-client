@@ -8,12 +8,13 @@ package lvm
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
-	"strings"
 
 	v2 "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/config/v2"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/lvm/vgselect"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/partition"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/raid"
 )
@@ -42,10 +43,46 @@ type State struct {
 	PVDevice string `json:"pv_device"`
 }
 
+// ForeignVGError reports a volume group with the set's name on disks outside
+// the set: vgcreate cannot make a second VG of that name, and the installer
+// must not remove a VG on a disk the layout does not own. It is deterministic
+// (the disk stays attached), so callers map it to a safety refusal.
+type ForeignVGError struct {
+	VG   string
+	UUID string
+	PVs  []string
+}
+
+func (e *ForeignVGError) Error() string {
+	return fmt.Sprintf("a volume group named %q (uuid %s, PVs %v) exists on a disk outside this set: refusing to create a second VG of that name or to remove one the layout does not own -- detach that disk, or rename or remove the VG by hand",
+		e.VG, e.UUID, e.PVs)
+}
+
 // Options configures a Builder.
 type Options struct {
 	Runner executor.Runner
 	Logger *txlog.Logger
+	// ZeroDevice zeroes the start of a new PV (ZeroStart); nil skips it, as
+	// for a dry run.
+	ZeroDevice func(device string) error
+}
+
+// ZeroStart writes zeros over the first 4 MiB of device and flushes them to
+// the disk, as `dd bs=1M count=4 conv=fsync` would.
+func ZeroStart(device string) error {
+	f, err := os.OpenFile(device, os.O_WRONLY, 0) //nolint:gosec // the PV lpart just created
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(make([]byte, 4<<20)); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // Builder builds the LVM stack.
@@ -123,6 +160,21 @@ func (b *Builder) Build(ctx context.Context, set *v2.Set, layout partition.Layou
 		CaptureStdout: true, CaptureStderr: true,
 	})
 
+	// Zero the start of the new PV device. A new md array or partition can
+	// start in the middle of what an earlier layout left on the disks: on
+	// the lab node a raid0 created over the members of a former raid6 began
+	// with fragments of the old LVM label, mda header and metadata text.
+	// blkid does not recognise those (so wipefs leaves them), but lvm2
+	// 2.03.14 (el8) parses them and crashes (SIGSEGV) in every pvcreate,
+	// pvs and vgchange -- the node retried for ever. LVM looks for its label
+	// in the first sectors only; 4 MiB also clears the old metadata area.
+	// Written from Go: the Ubuntu ramdisk's klibc dd rejects conv=fsync.
+	if b.o.ZeroDevice != nil {
+		if err := b.o.ZeroDevice(pvDevice); err != nil && b.o.Logger != nil {
+			b.o.Logger.Warn(fmt.Sprintf("zeroing the start of %s before pvcreate failed: %v", pvDevice, err))
+		}
+	}
+
 	if _, err := b.o.Runner.Run(ctx, executor.CommandSpec{
 		Path: "pvcreate", Args: []string{"-ff", "-y", pvDevice},
 		CaptureStdout: true, CaptureStderr: true,
@@ -133,13 +185,13 @@ func (b *Builder) Build(ctx context.Context, set *v2.Set, layout partition.Layou
 	// DIFFERENT disk topology can survive cleanup (its md array was
 	// disassembled at cleanup time, then reassembled by a later udev event),
 	// so `vgcreate` here would make a SECOND VG of this name and the following
-	// `lvcreate` can no longer disambiguate -> exit 5, install fails. Purge any
-	// existing VG of this name by UUID immediately before creating ours (the
-	// fresh pvDevice has no VG yet, so this only removes OTHER same-name
-	// groups). Cleanup's protected-disk fence has already run; a same-name
-	// collision with the OS VG is by construction a stale OS remnant, not a
-	// persistent data set (those carry distinct VG names).
-	b.purgeStaleVGsByName(ctx, vgName)
+	// `lvcreate` can no longer disambiguate -> exit 5, install fails. Purge
+	// such a VG by UUID immediately before creating ours -- but only one whose
+	// PVs are on THIS set's disks. A same-named VG elsewhere (an old OS disk
+	// still attached) is not ours to remove: refuse instead.
+	if err := b.purgeStaleVGsByName(ctx, vgName, layout.Disks); err != nil {
+		return State{}, err
+	}
 
 	if _, err := b.o.Runner.Run(ctx, executor.CommandSpec{
 		Path: "vgcreate", Args: []string{vgName, pvDevice},
@@ -208,32 +260,33 @@ func (b *Builder) Build(ctx context.Context, set *v2.Set, layout partition.Layou
 	return state, nil
 }
 
-// purgeStaleVGsByName removes every existing VG named vgName, by UUID (the
-// name may be ambiguous when duplicates exist). Best-effort: each command is
-// allowed to fail without aborting the install (the subsequent vgcreate is
-// the real gate). See the call site in Build for the rationale (FTA v2 BE-A6b,
-// barrier NB-9).
-func (b *Builder) purgeStaleVGsByName(ctx context.Context, vgName string) {
-	res, err := b.o.Runner.Run(ctx, executor.CommandSpec{
-		Path: "vgs", Args: []string{"--noheadings", "-o", "vg_uuid,vg_name"},
-		CaptureStdout: true, CaptureStderr: true,
-	})
+// purgeStaleVGsByName removes every existing VG named vgName whose PVs sit on
+// the set's disks, by UUID (the name may be ambiguous when duplicates exist).
+// A same-named VG with no PV on those disks is foreign and is never touched:
+// it is returned as a *ForeignVGError, because vgcreate would fail on it. A
+// probe failure is only logged: the vgcreate that follows is the real gate.
+// See the call site in Build for the rationale (FTA v2 BE-A6b, barrier NB-9).
+func (b *Builder) purgeStaleVGsByName(ctx context.Context, vgName string, disks []string) error {
+	loc, err := vgselect.Locate(ctx, b.o.Runner, vgName, disks)
 	if err != nil {
-		return
-	}
-	for _, line := range strings.Split(string(res.Stdout), "\n") {
-		f := strings.Fields(line)
-		if len(f) < 2 || f[1] != vgName {
-			continue
+		if b.o.Logger != nil {
+			b.o.Logger.Warn("lvm: cannot list volume groups before vgcreate", "vg", vgName, "err", err.Error())
 		}
-		sel := "vg_uuid=" + f[0]
+		return nil
+	}
+	if len(loc.Foreign) > 0 {
+		v := loc.Foreign[0]
+		return &ForeignVGError{VG: v.Name, UUID: v.UUID, PVs: v.PVs}
+	}
+	for _, v := range loc.Own {
 		_, _ = b.o.Runner.Run(ctx, executor.CommandSpec{
-			Path: "vgchange", Args: []string{"-an", "--select", sel},
+			Path: "vgchange", Args: []string{"-an", "--select", v.Select()},
 			CaptureStdout: true, CaptureStderr: true,
 		})
 		_, _ = b.o.Runner.Run(ctx, executor.CommandSpec{
-			Path: "vgremove", Args: []string{"-fy", "--select", sel},
+			Path: "vgremove", Args: []string{"-fy", "--select", v.Select()},
 			CaptureStdout: true, CaptureStderr: true,
 		})
 	}
+	return nil
 }

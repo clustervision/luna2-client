@@ -32,6 +32,7 @@ func silentLogger(t *testing.T) *txlog.Logger {
 // wipes, local/persistent only mount.
 func TestDecideActionDataFence(t *testing.T) {
 	H, B, K := storagehealth.VerdictHealthy, storagehealth.VerdictBlank, storagehealth.VerdictBroken
+	U := storagehealth.VerdictUnknown
 	cases := []struct {
 		name       string
 		mode       installcontext.Mode
@@ -61,6 +62,11 @@ func TestDecideActionDataFence(t *testing.T) {
 		{"auto/healthy", installcontext.ModeAuto, "data", false, H, actMount, false},
 		{"auto/broken-os", installcontext.ModeAuto, "os", false, K, actCreate, false},
 		{"auto/broken-data", installcontext.ModeAuto, "data", false, K, actMount, true},
+		// unknown (a checker did not run): never mount, never wipe -- not
+		// even the os set under auto, which recreates a BROKEN os set.
+		{"auto/unknown-os", installcontext.ModeAuto, "os", false, U, actMount, true},
+		{"auto/unknown-data", installcontext.ModeAuto, "data", false, U, actMount, true},
+		{"sync/unknown-os", installcontext.ModeSync, "os", false, U, actMount, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -84,12 +90,11 @@ func TestRunDecisionLegacyErrors(t *testing.T) {
 
 func TestRunDecisionSyncRequiresConfig(t *testing.T) {
 	sp := &setProcessor{logger: silentLogger(t)}
-	if _, _, err := sp.runDecision(context.Background(), installcontext.ModeSync, nil, "uefi", true, false); err == nil {
-		t.Fatal("sync with no disklayout must error")
-	}
-	if _, _, err := sp.runDecision(context.Background(), installcontext.ModeFull, &v2.Config{}, "uefi", true, false); err == nil {
-		t.Fatal("full with empty disklayout must error")
-	}
+	// Deterministic: fatal config (exit 3), not a retry loop.
+	_, _, err := sp.runDecision(context.Background(), installcontext.ModeSync, nil, "uefi", true, false)
+	wantFatal(t, err, "no-disklayout")
+	_, _, err = sp.runDecision(context.Background(), installcontext.ModeFull, &v2.Config{}, "uefi", true, false)
+	wantFatal(t, err, "no-disklayout")
 }
 
 func TestRunSanitizeNoDisks(t *testing.T) {
@@ -131,6 +136,7 @@ func TestRunSanitizeTearsDownStacksBeforeErase(t *testing.T) {
 		pool: []discover.Device{
 			{Path: "/dev/vda", KernelPath: "/dev/vda", Size: gib(20)},
 		},
+		sanitizeReadBack: func(string) (bool, error) { return true, nil },
 	}
 	if _, _, err := sp.runSanitize(context.Background(), false); err != nil {
 		t.Fatalf("runSanitize: %v", err)
@@ -160,6 +166,7 @@ func gib(n int64) int64 { return n * 1024 * 1024 * 1024 }
 func TestResolveDiscoverSelectsByTagsAndConsumesPool(t *testing.T) {
 	sp := &setProcessor{
 		logger: silentLogger(t),
+		runner: executor.NewFakeRunner(executor.FakeResponse{}),
 		pool: []discover.Device{
 			{Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(8000), Tags: []string{"rotary"}},
 			{Path: "/dev/nvme0n1", KernelPath: "/dev/nvme0n1", Size: gib(2000), Tags: []string{"ssd", "nvme"}},
@@ -173,7 +180,7 @@ func TestResolveDiscoverSelectsByTagsAndConsumesPool(t *testing.T) {
 			{Name: "scratch", Mountpoint: "/scratch", FS: "xfs", Provider: "lvm", Size: "100%"},
 		},
 	}
-	if err := sp.resolveDiscover(set); err != nil {
+	if err := sp.resolveDiscover(context.Background(), set); err != nil {
 		t.Fatalf("resolveDiscover: %v", err)
 	}
 	if len(set.Devices) != 2 {
@@ -193,6 +200,7 @@ func TestResolveDiscoverSelectsByTagsAndConsumesPool(t *testing.T) {
 func TestResolveDiscoverHaltsWhenUnmet(t *testing.T) {
 	sp := &setProcessor{
 		logger: silentLogger(t),
+		runner: executor.NewFakeRunner(executor.FakeResponse{}),
 		pool:   []discover.Device{{Path: "/dev/sda", KernelPath: "/dev/sda", Size: gib(500), Tags: []string{"ssd"}}},
 	}
 	set := &v2.Set{
@@ -200,7 +208,7 @@ func TestResolveDiscoverHaltsWhenUnmet(t *testing.T) {
 		Match:   &v2.Match{Tags: []string{"ssd"}},
 		Volumes: []v2.Volume{{Name: "root", Mountpoint: "/", FS: "xfs", Provider: "lvm", Size: "100%"}},
 	}
-	if err := sp.resolveDiscover(set); err == nil {
+	if err := sp.resolveDiscover(context.Background(), set); err == nil {
 		t.Fatal("raid1 with one eligible disk must halt (not enough disks)")
 	}
 }

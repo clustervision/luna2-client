@@ -2,6 +2,9 @@ package mount
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -280,4 +283,94 @@ func equalSlices(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// findmnt -r escapes a space as \x20: a sysroot whose path has one must still
+// be recognised in the live mount list and as the place a source is mounted.
+func TestFindmntTargetsAreDecoded(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-o", "TARGET"},
+		Response: executor.FakeResponse{Stdout: []byte("/proc\n/sys\\x20root\n/sys\\x20root/boot\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-S", "/dev/sdb1"},
+		Response: executor.FakeResponse{Stdout: []byte("/sys\\x20root/boot\n")}})
+	m := New(Options{Runner: f, Sysroot: "/sys root"})
+	if got := m.liveSysrootTargets(context.Background()); len(got) != 2 || got[1] != "/sys root/boot" {
+		t.Errorf("liveSysrootTargets = %q, want [/sys root /sys root/boot]", got)
+	}
+	if err := m.ensureNotMountedElsewhere(context.Background(), "/dev/sdb1"); err != nil {
+		t.Errorf("a source mounted below the sysroot is not mounted elsewhere: %v", err)
+	}
+}
+
+// The SOURCE column is escaped too: the device mounted at a target must come
+// back as its real path, or the re-entrancy check sees a different source.
+func TestFindmntSourceIsDecoded(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-M", "/sysroot/data", "-o", "SOURCE"},
+		Response: executor.FakeResponse{Stdout: []byte("/dev/disk/by-label/my\\x20data\n")}})
+	m := New(Options{Runner: f, Sysroot: "/sysroot"})
+	got, mounted := m.mountedSource(context.Background(), "/sysroot/data")
+	if !mounted || got != "/dev/disk/by-label/my data" {
+		t.Errorf("mountedSource = %q, %v, want /dev/disk/by-label/my data, true", got, mounted)
+	}
+}
+
+// findmnt -S prints one line per mount of the source: a device mounted below
+// the sysroot and somewhere else is still mounted elsewhere.
+func TestEnsureNotMountedElsewhereReadsEveryLine(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "findmnt", ArgsPrefix: []string{"-rn", "-S", "/dev/sdb1"},
+		Response: executor.FakeResponse{Stdout: []byte("/sysroot/data\n/mnt/x\n")}})
+	m := New(Options{Runner: f, Sysroot: "/sysroot"})
+	err := m.ensureNotMountedElsewhere(context.Background(), "/dev/sdb1")
+	if err == nil || !strings.Contains(err.Error(), "/mnt/x") {
+		t.Fatalf("want a refusal naming /mnt/x, got %v", err)
+	}
+}
+
+// A mount target is made and mounted only through real directories below the
+// sysroot: a symlinked component refuses, naming the link.
+func TestMountSysrootTreeRefusesSymlinkedTarget(t *testing.T) {
+	sysroot, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(sysroot, "srv")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(sysroot, "home"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	m := New(Options{Runner: f, Sysroot: sysroot})
+	_, err := m.MountSysrootTree(context.Background(), fs.Filesystems{Filesystems: []fs.Filesystem{
+		{Mount: "/home/a", Device: "/dev/vdb1", FS: "xfs"},
+		{Mount: "/srv/data", Device: "/dev/vdb2", FS: "xfs"},
+	}})
+	var se *SymlinkError
+	if !errors.As(err, &se) || se.Link != filepath.Join(sysroot, "srv") {
+		t.Fatalf("want a SymlinkError naming %s/srv, got %v", sysroot, err)
+	}
+	for _, c := range f.Calls() {
+		if strings.Contains(strings.Join(c.Args, " "), "/srv/data") {
+			t.Fatalf("ran %s %v through the symlink", c.Path, c.Args)
+		}
+	}
+}
+
+// The refusal is an error naming the link, and no mkdir or mount reaches the
+// directory the link points to. Uses no API the fix added.
+func TestMountSysrootTreeNeverFollowsASymlinkedTarget(t *testing.T) {
+	sysroot, outside := t.TempDir(), t.TempDir()
+	if err := os.Symlink(outside, filepath.Join(sysroot, "srv")); err != nil {
+		t.Fatal(err)
+	}
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	_, err := New(Options{Runner: f, Sysroot: sysroot}).MountSysrootTree(context.Background(),
+		fs.Filesystems{Filesystems: []fs.Filesystem{{Mount: "/srv/data", Device: "/dev/vdb2", FS: "xfs"}}})
+	if err == nil || !strings.Contains(err.Error(), filepath.Join(sysroot, "srv")) {
+		t.Fatalf("want an error naming %s/srv, got %v", sysroot, err)
+	}
+	for _, c := range f.Calls() {
+		if (c.Path == "mkdir" || c.Path == "mount") && strings.Contains(strings.Join(c.Args, " "), "/srv/data") {
+			t.Fatalf("ran %s %v through the symlink", c.Path, c.Args)
+		}
+	}
 }

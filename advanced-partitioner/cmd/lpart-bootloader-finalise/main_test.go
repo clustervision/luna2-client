@@ -3,11 +3,14 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/bootloader"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/result"
 )
 
@@ -279,7 +282,8 @@ func TestDiskRootBootloaderNoneOnBIOS(t *testing.T) {
 		FirmwareMode: "bios", StorageType: "lvm",
 		BootMethod: "none", BootFirmware: "uefi", RegisterNVRAM: "auto",
 		RAIDMode: "none", MountedTargetRoot: sysroot,
-		BootDevices: []string{"/dev/sda"},
+		// never a real disk: the BIOS none path clears the MBR boot code
+		BootDevices: []string{biosDiskImage(t)},
 		Filesystems: []result.Filesystem{
 			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", Options: "defaults", UUID: "root-uuid"},
 			{Mount: "/boot/efi", Device: "/dev/sda1", FS: "vfat", Options: "defaults", UUID: "esp-uuid"},
@@ -396,21 +400,46 @@ func TestDiskRootBootloaderNoneRemovesExistingSetup(t *testing.T) {
 	}
 }
 
-// On BIOS the none message names the firmware, and there is no UEFI boot path
-// to strip: nothing on the ESP is touched and no efibootmgr runs.
-func TestDiskRootBootloaderNoneOnBIOSRemovesNothing(t *testing.T) {
+// biosDiskImage writes a disk image whose MBR carries boot code, as an earlier
+// bootloader "first" install leaves it, and returns its path.
+func biosDiskImage(t *testing.T) string {
+	t.Helper()
+	img := make([]byte, 4096)
+	for i := 0; i < 440; i++ {
+		img[i] = 0xEB
+	}
+	for i := 446; i < 510; i++ {
+		img[i] = 0x11 // partition table stand-in
+	}
+	img[510], img[511] = 0x55, 0xAA
+	p := filepath.Join(t.TempDir(), "disk.img")
+	if err := os.WriteFile(p, img, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// biosNoneRun finalises a BIOS disk root whose MBR carries boot code, with the
+// given boot_order, and returns the log, the disk image and its first sector.
+func biosNoneRun(t *testing.T, bootOrder string) (log string, disk string, before []byte) {
+	t.Helper()
 	tmp := t.TempDir()
 	sysroot := filepath.Join(tmp, "sysroot")
 	if err := os.MkdirAll(sysroot, 0o750); err != nil {
 		t.Fatal(err)
 	}
 	stageESPLoaders(t, sysroot)
+	disk = biosDiskImage(t)
+	before, err := os.ReadFile(disk) //nolint:gosec // test artefact
+	if err != nil {
+		t.Fatal(err)
+	}
 	res := result.StorageResult{
 		Version: 2, Name: "os", Role: "os",
 		FirmwareMode: "bios", StorageType: "lvm",
-		BootMethod: "none", BootOrder: "last", BootFirmware: "uefi", RegisterNVRAM: "auto",
+		BootMethod: "none", BootOrder: bootOrder, BootFirmware: "uefi", RegisterNVRAM: "auto",
 		RAIDMode: "none", MountedTargetRoot: sysroot,
-		BootDevices: []string{"/dev/sda"},
+		BootDevices: []string{disk},
 		Filesystems: []result.Filesystem{
 			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", Options: "defaults", UUID: "root-uuid"},
 		},
@@ -425,12 +454,41 @@ func TestDiskRootBootloaderNoneOnBIOSRemovesNothing(t *testing.T) {
 	if rc != 0 {
 		t.Fatalf("rc=%d stderr=%s", rc, stderr)
 	}
-	log := readLog(t, logPath)
+	log = readLog(t, logPath)
 	if !strings.Contains(log, `firmware is "bios"`) {
-		t.Fatalf("the BIOS message must name the firmware as the reason:\n%s", log)
+		t.Fatalf("the BIOS message must name the firmware:\n%s", log)
 	}
 	if _, err := os.Stat(filepath.Join(sysroot, "boot", "efi", "EFI", "BOOT", "BOOTX64.EFI")); err != nil {
 		t.Errorf("a BIOS node has no UEFI boot path to strip: %v", err)
+	}
+	return log, disk, before
+}
+
+// "last" on BIOS installs nothing and keeps what an earlier "first" left on the
+// disk: it is the fallback when PXE fails.
+func TestDiskRootBootloaderLastOnBIOSKeepsBootCode(t *testing.T) {
+	log, disk, before := biosNoneRun(t, "last")
+	if !strings.Contains(log, "fallback behind PXE") {
+		t.Errorf("the last message must say the disk's GRUB stays:\n%s", log)
+	}
+	after, err := os.ReadFile(disk) //nolint:gosec // test artefact
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal(`bootloader "last" must not touch the disk`)
+	}
+}
+
+// "none" on BIOS goes through the removal (proven against disk images in the
+// bootloader package); here the disk cannot be listed, so it is warned about and
+// left rather than half-cleared.
+func TestDiskRootBootloaderNoneOnBIOSRunsTheRemoval(t *testing.T) {
+	log, _, _ := biosNoneRun(t, "none")
+	for _, want := range []string{`asks for bootloader "none"`, "left as it is"} {
+		if !strings.Contains(log, want) {
+			t.Errorf("missing %q:\n%s", want, log)
+		}
 	}
 }
 
@@ -452,7 +510,8 @@ func biosGRUBResult(t *testing.T, biosBootPartition int) string {
 		FirmwareMode: "bios", StorageType: "lvm",
 		BootMethod: "grub", BootOrder: "first", BootFirmware: "uefi", RegisterNVRAM: "auto",
 		RAIDMode: "none", MountedTargetRoot: sysroot,
-		BootDevices:       []string{"/dev/sda"},
+		// never a real disk: the gate must refuse before anything reaches it
+		BootDevices:       []string{filepath.Join(tmp, "no-such-disk")},
 		BIOSBootPartition: biosBootPartition,
 		Filesystems: []result.Filesystem{
 			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", Options: "defaults", UUID: "root-uuid"},
@@ -495,5 +554,170 @@ func TestBIOSGRUBWithBootPartitionPassesTheGate(t *testing.T) {
 		if strings.Contains(stderr, unwanted) {
 			t.Fatalf("unexpected refusal %q; stderr=%s", unwanted, stderr)
 		}
+	}
+}
+
+// classSysroot stages a sysroot with the given os-release and image files and
+// returns it with a storage-result path describing a grub install on it.
+func classSysroot(t *testing.T, osRelease string, files []string, mutate func(*result.StorageResult)) (string, string) {
+	t.Helper()
+	tmp := t.TempDir()
+	sysroot := filepath.Join(tmp, "sysroot")
+	for _, rel := range append([]string{"etc/os-release"}, files...) {
+		p := filepath.Join(sysroot, rel)
+		if err := os.MkdirAll(filepath.Dir(p), 0o750); err != nil {
+			t.Fatal(err)
+		}
+		body := ""
+		if rel == "etc/os-release" {
+			body = osRelease
+		}
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(filepath.Join(sysroot, "boot", "efi"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	res := result.StorageResult{
+		Version: 2, Name: "os", Role: "os",
+		FirmwareMode: "uefi", StorageType: "lvm",
+		BootMethod: "grub", BootOrder: "last", BootFirmware: "uefi", RegisterNVRAM: "auto",
+		RAIDMode: "none", MountedTargetRoot: sysroot,
+		BootDevices: []string{filepath.Join(tmp, "no-such-disk")},
+		Filesystems: []result.Filesystem{
+			{Mount: "/", Device: "/dev/mapper/os-root", FS: "xfs", UUID: "root-uuid"},
+			{Mount: "/boot", Device: "/dev/sda2", FS: "xfs", UUID: "boot-uuid"},
+			{Mount: "/boot/efi", Device: "/dev/sda1", FS: "vfat", UUID: "esp-uuid"},
+		},
+	}
+	if mutate != nil {
+		mutate(&res)
+	}
+	body, _ := json.Marshal(res)
+	p := filepath.Join(tmp, "storage-result.json")
+	if err := os.WriteFile(p, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return sysroot, p
+}
+
+var rhelTools = []string{"usr/sbin/dracut", "usr/sbin/grub2-mkconfig"}
+
+// Review finding 9: deterministic failures park (exit 3, fatal_config=<reason>)
+// instead of exit 1, which the wrapper retries every 30 s for ever -- in full
+// mode re-wiping the disks and downloading the image each time. None of these
+// may reach the bind mounts (non-dry-run: a mount attempt as a normal user
+// would turn them into exit 1).
+func TestDeterministicFailuresExit3(t *testing.T) {
+	for _, tc := range []struct {
+		name, osRelease string
+		files           []string
+		mutate          func(*result.StorageResult)
+		reason          string
+	}{
+		{"unsupported OS family", "ID=gentoo\n", nil, nil, "unsupported-os-family"},
+		{"image without dracut", "ID=rocky\n", []string{"usr/sbin/grub2-mkconfig"}, nil, "image-missing-tool"},
+		{"image without grub2-mkconfig", "ID=rocky\n", []string{"usr/sbin/dracut"}, nil, "image-missing-tool"},
+		{"debian image without update-grub", "ID=ubuntu\n", []string{"usr/sbin/update-initramfs"}, nil, "image-missing-tool"},
+		{"fstab entry without UUID", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.Filesystems[1].UUID = ""
+		}, "fstab-missing-uuid"},
+		{"no boot devices", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.BootDevices = []string{}
+		}, "no-boot-devices"},
+		{"BIOS first without grub2-install", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.FirmwareMode, r.BootOrder, r.BIOSBootPartition = "bios", "first", 1
+		}, "image-missing-bios-grub"},
+		{"BIOS first without the i386-pc modules", "ID=rocky\n", append([]string{"usr/sbin/grub2-install"}, rhelTools...), func(r *result.StorageResult) {
+			r.FirmwareMode, r.BootOrder, r.BIOSBootPartition = "bios", "first", 1
+		}, "image-missing-bios-grub"},
+		{"debian BIOS first without grub-install", "ID=ubuntu\n", []string{"usr/sbin/update-initramfs", "usr/sbin/update-grub"}, func(r *result.StorageResult) {
+			r.FirmwareMode, r.BootOrder, r.BIOSBootPartition = "bios", "first", 1
+		}, "image-missing-bios-grub"},
+		{"mirrored boot without efibootmgr", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.BootDevices = append(r.BootDevices, r.BootDevices[0]+"-b")
+		}, "image-missing-efibootmgr"},
+		{"clear_uefi_nvram without efibootmgr", "ID=rocky\n", rhelTools, func(r *result.StorageResult) {
+			r.ClearUEFINVRAM = true
+		}, "image-missing-efibootmgr"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, resPath := classSysroot(t, tc.osRelease, tc.files, tc.mutate)
+			stderr, rc := runEnv(t, "--result", resPath)
+			if rc != 3 || !strings.Contains(stderr, "fatal_config="+tc.reason) {
+				t.Fatalf("want exit 3 fatal_config=%s; rc=%d stderr=%s", tc.reason, rc, stderr)
+			}
+		})
+	}
+}
+
+// A dry run on a fresh disk previews the install: it writes nothing, so it
+// must not then fail validating the boot files it did not write.
+func TestDryRunOnFreshDiskSucceeds(t *testing.T) {
+	files := append([]string{"lib/modules/5.14.0-1.el9.x86_64/vmlinuz"}, rhelTools...)
+	sysroot, resPath := classSysroot(t, "ID=rocky\n", files, nil)
+	stageESPLoaders(t, sysroot)
+	stderr, rc := runEnv(t, "--result", resPath, "--dry-run")
+	if rc != 0 {
+		t.Fatalf("dry run on a fresh disk: rc=%d stderr=%s", rc, stderr)
+	}
+}
+
+// Two os sets cannot both be booted: the result is invalid (exit 3), not
+// silently reduced to the last one.
+func TestTwoOSSetsInStorageResultExit3(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "storage-result.json")
+	body := `{"version":2,"sets":[{"name":"os","role":"os"},{"name":"os2","role":"os"}]}`
+	if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stderr, rc := runEnv(t, "--result", p)
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=storage-result-invalid more than one os set") {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+}
+
+func TestInvalidStorageResultExit3(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "storage-result.json")
+	if err := os.WriteFile(p, []byte("{not json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stderr, rc := runEnv(t, "--result", p)
+	if rc != 3 || !strings.Contains(stderr, "fatal_config=storage-result-invalid") {
+		t.Fatalf("rc=%d stderr=%s", rc, stderr)
+	}
+	_, resPath := classSysroot(t, "ID=rocky\n", rhelTools, nil)
+	sysroot := filepath.Dir(resPath) + "/sysroot"
+	if err := os.Remove(filepath.Join(sysroot, "etc", "os-release")); err != nil {
+		t.Fatal(err)
+	}
+	if stderr, rc := runEnv(t, "--result", resPath); rc != 3 || !strings.Contains(stderr, "fatal_config=image-missing-os-release") {
+		t.Fatalf("missing os-release: rc=%d stderr=%s", rc, stderr)
+	}
+}
+
+// fail maps the typed error, not the message: a transient command failure is
+// a retry (exit 1) whatever it says.
+func TestFailClassification(t *testing.T) {
+	var buf bytes.Buffer
+	if rc := fail(&buf, "", errors.New("efibootmgr --create /dev/sda: exit status 5 (missing UUID)")); rc != 1 {
+		t.Fatalf("transient failure: rc=%d", rc)
+	}
+	wrapped := fmt.Errorf("StageSignedShim: %w", &bootloader.FatalError{Kind: "image", Reason: "image-no-signed-shim", Err: errors.New("no shim")})
+	buf.Reset()
+	if rc := fail(&buf, "", wrapped); rc != 3 || !strings.Contains(buf.String(), "fatal_config=image-no-signed-shim") {
+		t.Fatalf("wrapped FatalError: rc=%d out=%s", rc, buf.String())
+	}
+}
+
+// A bad command line is the same on every attempt: exit 3 parks with a
+// fatal_config line, as in every lpart tool; exit 2 is reserved for safety
+// refusals.
+func TestBadFlagIsFatalConfig(t *testing.T) {
+	var out, errb bytes.Buffer
+	rc := run([]string{toolName, "--no-such-flag"}, &out, &errb)
+	if rc != 3 || !strings.Contains(errb.String(), "fatal_config=usage") {
+		t.Fatalf("rc=%d (want 3), stderr=%s", rc, errb.String())
 	}
 }

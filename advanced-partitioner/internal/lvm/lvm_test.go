@@ -1,7 +1,11 @@
 package lvm
 
 import (
+	"bytes"
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -49,7 +53,12 @@ func TestBuildHappyPathNoRAID(t *testing.T) {
 			{Name: "root", Provider: "lvm", Mountpoint: "/", FS: "xfs", Size: "100%"},
 		},
 	}
-	state, err := New(Options{Runner: f}).Build(context.Background(), set,
+	// The zeroing is recorded in the runner's call list, in its place.
+	zero := func(dev string) error {
+		_, err := f.Run(context.Background(), executor.CommandSpec{Path: "(zero)", Args: []string{dev}})
+		return err
+	}
+	state, err := New(Options{Runner: f, ZeroDevice: zero}).Build(context.Background(), set,
 		partition.Layout{StoragePartitions: []string{"/dev/sda3"}},
 		raid.State{RAIDMode: "none"})
 	if err != nil {
@@ -60,13 +69,16 @@ func TestBuildHappyPathNoRAID(t *testing.T) {
 	}
 	// Verify order: defensive superblock clear (FTA D7 - a stale md 1.2
 	// superblock inside the re-created partition would otherwise be
-	// re-assembled by udev and hold the device busy), then pvcreate,
+	// re-assembled by udev and hold the device busy), the first 4 MiB
+	// zeroed from Go (old LVM remnants crash lvm2 2.03.14; klibc dd rejects
+	// conv=fsync), then pvcreate,
 	// vgcreate, fixed-size LVs in JSON order, 100% LV last.
 	want := []string{
 		"mdadm --zero-superblock /dev/sda3",
 		"wipefs -a /dev/sda3",
+		"(zero) /dev/sda3",
 		"pvcreate -ff -y /dev/sda3",
-		"vgs --noheadings -o vg_uuid,vg_name",
+		"pvs --noheadings -o vg_uuid,vg_name,pv_name",
 		"vgcreate os /dev/sda3",
 		"lvcreate --noudevsync -y -Z n -W n -n swap -L 1G os",
 		"vgmknodes os",
@@ -170,23 +182,26 @@ func mustHaveCall(t *testing.T, f *executor.FakeRunner, want string) {
 }
 
 // NB-9 (FTA v2 BE-A6b): a stale same-name VG left by a prior different-topology
-// install must be purged (by UUID) BEFORE vgcreate, or the second same-name VG
-// makes lvcreate ambiguous -> exit 5. Here `vgs` reports a stale "os" (UUID
-// STALEUUID01) plus an unrelated VG that must be left alone.
+// install on THIS set's disks must be purged (by UUID) BEFORE vgcreate, or the
+// second same-name VG makes lvcreate ambiguous -> exit 5. Here pvs reports a
+// stale "os" (UUID STALEUUID01) on sdb (one of the set's disks) plus an
+// unrelated VG that must be left alone.
 func TestBuildPurgesStaleSameNameVG(t *testing.T) {
 	f := executor.NewFakeRunner(executor.FakeResponse{})
 	f.AddMatch(executor.FakeMatch{
-		Path: "vgs",
+		Path: "pvs",
 		Response: executor.FakeResponse{
-			Stdout: []byte("  STALEUUID01 os\n  OTHERUUID99 keepme\n"),
+			Stdout: []byte("  STALEUUID01 os /dev/sdb3\n  OTHERUUID99 keepme /dev/sdc1\n"),
 		},
 	})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/sdb"},
+		Response: executor.FakeResponse{Stdout: []byte("sdb\nsdb3\n")}})
 	set := &v2.Set{
 		Name: "os", Role: "os", Raid: "none",
 		Volumes: []v2.Volume{{Name: "root", Provider: "lvm", Mountpoint: "/", FS: "xfs", Size: "100%"}},
 	}
 	if _, err := New(Options{Runner: f}).Build(context.Background(), set,
-		partition.Layout{StoragePartitions: []string{"/dev/sda3"}},
+		partition.Layout{StoragePartitions: []string{"/dev/sda3"}, Disks: []string{"/dev/sda", "/dev/sdb"}},
 		raid.State{RAIDMode: "none"}); err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -213,5 +228,70 @@ func TestBuildPurgesStaleSameNameVG(t *testing.T) {
 	}
 	if purgeIdx < 0 || createIdx < 0 || purgeIdx > createIdx {
 		t.Fatalf("purge must precede vgcreate: purge=%d create=%d", purgeIdx, createIdx)
+	}
+}
+
+// A VG with the set's name on a disk OUTSIDE the set (an old OS disk still
+// attached) is never removed by the build: it refuses with ForeignVGError
+// before vgcreate, instead of vgremove-ing a disk the layout does not own.
+func TestBuildRefusesForeignSameNameVG(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "pvs",
+		Response: executor.FakeResponse{Stdout: []byte("  OLDOSUUID os /dev/sdc3\n")}})
+	f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME", "/dev/sda"},
+		Response: executor.FakeResponse{Stdout: []byte("sda\nsda3\n")}})
+	set := &v2.Set{Name: "os", Role: "os", Raid: "none",
+		Volumes: []v2.Volume{{Name: "root", Provider: "lvm", Mountpoint: "/", FS: "xfs", Size: "100%"}}}
+	_, err := New(Options{Runner: f}).Build(context.Background(), set,
+		partition.Layout{StoragePartitions: []string{"/dev/sda3"}, Disks: []string{"/dev/sda"}},
+		raid.State{RAIDMode: "none"})
+	var fe *ForeignVGError
+	if !errors.As(err, &fe) || fe.UUID != "OLDOSUUID" {
+		t.Fatalf("want ForeignVGError for OLDOSUUID, got %v", err)
+	}
+	for _, c := range f.Calls() {
+		if c.Path == "vgremove" || c.Path == "vgchange" || c.Path == "vgcreate" {
+			t.Fatalf("foreign VG case must not run %s %v", c.Path, c.Args)
+		}
+	}
+}
+
+// ZeroStart overwrites the first 4 MiB and nothing after them.
+func TestZeroStartZeroesTheFirst4MiB(t *testing.T) {
+	dev := filepath.Join(t.TempDir(), "pv")
+	if err := os.WriteFile(dev, bytes.Repeat([]byte{0xff}, 8<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ZeroStart(dev); err != nil {
+		t.Fatalf("ZeroStart: %v", err)
+	}
+	got, err := os.ReadFile(dev) //nolint:gosec // test path
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 8<<20 || !bytes.Equal(got[:4<<20], make([]byte, 4<<20)) || !bytes.Equal(got[4<<20:], bytes.Repeat([]byte{0xff}, 4<<20)) {
+		t.Fatal("want the first 4 MiB zeroed and the rest untouched")
+	}
+	if err := ZeroStart(filepath.Join(t.TempDir(), "missing")); err == nil {
+		t.Fatal("a device that cannot be opened must be an error")
+	}
+}
+
+// The PV start is never zeroed through dd: the Ubuntu ramdisk's klibc dd
+// rejects conv=fsync. Uses no API the fix added.
+func TestBuildRunsNoDDBeforePvcreate(t *testing.T) {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	f.AddMatch(executor.FakeMatch{Path: "dd", Response: executor.FakeResponse{ExitCode: 1, Stderr: []byte("dd: bad conversion")}})
+	set := &v2.Set{Name: "os", Role: "os", Raid: "none", Volumes: []v2.Volume{
+		{Name: "root", Provider: "lvm", Mountpoint: "/", FS: "xfs", Size: "100%"},
+	}}
+	if _, err := New(Options{Runner: f}).Build(context.Background(), set,
+		partition.Layout{StoragePartitions: []string{"/dev/sda3"}}, raid.State{RAIDMode: "none"}); err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	for _, c := range f.Calls() {
+		if c.Path == "dd" {
+			t.Fatalf("ran dd %v", c.Args)
+		}
 	}
 }

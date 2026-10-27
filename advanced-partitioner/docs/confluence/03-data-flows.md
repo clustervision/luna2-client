@@ -102,7 +102,7 @@ Top to bottom; **no reboot inside it** — it ends by reporting success and cont
 
 | Binary | Phase | What it does |
 |---|---|---|
-| **`lpart-node-installer`** | all | the **orchestrator** — `--phase pre/part/post` runs the pipeline in-process and drives the live TUI (or `--no-tui`) |
+| **`lpart-node-installer`** | all | the **orchestrator** — `--phase pre/part/post` runs the pipeline in-process and drives the live TUI (or `--no-tui`); `--phase finish` flushes the installed system to disk at the end of the install |
 | **`lpart-storage-prepare`** | part | discover disks (tags/size), resolve the layout, then partition / RAID / LVM / mkfs and **mount the tree at the sysroot** — dispatching on `install_mode`, enforcing the data fence (defined on **06**); `sanitize` securely erases here, `memboot` makes a tmpfs root |
 | **`lpart-storage-check`** | part | the health probe for an *existing* layout (`auto`/`sync`): healthy → reuse-and-mount, broken → recreate; the whole job for `local` |
 | **`lpart-osimage-install`** | part | **download + extract** the OS image into the sysroot — honouring `provision_method`/`fallback`, the `osimage_filter`, the first-install→full promotion, and the persistent-set excludes — then verify (`/etc/os-release` present) |

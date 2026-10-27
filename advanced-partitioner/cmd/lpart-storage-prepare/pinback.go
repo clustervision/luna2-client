@@ -35,7 +35,9 @@ const (
 // disklayout. Structural fields (role, raid, persistent, volumes) come from the
 // original authored config so volumes are reproduced verbatim; the device list
 // comes from what the resolver actually selected. selection becomes "manual" and
-// the discover-only fields (save, count, spares, match) are dropped. A set that
+// the discover-only fields (save, count, match) are dropped. spares is KEPT: the
+// device list holds the members followed by the spares, and without the count
+// the next build would turn the spares into active members. A set that
 // was selection=discover in the source carries the provenance stamp (origin,
 // when non-nil); operator-authored manual sets do not. Returns nil when no set
 // resolved to concrete disks (e.g. memboot/sanitize), so callers can skip the
@@ -54,7 +56,16 @@ func buildPinnableConfig(orig *v2.Config, resolved []result.ResolvedSet, origin 
 			continue
 		}
 		devices := make([]string, 0, len(rs.SelectedDisks))
+		if src.SelectionMode() == "manual" {
+			// Operator-authored: keep the device list verbatim, including a
+			// member that is absent while the set runs degraded -- the
+			// replacement disk goes back in its place.
+			devices = append(devices, src.Devices...)
+		}
 		for _, d := range rs.SelectedDisks {
+			if src.SelectionMode() == "manual" {
+				break
+			}
 			p := d.ConfiguredPath
 			if p == "" {
 				p = d.ResolvedPath
@@ -74,14 +85,17 @@ func buildPinnableConfig(orig *v2.Config, resolved []result.ResolvedSet, origin 
 			devices = append(devices, p)
 		}
 		pinned := v2.Set{
-			Name:       src.Name,
-			Role:       src.Role,
-			Selection:  "manual",
-			Raid:       src.Raid,
-			Devices:    devices,
-			Persistent: src.Persistent,
-			Bootloader: src.Bootloader,
-			Volumes:    src.Volumes,
+			Name:          src.Name,
+			Role:          src.Role,
+			Selection:     "manual",
+			Raid:          src.Raid,
+			Spares:        src.Spares,
+			Devices:       devices,
+			Persistent:    src.Persistent,
+			Bootloader:    src.Bootloader,
+			AllowDegraded: src.AllowDegraded,
+			Volumes:       src.Volumes,
+			Comment:       src.Comment,
 		}
 		// Stamp provenance only on sets the installer actually discovered;
 		// operator-authored manual sets pass through unmarked.

@@ -2,6 +2,7 @@ package cleanup
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -9,14 +10,14 @@ import (
 
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/executor"
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/mount"
 )
 
 // Set is the subset of v2.Set the cleanup cascade needs. lpart-storage-prepare
 // builds one of these per selected set from the typed v2 config + the
 // disk/selector.Resolved records.
 type Set struct {
-	// Name is the set name; also the LVM VG name (unless provider.vg_name
-	// overrides it, in which case the override goes here too).
+	// Name is the set name; also the LVM VG name (v2.Set.VGName).
 	Name string
 	// SelectedDisks is the list of resolved whole-disk paths, e.g.
 	// "/dev/sda", "/dev/disk/by-path/pci-0000:00:1f.2-ata-1.0" (the
@@ -44,6 +45,28 @@ type Set struct {
 	// or when a VG/md array under teardown has any member on a protected
 	// disk — whatever the selection logic upstream decided. Tests pin this.
 	Protected map[string]struct{}
+	// ErasesPastPVsError is set by a sanitize that erases every disk on the node:
+	// a pvs failure it accepts only warns, as no VG can reach an unerased disk.
+	ErasesPastPVsError func(error) bool
+}
+
+// ErrProtected is matched (errors.Is) by every refusal of the protected-disk
+// barrier: the work would touch a persistent set's disk. Such a refusal is
+// deterministic -- the same layout refuses identically on every retry -- so
+// callers map it to the exit-2 safety refusal, never to a retryable failure.
+var ErrProtected = errors.New("protected-disk barrier")
+
+// ProtectedError is one protected-disk barrier refusal; it matches
+// ErrProtected.
+type ProtectedError struct{ Msg string }
+
+func (e *ProtectedError) Error() string { return e.Msg }
+
+// Is makes errors.Is(err, ErrProtected) true for every barrier refusal.
+func (e *ProtectedError) Is(target error) bool { return target == ErrProtected }
+
+func protectedf(format string, args ...any) error {
+	return &ProtectedError{Msg: fmt.Sprintf(format, args...)}
 }
 
 // Result is the typed equivalent of the {"status":"ok"} JSON the Bash
@@ -101,7 +124,9 @@ type Cleaner struct {
 // New returns a Cleaner with sensible defaults filled in.
 func New(o Options) *Cleaner {
 	if o.Sysroot == "" {
-		o.Sysroot = "/sysroot"
+		// $rootmnt on initramfs-tools (Ubuntu: /root), /sysroot on dracut --
+		// the same root the mounter uses, or leftovers there are never unmounted
+		o.Sysroot = mount.EffectiveSysroot()
 	}
 	if o.CommandAvailable == nil {
 		o.CommandAvailable = defaultCommandAvailable
@@ -160,16 +185,19 @@ func (c *Cleaner) CleanupSelectedSet(ctx context.Context, set Set) (Result, erro
 	// wrong, this is the last barrier before irreversible destruction.
 	for disk := range selected {
 		if _, hit := set.Protected[disk]; hit {
-			return Result{}, fmt.Errorf(
+			return Result{}, protectedf(
 				"cleanup: selected disk %s belongs to a persistent set — refusing to touch it (protected-disk barrier)", disk)
 		}
 	}
 
-	c.unmountUnderSysroot(ctx, set.Name, set.OwnsSysroot, selected)
-	if err := c.teardownVG(ctx, set.Name, set.Protected); err != nil {
+	if err := c.refuseOutsideSpans(ctx, selected, set.ErasesPastPVsError); err != nil {
 		return Result{}, err
 	}
-	if err := c.teardownSameDiskVGs(ctx, selected, set.Protected); err != nil {
+	c.unmountUnderSysroot(ctx, set.Name, set.OwnsSysroot, selected)
+	if err := c.teardownVG(ctx, set.Name, selected, set.Protected); err != nil {
+		return Result{}, err
+	}
+	if err := c.teardownSameDiskVGs(ctx, selected, set.Protected, set.ErasesPastPVsError); err != nil {
 		return Result{}, err
 	}
 	if err := c.stopMDArrays(ctx, set.Name, selected, set.Protected); err != nil {

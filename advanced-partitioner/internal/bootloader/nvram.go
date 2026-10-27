@@ -13,7 +13,7 @@ import (
 )
 
 // BootloaderID is the EFI bootloader-id stamp used everywhere. Mirrors
-// LPART_BOOTLOADER_ID in /root/NEWTREE/lib/common.sh.
+// LPART_BOOTLOADER_ID in the bash lib/common.sh.
 const BootloaderID = "TrinityX"
 
 // efibootmgrChrootPath returns the in-image absolute path to efibootmgr,
@@ -32,12 +32,11 @@ func efibootmgrChrootPath(sysroot string) string {
 	return ""
 }
 
-// pxeAllowlist mirrors the bash awk allow-pass in
-// clear_uefi_nvram_entries: "anything matching PXE|Network|Luna|iPXE
-// must NOT be deleted". This is the safety net that keeps the network
-// boot path alive when an operator runs the clear_uefi_nvram path on
-// the tmpfs OS.
-var pxeAllowRE = regexp.MustCompile(`PXE|Network|Luna|iPXE`)
+// pxeAllowRE is the safety net that keeps the network boot path alive
+// when an operator runs the clear_uefi_nvram path: an entry whose label
+// matches is never deleted. Case-insensitive and wider than the bash
+// predecessor's PXE|Network|Luna|iPXE, which deleted HTTP boot entries.
+var pxeAllowRE = regexp.MustCompile(`(?i)PXE|Network|HTTP|IPv4|IPv6|iPXE|Luna`)
 
 // bootEntryRE matches a line like "Boot0001* TrinityX sda" or
 // "Boot0042  Linux Boot Manager". The first group is the four-hex
@@ -70,20 +69,17 @@ var trailingEntryRE = regexp.MustCompile(
 var bootNextRE = regexp.MustCompile(`^BootNext:\s*(.+)\s*$`)
 
 // ClearUEFINVRAMEntries deletes UEFI boot entries whose label does NOT
-// match PXE|Network|Luna|iPXE. Used by tmpfs-root + clear_uefi_nvram=true
-// to wipe stale local-install entries before reboot. Mirrors
+// match pxeAllowRE. Used whenever clear_uefi_nvram=true, for every boot
+// method, to wipe stale local-install entries before reboot. Mirrors
 // lib/bootloader_common.sh::clear_uefi_nvram_entries.
 func ClearUEFINVRAMEntries(ctx context.Context, runner executor.Runner, sysroot, firmwareMode string) error {
 	if firmwareMode != "uefi" {
 		return nil
 	}
-	eb := efibootmgrChrootPath(sysroot)
-	if eb == "" {
-		return fmt.Errorf(
-			"clear_uefi_nvram requested but efibootmgr is not available in %s -- "+
-				"osimage must be installed before calling lpart-bootloader-finalise",
-			sysroot)
+	if err := RequireEfibootmgr(sysroot, "clear_uefi_nvram"); err != nil {
+		return err
 	}
+	eb := efibootmgrChrootPath(sysroot)
 	res, err := runner.Run(ctx, executor.CommandSpec{
 		Path: eb, Chroot: sysroot,
 		CaptureStdout: true, CaptureStderr: true,
@@ -104,7 +100,7 @@ func ClearUEFINVRAMEntries(ctx context.Context, runner executor.Runner, sysroot,
 }
 
 // parseClearableBootNums returns the four-hex boot numbers whose label
-// is NOT in the PXE/Network/Luna/iPXE allowlist. Exported as an
+// does not match pxeAllowRE. Exported as an
 // internal helper for tests.
 func parseClearableBootNums(efibootmgrOutput string) []string {
 	var out []string
@@ -545,9 +541,37 @@ func signedShimLoaderPath(sysroot, arch string) (string, bool) {
 	if err != nil {
 		return "", false
 	}
-	distroDir, _, _, err := findSignedShimDir(filepath.Join(sysroot, "boot", "efi"), arch)
+	sel, err := findSignedShim(sysroot, arch)
 	if err != nil {
 		return "", false
 	}
-	return `\EFI\` + filepath.Base(distroDir) + `\` + shimName, true
+	return `\EFI\` + filepath.Base(sel.dir) + `\` + shimName, true
+}
+
+// RequireEfibootmgr returns an image FatalError when the image has no
+// efibootmgr although why needs one. Every NVRAM change runs the image's
+// efibootmgr in the chroot (the install initramfs has none), so retrying
+// cannot help.
+func RequireEfibootmgr(sysroot, why string) error {
+	if efibootmgrChrootPath(sysroot) != "" {
+		return nil
+	}
+	return imageErrorf("image-missing-efibootmgr",
+		"%s needs efibootmgr, but the OS image in %s has none -- add the efibootmgr package to the image", why, sysroot)
+}
+
+// RequireNVRAMTooling is the preflight for the NVRAM work an install cannot do
+// without: a UEFI install with more than one boot disk (a mirrored boot set)
+// needs one NVRAM entry per disk -- that IS its failover -- so an image without
+// efibootmgr would only fail VerifyAndReport at the very end, on every retry.
+// register_nvram=no is the deliberate opt-out. A single disk boots through the
+// removable fallback and is not refused.
+func RequireNVRAMTooling(bc BootContext) error {
+	if !strings.EqualFold(bc.FirmwareMode, "uefi") || bc.Family == FamilyNone ||
+		bc.RegisterNVRAM == "no" || len(bc.StorageResult.BootDevices) <= 1 {
+		return nil
+	}
+	return RequireEfibootmgr(bc.Sysroot, fmt.Sprintf(
+		"this %d-disk mirrored-boot install (one NVRAM boot entry per disk; set register_nvram=no to accept fallback-only boot)",
+		len(bc.StorageResult.BootDevices)))
 }

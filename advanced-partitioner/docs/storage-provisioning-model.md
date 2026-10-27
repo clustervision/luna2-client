@@ -222,7 +222,7 @@ The guarantees that fall out of this:
 - `auto` may recreate the OS set, which carries no user data. DATA sets halt rather than be wiped.
 - No mode wipes a disk on a mismatch except the OS set under `auto` or `full`. This closes the case where a renumbered disk triggers an accidental wipe.
 
-There is one more behaviour worth stating plainly. Because `memboot` consults the disk layout for DATA sets, "run the OS from RAM but keep my local data" is expressed directly: a `memboot` node with one persistent DATA set. The data is partitioned and formatted by no one, only mounted, and the mount is written into the RAM `/etc/fstab` during the post phase. The set's volumes are the single source of truth for the mounts. The image lay down also excludes persistent mountpoints, so nothing can write into them. Wiping such data on every boot is not a default and is not expressible without a deliberate, separate choice.
+There is one more behaviour worth stating plainly. Because `memboot` consults the disk layout for DATA sets, "run the OS from RAM but keep my local data" is expressed directly: a `memboot` node with one persistent DATA set. The data is partitioned and formatted by no one, only mounted under `/sysroot`, and it stays mounted across the switch to the RAM root. `memboot` runs no bootloader finalise, so the mount is not written into `/etc/fstab`; `auto` with a data-only layout takes the same RAM-root path and does write it. The set's volumes are the single source of truth for the mounts. The image lay down also excludes persistent mountpoints, so nothing can write into them. Wiping such data on every boot is not a default and is not expressible without a deliberate, separate choice.
 
 ### 5.3 Disk selection with tags and size
 
@@ -610,7 +610,7 @@ A non-zero exit from any field script aborts the install, and the ramdisk retrie
 
 | Binary | Phase | What it does |
 |--------|-------|--------------|
-| **`lpart-node-installer`** | all | The **orchestrator**. `--phase pre\|part\|post` runs the whole pipeline in-process and drives the live TUI dashboard (or plain output with `--no-tui`). It invokes everything below. |
+| **`lpart-node-installer`** | all | The **orchestrator**. `--phase pre\|part\|post` runs the whole pipeline in-process and drives the live TUI dashboard (or plain output with `--no-tui`). It invokes everything below. `--phase finish` only flushes the installed system to disk, as `luna_finish`'s last step. |
 | **`lpart-phase`** | all | The **shim** the pre/part/post fields exec → `exec lpart-node-installer --phase <phase>`. Keeps the node's script fields one line. |
 | **`lpart-storage-prepare`** | part | The **storage decision + execution**: discover disks (tags/size), resolve the layout, then partition / build RAID / create LVM / mkfs and **mount the tree at the sysroot** — dispatching on `install_mode` and enforcing the data fence. `sanitize` securely erases here and stops; `memboot` makes a tmpfs root. Ends by showing `blkid`/`pvs`/`vgs`/`lvs`/`mdadm` evidence. |
 | **`lpart-storage-check`** | part | The **health probe** for an *existing* layout, used by `auto`/`sync`: OS set present and healthy → reuse-and-mount, broken → recreate. It is the whole job for `local` (verify only, no image). |

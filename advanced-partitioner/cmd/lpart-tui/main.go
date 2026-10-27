@@ -1,5 +1,5 @@
 // Command lpart-tui is the standalone install dashboard (ADR 0009). It is the
-// renderer half of the decoupled TUI: luna2-start.sh launches it once, around
+// renderer half of the decoupled TUI: luna-installer.sh launches it once, around
 // the whole install.sh run, and it draws one live screen by reading the event
 // bus that every step — the lpart-* workers and the bash steps (bmcsetup, the
 // pre/part/post admin columns, the legacy tail) — emits to.
@@ -19,12 +19,14 @@ import (
 	"fmt"
 	"os"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/engine"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/eventbus"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/installerui"
 )
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, "lpart-tui")
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "lpart-tui:", err)
 		os.Exit(1)

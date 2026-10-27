@@ -59,7 +59,7 @@ Per-distro/arch trees under `{redhat,opensuse,ubuntu}/{x86,arm}/src/usr/lib/drac
 
 | `cmd/` binary | Responsibility |
 |---|---|
-| `lpart-node-installer` | the orchestrator (`--phase pre/part/post`), drives the pipeline + the live TUI |
+| `lpart-node-installer` | the orchestrator (`--phase pre/part/post`), drives the pipeline + the live TUI; `--phase finish` flushes the installed system to disk at the end of the install |
 | `lpart-storage-prepare` | discover/resolve disks, partition/RAID/LVM/mkfs, mount the sysroot, the data fence |
 | `lpart-storage-check` | health probe for an existing layout (`auto`/`sync`/`local`) |
 | `lpart-osimage-install` | download + extract the OS image, the preserve filter |

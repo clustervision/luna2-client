@@ -28,8 +28,8 @@ import (
 // eopts.Sysroot in a single `curl | tar` pipe. dopts supplies the URL,
 // auth token, TLS policy, NIC pinning and watchdog; eopts supplies the
 // sysroot, excludes and ACL mode (TarballPath is ignored). The pipe runs
-// under `set -o pipefail`, so a curl failure fails the whole step even
-// when tar exits 0 on the truncated stream.
+// under `set -o pipefail` where the shell has it; busybox ash (Ubuntu) does
+// not and goes on with tar's status, which a truncated stream still fails.
 //
 // curl's --retry is deliberately OMITTED here (unlike downloadHTTP): a
 // mid-stream retry would restart the byte stream into a tar that already
@@ -74,17 +74,18 @@ func StreamHTTPExtract(ctx context.Context, dopts DownloadOptions, eopts Extract
 		tarArgs = append(tarArgs, "--no-acls")
 	}
 	tarArgs = append(tarArgs, "--numeric-owner")
+	tarArgs = append(tarArgs, CapabilityXattrArgs...)
 	tarArgs = append(tarArgs, eopts.TarExcludes...)
 	tarArgs = append(tarArgs, "-xf", "-", "-C", eopts.Sysroot)
 
 	pipe := "set -o pipefail; curl " + shJoin(curlArgs) + " | tar " + shJoin(tarArgs)
 
 	dopts.info("streaming osimage extract (curl | tar): " + imageURL + " -> " + eopts.Sysroot)
-	if _, err := dopts.Runner.Run(ctx, executor.CommandSpec{
+	if res, err := dopts.Runner.Run(ctx, executor.CommandSpec{
 		Path: "sh", Args: []string{"-c", pipe},
 		CaptureStdout: true, CaptureStderr: true,
 	}); err != nil {
-		return fmt.Errorf("streamed curl|tar extract: %w", err)
+		return fmt.Errorf("streamed curl|tar extract: %w", withStderr(err, res.Stderr))
 	}
 
 	osRelease := filepath.Join(eopts.Sysroot, "etc", "os-release")

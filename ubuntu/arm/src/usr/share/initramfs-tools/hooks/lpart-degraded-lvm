@@ -1,0 +1,55 @@
+#!/bin/sh
+
+# This file is part of Luna, cluster provisioning tool
+
+# Luna is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+
+# Luna is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+
+# You should have received a copy of the GNU General Public License
+# along with Luna.  If not, see <http://www.gnu.org/licenses/>.
+
+# Boot an LVM root on a degraded mirror without a race.
+#
+# Ubuntu's mdadm local-block script starts degraded arrays only at the end of
+# the root wait (its "COUNT = MAX" catch-up once wait-for-root has timed out),
+# and the wait then checks for the root LV once more -- before udev's LVM rule
+# has activated the volume group on the arrays just started. Whether a node
+# with a dead mirror disk boots or drops to "ALERT! /dev/mapper/os-root does
+# not exist" was a race (Ubuntu 24.04 lab node, first disk removed: two of four
+# boots failed). This hook adds an LVM activation and a udev settle right after
+# the degraded start, in the initramfs copy of that script only.
+
+PREREQ="mdadm lvm2"
+prereqs()
+{
+   echo "$PREREQ"
+}
+
+case $1 in
+prereqs)
+   prereqs
+   exit 0
+   ;;
+esac
+
+f="${DESTDIR}/scripts/local-block/mdadm"
+[ -f "$f" ] || exit 0
+grep -q 'lpart-degraded-lvm' "$f" && exit 0
+awk '{ print }
+     /mdadm -q --assemble --scan --run/ {
+         print "    # lpart-degraded-lvm: activate LVM on the arrays just started degraded"
+         print "    lvm vgchange -aay --sysinit >/dev/null 2>&1 || true"
+         print "    wait_for_udev 10"
+     }' "$f" > "$f.lpart" && cat "$f.lpart" > "$f"
+rm -f "$f.lpart"
+# Ubuntu changed the script this hook patches: say so, the race is back.
+grep -q 'lpart-degraded-lvm' "$f" ||
+    echo "W: lpart-degraded-lvm: scripts/local-block/mdadm has no 'mdadm -q --assemble --scan --run' line to patch; an LVM root on a degraded mirror may not boot" >&2
+exit 0

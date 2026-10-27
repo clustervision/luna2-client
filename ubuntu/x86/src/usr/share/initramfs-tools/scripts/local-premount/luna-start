@@ -111,14 +111,27 @@ luna_start() {
     local luna_bootproto
     local luna_mac
     echo "$(getargs luna.hostname=)" > /proc/sys/kernel/hostname
-    echo "Luna2: Starting ssh"
-    echo "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin" >> /etc/passwd
-    echo sshd:x:74: >> /etc/group
-    mkdir -p /var/empty/sshd
-    /usr/sbin/sshd > /dev/null 2>&1
+    # The dhcpcd hook replaces /etc/passwd with its own line only; without root
+    # every ssh key is refused for a user that does not exist.
+    grep -q '^root:' /etc/passwd 2>/dev/null || echo 'root:x:0:0:root:/:/bin/sh' >> /etc/passwd
+    # dropbear first, as in the dracut hook: one self-contained binary that makes
+    # its own host keys and needs no privilege-separation dir. sshd only without it.
+    if [ -x /usr/sbin/dropbear ]; then
+        echo "Luna2: Starting ssh (dropbear)"
+        mkdir -p /etc/dropbear
+        /usr/sbin/dropbear -R -p 22 -P /run/luna-ssh.pid || echo "Luna2: dropbear did not start: no ssh into this ramdisk"
+    else
+        echo "Luna2: Starting ssh"
+        echo "sshd:x:74:74:Privilege-separated SSH:/var/empty/sshd:/sbin/nologin" >> /etc/passwd
+        echo sshd:x:74: >> /etc/group
+        # Debian's sshd refuses to start without /run/sshd (its privilege-separation dir).
+        mkdir -p /var/empty/sshd /run/sshd
+        /usr/sbin/sshd -o PidFile=/run/luna-ssh.pid > /dev/null 2>&1 || echo "Luna2: sshd did not start: no ssh into this ramdisk"
+    fi
     echo "Luna2: Start shell on tty2"
     luna_ctty2=/dev/tty2
     setsid -c /bin/sh -i -l 0<>$luna_ctty2 1<>$luna_ctty2 2<>$luna_ctty2 &
+    echo $! > /run/luna-tty2.pid
     udevadm settle
     # settle is not really reliable
     sleep 5
@@ -153,16 +166,30 @@ luna_start() {
 }
 
 luna_finish() {
+    # -P 514: without a port logger resolves the service name "syslog", which
+    # needs /etc/services -- absent from the initramfs, so every forward
+    # failed ("Servname not supported") and the controller never saw this log
     luna_loghost=$(getargs luna.loghost=)
     if [ "$luna_loghost" ]; then
-        cat /tmp/luna_install.log | logger -d -n $luna_loghost
+        logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
     else
         echo "Luna2: loghost not defined, cannot forward logs."
     fi
-    # shutdown sshd
-#   ps -h not available in busybox
-#    /usr/bin/ps h --ppid `cat /var/run/sshd.pid` -o 'pid' | while read pid; do kill $pid; done
-#    kill `cat /var/run/sshd.pid`
+    # shutdown sshd: initramfs-tools hands its processes on to the installed system,
+    # where this one would hold port 22 and refuse every key. Each login is a child
+    # of the listener: end those first, while they are still its children.
+    if [ -f /run/luna-ssh.pid ]; then
+        local _ssh_pid _stat _st _ppid _pid
+        _ssh_pid=$(cat /run/luna-ssh.pid)
+        # POSIX only: initramfs-tools drops a script that dash cannot parse
+        for _stat in /proc/[0-9]*/stat; do
+            read -r _st 2>/dev/null < "$_stat" || continue
+            _ppid=${_st##*) }; _ppid=${_ppid#* }; _ppid=${_ppid%% *}
+            _pid=${_stat#/proc/}; _pid=${_pid%/stat}
+            [ "$_ppid" = "$_ssh_pid" ] && kill "$_pid" 2>/dev/null
+        done
+        kill "$_ssh_pid" 2>/dev/null
+    fi
     # shutdown dhclient
     /usr/sbin/dhclient -lf /lunatmp/dhclient.leases -x
     # bring interfaces down
@@ -178,31 +205,195 @@ luna_finish() {
                 ip link set dev $iface down
             done
     fi
-    mv /tmp/luna_install.log /sysroot/var/log/
-    # kill shell on tty2
-    ps h t tty2 o pid | while read pid; do kill -9 $pid; done
+    # The lpart per-tool logs are the detailed record of the install, and /tmp
+    # does not survive run-init: keep them, as the dracut hook does.
+    if [ -d /tmp/install_files/logs ]; then
+        mkdir -p "${rootmnt:-/root}/var/log/luna"
+        cp -a /tmp/install_files/logs/. "${rootmnt:-/root}/var/log/luna/" 2>/dev/null \
+            || echo "Luna2: could not preserve the lpart logs"
+    fi
+    # kill shell on tty2, by its pid: busybox ps has no 'h t o' selectors
+    [ -f /run/luna-tty2.pid ] && kill -9 "$(cat /run/luna-tty2.pid)" 2>/dev/null
 
+    # Copied last, not moved: tee still writes the log, and a move to another
+    # filesystem leaves it writing into a deleted file. initramfs-tools mounts
+    # the new root at $rootmnt (/root), not /sysroot.
+    cp /tmp/luna_install.log "${rootmnt:-/root}/var/log/"
+
+    # init hands over to the installed disk next and nothing flushes it after
+    # this: a power cut in the next seconds loses the last writes.
+    lpart-phase finish || echo "Luna2: could not flush the installed system to disk"
+
+    # The installer reached its end, the root is complete (as the dracut hook).
+    : > /run/luna-install-finished
 }
 
+# Without luna.ctty: the last console= on the command line (the kernel's
+# /dev/console), else tty1 -- a park shell on tty1 is invisible on a
+# serial-console node. Same rule as 95luna's luna-installer.sh.
+# POSIX sh only (no arrays): initramfs-tools runs `sh -n` (dash) over every
+# boot script while building the initramfs and silently leaves out any
+# script that fails it -- the node then boots to "No init found".
 _get_luna_ctty() {
-    local luna_ctty
+    local luna_ctty _o _c=""
     luna_ctty=$(getargs luna.ctty=)
-    # TODO [ "x${luna_ctty}" = "x" ] && luna_ctty=$(getargs console=)
-    [ "x${luna_ctty}" = "x" ] && luna_ctty="/dev/tty1"
-    echo -n $luna_ctty
+    if [ -z "${luna_ctty}" ]; then
+        for _o in $(cat /proc/cmdline 2>/dev/null); do
+            case "$_o" in console=*) _c="${_o#console=}"; _c="${_c%%,*}" ;; esac
+        done
+        [ "$_c" = "tty0" ] && _c=tty1
+        [ -n "$_c" ] && [ -c "/dev/${_c#/dev/}" ] && luna_ctty="/dev/${_c#/dev/}"
+    fi
+    [ -n "${luna_ctty}" ] || luna_ctty="/dev/tty1"
+    printf '%s' "$luna_ctty"
 }
 
+# lpart writes the failing stage + reason here; the tmpfs survives retries,
+# so it is cleared before every attempt (as is the sanitize marker).
+LUNA_FAILURE_FILE=/tmp/install_files/logs/last-failure.txt
+LUNA_SANITIZE_MARKER=/tmp/install_files/runtime/sanitize.done
+LUNA_FATAL_RC=3   # keep in sync with lpart-node-installer exitFatalConfig
+LUNA_SAFETY_RC=2  # keep in sync with internal/cli ExitSafetyRefusal
+
+# luna_report <file>: print a final report on the console (and into the install
+# log through tee) and send the install log plus the report to the loghost.
+# The report is sent ON ITS OWN as well: the install log reaches the loghost only
+# through the file tee writes, and on a slow console (serial, 115200 baud) tee
+# lags behind by up to two pipe buffers, so the lines printed just before the
+# forward -- the reason a node parks or what sanitize erased -- were missing.
+luna_report() {
+    cat "$1"
+    if [ "$luna_loghost" ]; then
+        logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log   # as far as tee got
+        logger -d -n "$luna_loghost" -P 514 < "$1"
+    fi
+}
+
+# The install script reported where it stopped with a token issued when it
+# started, which a long erase outlives: report that state again with a fresh one.
+luna_post_state() {
+    local _token
+    _token=$(fetch_token 2>/dev/null)
+    [ -n "$_token" ] && [ "$_token" != "None" ] || return 0
+    luna_curl -s -m 10 -X POST -H "x-access-tokens: $_token" -H "Content-Type: application/json" \
+        -d '{"monitor": {"status": {"'"$luna_node"'": {"state": "'"$1"'"}}}}' \
+        "${luna_url}/monitor/node/${luna_node}" > /dev/null 2>&1
+}
+
+# The state the install template reported for lpart's park exit (lpart_phase).
+lpart_park_state() {
+    if [ "$1" = "$LUNA_SAFETY_RC" ]; then
+        [ -f /tmp/install_files/runtime/degraded.done ] && echo install.degraded || echo install.refused
+    else
+        echo install.fatal
+    fi
+}
+
+# install_mode=sanitize finished: report what lpart-storage-prepare reported
+# (the marker content) and park -- a retry would only erase again.
+luna_sanitize_stop() {
+    local _line _r=/lunatmp/luna-report.txt
+    {
+        echo "Luna2: SANITIZE FINISHED -- lpart-storage-prepare reported:"
+        if [ -s "$LUNA_SANITIZE_MARKER" ]; then
+            while IFS= read -r _line || [ -n "$_line" ]; do echo "Luna2:   ${_line}"; done < "$LUNA_SANITIZE_MARKER"
+        else
+            echo "Luna2:   (no report was written -- check the install log)"
+        fi
+        echo "Luna2: install_mode=sanitize stops the node here (install.sh rc=$1):"
+        echo "Luna2: set another install_mode, then reboot the node."
+        echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
+    } > "$_r"
+    luna_report "$_r"
+    luna_post_state install.sanitized
+    sync
+    while true; do
+        if { exec 9<>"$luna_ctty"; } 2>/dev/null; then
+            exec 9<&-
+            setsid -c /bin/sh -i -l 0<>"$luna_ctty" 1<>"$luna_ctty" 2<>"$luna_ctty"
+        else
+            sleep 3600
+        fi
+    done
+}
+
+# install.sh exit 2 (safety refusal) or 3 (config error or crash) recurs
+# on every attempt: show the reason, park in a shell, never retry.
+fatal_park() {
+    local _kind _r=/lunatmp/luna-report.txt
+    {
+        echo "Luna2: ============================================================"
+        echo "Luna2: INSTALL FAILED (exit $1) -- NOT retrying."
+        if [ -s "$LUNA_FAILURE_FILE" ]; then
+            print_failure_reason
+            case "$1" in
+                "$LUNA_SAFETY_RC") _kind="a safety refusal" ;;
+                *) _kind="a configuration error or a crash" ;;
+            esac
+            echo "Luna2: lpart reported the reason above: ${_kind}, which would recur on"
+            echo "Luna2: every attempt."
+        else
+            echo "Luna2: Reason:"
+            echo "Luna2:   install script failed (exit $1)"
+            echo "Luna2: lpart left no verdict, so this is not a safety refusal: see the log."
+        fi
+        echo "Luna2: Exit 2 and 3 are non-retryable, so the node is parked instead of"
+        echo "Luna2: reinstalling in a loop."
+        echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
+        echo "Luna2: ============================================================"
+    } > "$_r"
+    luna_report "$_r"
+    if [ -s "$LUNA_FAILURE_FILE" ]; then
+        luna_post_state "$(lpart_park_state "$1")"
+    else
+        luna_post_state install.fatal
+    fi
+    while true; do
+        if { exec 9<>"$luna_ctty"; } 2>/dev/null; then
+            exec 9<&-
+            setsid -c /bin/sh -i -l 0<>"$luna_ctty" 1<>"$luna_ctty" 2<>"$luna_ctty"
+        else
+            sleep 3600
+        fi
+    done
+}
+
+# curl --interface with an empty $luna_nic swallowed the next option: bind
+# to the NIC only when one matched luna.mac. POSIX sh (see _get_luna_ctty).
+luna_curl() {
+    if [ -n "$luna_nic" ]; then
+        curl ${INSECURE:+"$INSECURE"} --interface "$luna_nic" "$@"
+    else
+        curl ${INSECURE:+"$INSECURE"} "$@"
+    fi
+}
+
+luna_trim() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "$v"
+}
+
+# Parses luna.ini as the dracut hook's get_credentials does: [API] section,
+# '#' and ';' comments, a line split on its first '=' only. POSIX sh.
 get_credentials() {
+    local _raw _key _value _section=""
     LUNA_INI='/trinity/local/luna/node/config/luna.ini'
     if [ -f $LUNA_INI ]; then
-        API_USERNAME=$(grep USERNAME $LUNA_INI | awk -F '= ' '{ print $2 }')
-        if [ "x$API_USERNAME" = "x" ]; then
-            API_USERNAME=$(grep USERNAME $LUNA_INI | awk -F '=' '{ print $2 }')
-        fi
-        API_PASSWORD=$(grep PASSWORD $LUNA_INI | awk -F '= ' '{ print $2 }')
-        if [ "x$API_PASSWORD" = "x" ]; then
-            API_PASSWORD=$(grep PASSWORD $LUNA_INI | awk -F '=' '{ print $2 }')
-        fi
+        while IFS= read -r _raw; do
+            _key=$(luna_trim "${_raw%%=*}")
+            case "$_key" in
+                ''|'#'*|';'*) continue ;;
+                '['*) _section=$(printf '%s' "$_key" | grep -oE "[A-Z]+"); continue ;;
+            esac
+            _value=""
+            [ "$_raw" != "${_raw%%=*}" ] && _value=$(luna_trim "${_raw#*=}")
+            case "${_section}_${_key}" in
+                API_USERNAME) API_USERNAME=$_value ;;
+                API_PASSWORD) API_PASSWORD=$_value ;;
+            esac
+        done < $LUNA_INI
     else
         echo ":"
     fi
@@ -211,14 +402,16 @@ get_credentials() {
 
 fetch_token() {
     CRED=$(get_credentials)
-    USERNAME=$(echo $CRED | awk -F':' '{ print $1 }')
-    PASSWORD=$(echo $CRED | awk -F':' '{ print $2 }')
+    # the password may hold ':', '"' or '\': split on the first ':' only, and let jq quote
+    USERNAME=${CRED%%:*}
+    PASSWORD=${CRED#*:}
     export TPM2TOOLS_TCTI="device:/dev/tpm0"
     TPM=$(tpm2_pcrread sha256:0 2> /dev/null | grep '0x' | awk -F' : ' '{ print $2 }')
 #    if [ "$TPM" == "" ]; then
 #        TPM=$(ip a | grep -oE '[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+:[0-9a-z]+'|grep -v '00:00:00'|tr '\n' ':')
 #    fi
-    json='{"tpm_sha256":"'$TPM'","username":"'$USERNAME'","password":"'$PASSWORD'"}'
+    json=$(jq -cn --arg tpm "$TPM" --arg user "$USERNAME" --arg pass "$PASSWORD" \
+        '{tpm_sha256: $tpm, username: $user, password: $pass}')
     luna_url=$(getargs luna.url=)
     luna_node=$(getargs luna.node=)
     luna_verifycert=$(getargs luna.verifycert= | tr 'A-Z' 'a-z')
@@ -226,8 +419,8 @@ fetch_token() {
         INSECURE='--insecure'
     fi
     luna_mac=$(getargs luna.mac=)
-    luna_nic=$(find_nic ${luna_mac})
-    curl $INSECURE --interface $luna_nic -X POST -H "Content-Type: application/json" -d "$json" -s "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
+    luna_nic=$(find_nic "${luna_mac}")
+    luna_curl -X POST -H "Content-Type: application/json" -d "$json" -s -m 60 --connect-timeout 10 "${luna_url}/tpm/${luna_node}" > /lunatmp/token.json
     valid=$(grep token /lunatmp/token.json)
     if [ "$valid" ]; then
         token=$(cat /lunatmp/token.json | awk '{ print $2 }' | grep -oE '"(\S+)"')
@@ -242,42 +435,17 @@ fetch_token() {
 }
 
 # lpart leaves the reason for a refused or failed install here. The dracut hook
-# (95luna/luna-installer.sh) prints the same file in the same words; keep them in step.
-LUNA_FAILURE_FILE=/tmp/install_files/logs/last-failure.txt
-LUNA_FATAL_RC=3   # keep in sync with lpart-node-installer exitFatalConfig
-LUNA_SAFETY_RC=2  # keep in sync with internal/cli ExitSafetyRefusal
-
+# (95luna/luna-installer.sh) prints the same file, but wrapped and capped differently.
 print_failure_reason() {
     [ -s "$LUNA_FAILURE_FILE" ] || return 0
     echo "Luna2: Reason:"
-    head -n 15 "$LUNA_FAILURE_FILE" | sed 's/^/Luna2:   /'
-}
-
-# A safety refusal or a configuration error recurs on every attempt, so the node is
-# parked in a shell on the console instead of reinstalling in a loop. Never returns.
-fatal_park() {
-    local rc="$1"
-    echo ""
-    echo "Luna2: ============================================================"
-    echo "Luna2: INSTALL FAILED FATALLY (exit ${rc}) -- NOT retrying."
-    print_failure_reason
-    if [ "$rc" = "$LUNA_SAFETY_RC" ]; then
-        echo "Luna2: Exit ${rc} is a safety refusal: lpart declined to touch the disk;"
-        echo "Luna2: the reason is above. Fix the layout or the node's data, then boot."
-    else
-        echo "Luna2: Exit ${rc} is a non-retryable configuration or safety error from an"
-        echo "Luna2: install step; the reason is above. It would recur on every attempt,"
-        echo "Luna2: so the node is parked instead of reinstalling in a loop."
-    fi
-    echo "Luna2: Logs: /tmp/luna_install.log"
-    echo "Luna2: 'poweroff' stops the node; exiting the shell re-opens it (no retry)."
-    echo "Luna2: ============================================================"
-    while true; do
-        setsid -c /bin/sh -i -l 0<>$luna_ctty 1<>$luna_ctty 2<>$luna_ctty
-    done
+    awk 'NR <= 15 { print "Luna2:   " $0 }' "$LUNA_FAILURE_FILE"
 }
 
 if [ "x$ROOT" = "xluna" ]; then
+    # An install starts in this boot: from now on the local-bottom guard lets
+    # init boot /root only after luna_finish (scripts/local-bottom/luna-guard).
+    : > /run/luna-install-started
     luna_init
     luna_start
     luna_ctty=$(_get_luna_ctty)
@@ -300,27 +468,41 @@ if [ "x$ROOT" = "xluna" ]; then
             echo "Luna2: Trying to get install script."
             while [ 0 ]; do
                 token=$(fetch_token)
-                curl $INSECURE --interface $luna_nic -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
+                luna_curl -f -s -m 60 --connect-timeout 10 -H "x-access-tokens: $token" "${luna_url}/boot/install/${luna_node}" -o /lunatmp/install.sh -w "%{http_code}" > /lunatmp/http_code.out
+                curl_rc=$?
                 http_code=$(cat /lunatmp/http_code.out)
-                if [ "$http_code" = "200" ]; then
+                # a body cut short still reports 200; only curl's exit status tells
+                if [ "$curl_rc" = "0" ] && [ "$http_code" = "200" ]; then
                     break
                 else
-                    echo "Luna2: Could not get install script [$http_code]. Sleeping 10 sec."
+                    echo "Luna2: Could not get install script [$http_code, curl exit $curl_rc]. Sleeping 10 sec."
                     sleep 10
                 fi
             done
+            rm -f "$LUNA_FAILURE_FILE" "$LUNA_SANITIZE_MARKER"
             /bin/bash /lunatmp/install.sh
             rc=$?
             [ "$rc" = "0" ] && RES="success"
             echo "Luna2: install.sh exit status: $RES (rc=$rc)"
-            if [ "$RES" != "success" ] && [ "$luna_loghost" ]; then
-                cat /tmp/luna_install.log | logger -d -n $luna_loghost
+            if [ -f "$LUNA_SANITIZE_MARKER" ]; then
+                luna_sanitize_stop "$rc"   # never returns
+            fi
+            if [ "$RES" != "success" ] && { [ "$rc" = "$LUNA_SAFETY_RC" ] || [ "$rc" = "$LUNA_FATAL_RC" ]; }; then
+                fatal_park "$rc"           # never returns
+            fi
+            if [ "$RES" != "success" ]; then
+                # with or without a loghost: keep the first and the last failed
+                # attempt, and start the next on an empty log (tmpfs is RAM)
+                if [ "$luna_loghost" ]; then
+                    logger -d -n "$luna_loghost" -P 514 < /tmp/luna_install.log
+                fi
+                cat /tmp/luna_install.log > /tmp/luna_install.log.prev
+                if [ ! -f /tmp/luna_install.log.first ]; then
+                    cat /tmp/luna_install.log > /tmp/luna_install.log.first
+                fi
                 echo -n '' > /tmp/luna_install.log
             fi
             if [ "$RES" != "success" ]; then
-                if [ "$rc" = "$LUNA_FATAL_RC" ] || [ "$rc" = "$LUNA_SAFETY_RC" ]; then
-                    fatal_park "$rc"   # never returns
-                fi
                 print_failure_reason
                 echo "Luna2: Exit ${rc}: a retryable failure; the reason is above. Retrying in 10s."
             fi

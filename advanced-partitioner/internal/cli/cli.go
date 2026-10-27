@@ -18,6 +18,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"runtime/debug"
 
 	txlog "gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/log"
 )
@@ -174,4 +175,31 @@ func ExitSafetyRefusal(stderr io.Writer, tool, reason, format string, args ...an
 	msg := fmt.Sprintf(format, args...)
 	_, _ = fmt.Fprintf(stderr, "%s: safety_refusal=%s %s\n", tool, reason, msg)
 	return 2
+}
+
+// ExitFatalConfigCode is the exit code of a non-retryable configuration
+// error: the same input fails identically on every attempt (an invalid
+// disklayout, an unparsable filter). lpart-node-installer maps it, like 2, to
+// its own exit 3 so the install wrapper parks instead of retrying every 30 s.
+const ExitFatalConfigCode = 3
+
+// ExitFatalConfig logs a non-retryable configuration error with the
+// fatal_config=<reason> marker and returns ExitFatalConfigCode.
+func ExitFatalConfig(stderr io.Writer, tool, reason, format string, args ...any) int {
+	msg := fmt.Sprintf(format, args...)
+	_, _ = fmt.Fprintf(stderr, "%s: fatal_config=%s %s\n", tool, reason, msg)
+	return ExitFatalConfigCode
+}
+
+// osExit is replaced in tests.
+var osExit = os.Exit
+
+// ExitOnPanic, deferred first in a tool's main, turns a panic into exit 3.
+// An unrecovered panic exits 2, the safety-refusal code, so a crash parked the
+// node as a refusal. The stack goes first: the verdict line must be the last.
+func ExitOnPanic(stderr io.Writer, tool string) {
+	if r := recover(); r != nil {
+		_, _ = stderr.Write(debug.Stack())
+		osExit(ExitFatalConfig(stderr, tool, "internal-error", "internal error: %v", r))
+	}
 }

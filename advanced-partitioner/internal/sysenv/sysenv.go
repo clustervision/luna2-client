@@ -19,6 +19,7 @@
 package sysenv
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -74,7 +75,7 @@ func RequireInstallerEnv(opts Options) error {
 }
 
 // KernelParam returns the value of a `key=value` token on the kernel cmdline
-// — the Go equivalent of luna2-start.sh's `getargs key=`. The path defaults to
+// — the Go equivalent of luna-installer.sh's `getargs key=`. The path defaults to
 // CmdlinePath; tests inject Options.CmdlinePath. ok is false when the file is
 // unreadable or the key is absent. The first occurrence wins, matching kernel
 // last-wins-at-parse but getargs first-match behaviour used by the bash client.
@@ -96,8 +97,37 @@ func KernelParam(opts Options, key string) (value string, ok bool) {
 	return "", false
 }
 
+// ErrHostMismatch is matched (errors.Is) when the node is not the expected
+// host: a deterministic refusal, unlike a failure to read the hostname.
+var ErrHostMismatch = errors.New("host mismatch")
+
+// shortHost is the `hostname -s` form: up to the first dot, lower-cased
+// (host names are case-insensitive).
+func shortHost(h string) string {
+	h = strings.TrimSpace(h)
+	if dot := strings.IndexByte(h, '.'); dot >= 0 {
+		h = h[:dot]
+	}
+	return strings.ToLower(h)
+}
+
+// compareHosts returns the two names in the form they were compared in: in
+// full when both carry a domain, as short names otherwise.
+func compareHosts(current, expected string) (string, string, bool) {
+	a := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(current)), ".")
+	b := strings.TrimSuffix(strings.ToLower(strings.TrimSpace(expected)), ".")
+	if !strings.Contains(a, ".") || !strings.Contains(b, ".") {
+		a, b = shortHost(a), shortHost(b)
+	}
+	return a, b, a == b
+}
+
 // RequireExpectedHost ensures the local hostname matches expected when
-// non-empty. Mirrors require_expected_host.
+// non-empty. Mirrors require_expected_host. When both names carry a domain
+// they are compared in full (node001.a is not node001.b); otherwise as short
+// names: the pipeline passes $_HOSTNAME, which Luna may set to the FQDN
+// ("node001.cluster"), and stripping the domain only from the local name
+// refused every such node as a "mismatch".
 func RequireExpectedHost(expected string, opts Options) error {
 	if expected == "" {
 		return nil
@@ -110,16 +140,10 @@ func RequireExpectedHost(expected string, opts Options) error {
 	if err != nil {
 		return fmt.Errorf("hostname: %w", err)
 	}
-	// os.Hostname returns the FQDN on some kernels; the bash version
-	// uses `hostname -s`. Strip everything after the first dot to
-	// match the short-name semantics.
-	if dot := strings.IndexByte(current, '.'); dot >= 0 {
-		current = current[:dot]
-	}
-	if current != expected {
+	if a, b, same := compareHosts(current, expected); !same {
 		return fmt.Errorf(
-			"refusing destructive execution on host %s; expected %s",
-			current, expected)
+			"%w: refusing destructive execution on host %s; expected %s",
+			ErrHostMismatch, a, b)
 	}
 	return nil
 }
@@ -188,6 +212,13 @@ var StoragePrepareCommands = []string{
 	"mkfs.xfs",
 	"mkfs.ext4",
 	"mkswap",
+	// The health probe's filesystem checkers (internal/fscheck). sync and
+	// auto decide mount-vs-recreate on their verdict, so a ramdisk without
+	// them must fail closed here, before anything happens -- not have every
+	// volume probed as "broken" and the os set recreated. fsck.vfat /
+	// fsck.fat is a fallback pair, handled separately.
+	"e2fsck",
+	"xfs_repair",
 }
 
 // StorageCheckCommands lists the binaries lib/commands.sh::
@@ -218,13 +249,31 @@ var BootloaderCommonCommands = []string{
 	"readlink",
 }
 
+// StoragePrepareTools are the fallback-pair names the storage-prepare
+// preflight picked.
+type StoragePrepareTools struct {
+	// MkfsFat is mkfs.fat or mkfs.vfat (fs.Builder.Options.MkfsFatName).
+	MkfsFat string
+	// FsckVfat is fsck.vfat or fsck.fat (fscheck.Options.FsckVfatCmd).
+	FsckVfat string
+}
+
 // RequireStoragePrepareCommands runs the preflight for lpart-storage-prepare
-// and returns the chosen FAT tool. The bash helper is non-trivial because
-// it accepts mkfs.fat OR mkfs.vfat — we return the chosen name so the
-// caller plumbs it into fs.Builder.Options.MkfsFatName.
-func RequireStoragePrepareCommands() (fatTool string, err error) {
+// and returns the chosen FAT tools. The bash helper is non-trivial because
+// it accepts mkfs.fat OR mkfs.vfat (and the health probe fsck.vfat OR
+// fsck.fat, like lpart-storage-check) — we return the chosen names so the
+// caller plumbs them into the fs builder and the fs checker.
+func RequireStoragePrepareCommands() (StoragePrepareTools, error) {
 	if err := RequireCommands(StoragePrepareCommands...); err != nil {
-		return "", err
+		return StoragePrepareTools{}, err
 	}
-	return RequireCommandsWithFallback("mkfs.fat", "mkfs.vfat")
+	mkfs, err := RequireCommandsWithFallback("mkfs.fat", "mkfs.vfat")
+	if err != nil {
+		return StoragePrepareTools{}, err
+	}
+	fsck, err := RequireCommandsWithFallback("fsck.vfat", "fsck.fat")
+	if err != nil {
+		return StoragePrepareTools{}, err
+	}
+	return StoragePrepareTools{MkfsFat: mkfs, FsckVfat: fsck}, nil
 }

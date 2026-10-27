@@ -32,11 +32,13 @@ import (
 	"strings"
 	"time"
 
+	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/cli"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/engine"
 	"gitlab.taurusgroup.one/clustervision/luna2-client/advanced-partitioner/internal/eventbus"
 )
 
 func main() {
+	defer cli.ExitOnPanic(os.Stderr, "lpart-emit")
 	bus := flag.String("bus", eventbus.DefaultPath, "event bus path to write to")
 	pipe := flag.Bool("pipe", false, "read stdin lines and emit each as a bus event (teed to stdout)")
 	stage := flag.String("stage", "", "stage tag for --pipe events")
