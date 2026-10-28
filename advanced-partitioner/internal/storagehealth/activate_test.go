@@ -173,3 +173,42 @@ func TestAssembleLostSuperblockIsDegraded(t *testing.T) {
 		})
 	}
 }
+
+// dirtyRaid5WithSpare is a raid5 of four plus a hot spare after an unclean
+// shutdown, with one active member's disk gone: three actives and the spare
+// are found, so the members match Raid Devices and only mdadm's refusal says
+// the array is short.
+func dirtyRaid5WithSpare(stderr string) *executor.FakeRunner {
+	f := executor.NewFakeRunner(executor.FakeResponse{})
+	for _, d := range []string{"vda", "vdb", "vdc", "vdd"} {
+		f.AddMatch(executor.FakeMatch{Path: "lsblk", ArgsPrefix: []string{"-ln", "-o", "KNAME,TYPE", "/dev/" + d},
+			Response: executor.FakeResponse{Stdout: []byte(d + " disk\n" + d + "2 part\n")}})
+		f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--examine", "/dev/" + d + "2"},
+			Response: executor.FakeResponse{Stdout: []byte("           Name : any:os-root  (local to host any)\n   Raid Devices : 4\n")}})
+	}
+	f.AddMatch(executor.FakeMatch{Path: "mdadm", ArgsPrefix: []string{"--assemble"},
+		Response: executor.FakeResponse{ExitCode: 1, Err: fmt.Errorf("exit status 1"), Stderr: []byte(stderr)}})
+	return f
+}
+
+// A present spare must not make a dirty, member-short raid5 look complete:
+// mdadm refuses it with "not clean", never "need all", and the set is
+// degraded, not broken.
+func TestAssembleDirtyRaid5WithSpareIsDegraded(t *testing.T) {
+	for _, c := range []struct {
+		name   string
+		start  bool
+		stderr string
+	}{
+		{"without --run", false, "mdadm: /dev/md/os-root assembled from 3 drives and 1 spare - not enough to start the array while not clean - consider --force.\n"},
+		{"with --run", true, "mdadm: Not enough devices to start the array while not clean - consider --force.\n"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, degraded := assembleExplicit(context.Background(), dirtyRaid5WithSpare(c.stderr), "os-root",
+				[]string{"/dev/vda", "/dev/vdb", "/dev/vdc", "/dev/vdd"}, func(string, ...string) {}, nil, c.start)
+			if !degraded {
+				t.Fatal("a dirty raid5 one active member short, spare present, was not reported degraded")
+			}
+		})
+	}
+}
