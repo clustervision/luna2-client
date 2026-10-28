@@ -26,7 +26,7 @@ the on-disk OS and fetches nothing; `sanitize` securely erases all local disks f
 - Memboot's RAM-root population moves into the `lpart-storage-prepare` decision engine (mode-driven), using
   the existing `fs.MemoryFilesystems`/tmpfs mechanics, since `provider=memory` left the grammar ([[0003]]).
 - Mode-aware refusals are restated against the new enum: `lpart-osimage-install` only extracts under
-  `sync`/`full`; `local` routes to `lpart-storage-check`; `memboot`/`sanitize` install no bootloader.
+  `sync`/`full`; `local` routes to `lpart-storage-check`; `memboot`/`sanitize` install no bootloader, nor, since [[0015]], does `local`.
 
 ## Consequences
 - One field instead of two; the nonsense combinations are unrepresentable.

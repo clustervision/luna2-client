@@ -81,8 +81,7 @@ func (a *rhelAdapter) RegenerateInitramfs(ctx context.Context) error {
 // builds the node's boot kernel from the osimage: in every mode that extracts the
 // image, the running version IS that image's kernel, which is the answer the rest of
 // this function is trying to infer. It is checked against the target root rather than
-// trusted, for "local" -- that mode installs a bootloader over an on-disk OS it did
-// not lay down, so the booted kernel need not be the one on the disk.
+// trusted, because the booted kernel need not be the one on the disk.
 func detectKernelVersion(sysroot string) (string, error) {
 	if k := runningKernelVersion(); k != "" && isInstalledKernel(sysroot, k) {
 		return k, nil

@@ -208,6 +208,39 @@ func TestPostPhaseSkipsBootloaderForSanitize(t *testing.T) {
 	}
 }
 
+// install_mode=local boots the on-disk OS as it is: the post phase must not
+// run the finalise, which rewrites fstab, grub, the initramfs and NVRAM.
+func TestPostPhaseSkipsBootloaderForLocal(t *testing.T) {
+	for _, c := range []struct {
+		mode     string
+		finalise bool
+	}{
+		{"auto", true}, // control: the harness does reach the finalise
+		{"local", false},
+	} {
+		t.Run(c.mode, func(t *testing.T) {
+			rt, logs, bin := partEnv(t, c.mode)
+			if err := os.WriteFile(rt+"/storage-result.json", []byte(`{"filesystems":[]}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fakeBin(t, bin, "lpart-bootloader-finalise", "touch "+rt+"/finalise-ran")
+			p := New(context.Background(), Options{Phase: PhasePost, RuntimeDir: rt, LogDir: logs, BinDir: bin, StepTimeout: time.Minute})
+			go func() {
+				for range p.Events() {
+				}
+			}()
+			err := p.runPost()
+			_, statErr := os.Stat(rt + "/finalise-ran")
+			if ran := statErr == nil; ran != c.finalise {
+				t.Fatalf("install_mode=%s: finalise ran=%v, want %v (runPost: %v)", c.mode, ran, c.finalise, err)
+			}
+			if err != nil {
+				t.Fatalf("install_mode=%s: runPost: %v", c.mode, err)
+			}
+		})
+	}
+}
+
 // An install-context the post phase cannot read parks (fatal) instead of
 // being taken for install_mode=auto.
 func TestPostPhaseRefusesAnUnreadableInstallContext(t *testing.T) {
