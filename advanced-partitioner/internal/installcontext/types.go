@@ -77,9 +77,9 @@ func (m Mode) IsSanitize() bool { return m == ModeSanitize }
 // IsLegacy reports the legacy mode (daemon-only; should not reach the client).
 func (m Mode) IsLegacy() bool { return m == ModeLegacy }
 
-// InstallsBootloader reports whether a bootloader finalise step applies:
-// every disk-based OS mode (auto, sync, full, local) but not memboot/
-// sanitize/legacy.
+// InstallsBootloader reports the disk-based OS modes (auto, sync, full,
+// local), not memboot/sanitize/legacy. The post phase finalises the
+// bootloader for all of them except local (decisions/0015).
 func (m Mode) InstallsBootloader() bool {
 	return m == ModeAuto || m == ModeSync || m == ModeFull || m == ModeLocal
 }
