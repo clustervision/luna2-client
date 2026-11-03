@@ -185,8 +185,12 @@ func assembleExplicit(ctx context.Context, runner executor.Runner, mdName string
 	md := mdHolder(ctx, runner, members[0])
 	if md == "" {
 		// mdadm would not start it: a member is missing, also when only its
-		// superblock is gone and the disk is there
-		return false, strings.Contains(string(res.Stderr), "need all") || len(members) < raidDevices(ctx, runner, members[0])
+		// superblock is gone and the disk is there. "not clean" is mdadm
+		// counting active members short on a dirty array, which a present
+		// spare hides from the member count.
+		stderr := string(res.Stderr)
+		return false, strings.Contains(stderr, "need all") || strings.Contains(stderr, "not clean") ||
+			len(members) < raidDevices(ctx, runner, members[0])
 	}
 	return true, arrayState(ctx, runner, md) == "inactive"
 }

@@ -55,7 +55,7 @@ the daemon install template in order. The contract (pinned by
 |-------|-------------------|---------|
 | **pre**  | `prepare-runtime` (mkdir runtime/log dirs) | **nothing destructive** — no disk, no daemon call. Just env prep + a kernel-log snapshot. (The legacy image-unpack bypass is the daemon template's own no-op `download_image`/`unpack_imagefile`, not a pre-phase step.) |
 | **part** | `install-context` (`lpartinputs.Resolve`: GET node-detail → write `storage.json`/`osimage-filter.json`/`install-context.json`, incl. `provision_method`/`fallback`/`interface`), `storage-prepare` (partition/RAID/LVM/mkfs + mount the sysroot; dispatches on `install_mode`; **sanitize stops here**), `osimage` (`lpart-osimage-install` download+extract, or `lpart-storage-check` for `local`, or skipped for `sanitize`) | **the disk + the image.** Inputs are resolved *first*, before any mutation. |
-| **post** | `bootloader` (`lpart-bootloader-finalise`: shim/grub + UEFI NVRAM; skipped for memboot/sanitize) | the ESP + NVRAM. Runs only after the OS image is in place. |
+| **post** | `bootloader` (`lpart-bootloader-finalise`: shim/grub + UEFI NVRAM; skipped for memboot/sanitize/local) | the ESP + NVRAM. Runs only after the OS image is in place. |
 
 Invariants the tests assert: stage order never changes; a phase marks all *earlier*
 phases' stages done; **pre owns no destructive stage**; the install-context (and thus

@@ -9,7 +9,8 @@
 // internally (the decision engine), then the OS image is extracted
 // (lpart-osimage-install) for the image modes, verified in place
 // (lpart-storage-check) for local, or skipped for sanitize; the bootloader
-// finalise runs in the post phase only for the disk-based OS modes.
+// finalise runs in the post phase only for the modes that put an OS on disk
+// (auto, sync, full; not local, decisions/0015).
 package pipeline
 
 import (
@@ -497,7 +498,7 @@ func (p *Pipeline) runPost() error {
 	mode := ic.InstallMode
 	p.emitLuna(string(ic.InstallMode))
 	p.emitNode()
-	if !mode.InstallsBootloader() {
+	if !mode.InstallsBootloader() || mode.IsLocal() {
 		p.stageStart("bootloader", "Bootloader finalise")
 		p.info("no bootloader finalise for install_mode=" + string(mode))
 		p.stageDone("bootloader", "skipped")
