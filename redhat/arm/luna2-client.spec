@@ -18,12 +18,13 @@ Requires:      curl
 Requires:      dracut-config-generic  
 Requires:      dracut-network  
 Requires:      e2fsprogs  
+Requires:      xfsprogs  
 Requires:      gawk  
 Requires:      grub2  
 Requires:      gzip  
 Requires:      ipmitool  
 Requires:      kernel  
-Requires:      lbzip2
+Requires:      ((lbzip2) or (pbzip2))
 Requires:      nss  
 Requires:      nss-softokn  
 Requires:      openssh  
@@ -44,7 +45,6 @@ Requires:      mdadm
 Requires:      procps-ng
 Requires:      pciutils
 Requires:      dosfstools
-Requires:      dhcp-client
 Requires:      dmidecode
 Requires:      util-linux
 Requires:      device-mapper
